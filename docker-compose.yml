@@ -1,0 +1,88 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ztsaacm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ztsaacm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-ztsaacm_db}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ztsaacm} -d ${POSTGRES_DB:-ztsaacm_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - ztsaacm-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: ztsaacm-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - ztsaacm-net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ztsaacm-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Inside Docker's network, services reach each other by service name,
+      # not localhost — override the DB/Redis hosts from .env accordingly.
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ztsaacm-net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ztsaacm-frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_BASE_URL: http://localhost:${BACKEND_PORT:-8000}
+      VITE_WS_BASE_URL: ws://localhost:${BACKEND_PORT:-8000}
+    ports:
+      - "${FRONTEND_PORT:-5173}:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - ztsaacm-net
+
+networks:
+  ztsaacm-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:

@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+/*
+  SOC-dashboard color tokens.
+  Kept centralized here (rather than sprinkled as literal Tailwind color
+  utilities everywhere) so Module 8 can retheme the whole dashboard by
+  editing this one block.
+*/
+:root {
+  color-scheme: dark;
+
+  --color-bg: #0b0e14;
+  --color-surface: #121620;
+  --color-surface-alt: #171c28;
+  --color-border: #232838;
+
+  --color-text: #e2e5ec;
+  --color-text-muted: #8892a6;
+
+  --color-accent: #3b82f6;
+
+  --color-risk-low: #22c55e;
+  --color-risk-medium: #eab308;
+  --color-risk-high: #ef4444;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
