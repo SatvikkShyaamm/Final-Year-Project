@@ -1,9 +1,9 @@
 """
 Business-logic services package, separated from the API layer.
 
-Sub-packages are pre-created (empty except for __init__.py) so the intended
-module boundaries are visible from the start:
+Sub-packages map one-to-one to the module that owns that business logic:
 
+  services/auth/        -> Module 2: registration + credential verification
   services/session/     -> Module 3: session lifecycle FSM, connection manager glue
   services/acl/         -> Module 4: ACL create/remove, ipset integration (L-PEP role)
   services/trust_score/ -> Module 5: weighted trust factor calculation

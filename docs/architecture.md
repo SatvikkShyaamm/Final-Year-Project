@@ -40,12 +40,20 @@ the same S2→S3 revocation path the base paper already defines
 
 ```
 backend/app/api/v1/endpoints/   one file per module's REST surface
-backend/app/services/            one sub-package per module's business logic
-backend/app/models/              one file per module's ORM model(s)
+backend/app/api/deps.py          shared deps: get_db, get_current_user, get_current_admin (Module 2)
+backend/app/core/security.py     password hashing + JWT primitives (Module 2)
+backend/app/services/            one sub-package per module's business logic (auth/ is Module 2)
+backend/app/models/              one file per module's ORM model(s) (user.py is Module 2)
 backend/app/ws/                  Module 3's WebSocket signaling layer
+frontend/src/auth/               token store, AuthProvider, useAuth, ProtectedRoute (Module 2)
 frontend/src/pages/admin/        one page per Module 8 dashboard section
 infra/l-pep/                     Module 4's enforcement component
 ```
+
+Status: Modules 1-2 implemented. The base paper's "JWT verification" step of
+the SS-PDP is `app/core/security.decode_access_token` + the `get_current_user`
+dependency; Module 3 reuses it for the WebSocket handshake rather than
+re-parsing tokens.
 
 Do not add cross-module imports that blur these boundaries (e.g. the MFA
 service should not import ACL internals directly — it returns a decision;

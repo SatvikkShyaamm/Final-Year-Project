@@ -44,7 +44,7 @@ export function Sidebar() {
         ))}
       </nav>
       <div className="border-t border-[color:var(--color-border)] px-5 py-4 text-xs text-[color:var(--color-text-muted)]">
-        Module 1 — Foundation
+        Module 2 — Authentication
       </div>
     </aside>
   )

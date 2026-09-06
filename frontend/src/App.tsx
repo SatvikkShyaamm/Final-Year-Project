@@ -1,4 +1,6 @@
 import { Navigate, Route, Routes } from 'react-router-dom'
+import { AuthProvider } from './auth/AuthProvider'
+import { ProtectedRoute } from './auth/ProtectedRoute'
 import { AdminLayout } from './components/layout/AdminLayout'
 import { Login } from './pages/Login'
 import { UserPortal } from './pages/UserPortal'
@@ -13,24 +15,33 @@ import { SystemStatus } from './pages/admin/SystemStatus'
 
 function App() {
   return (
-    <Routes>
-      <Route path="/" element={<Navigate to="/admin" replace />} />
-      <Route path="/login" element={<Login />} />
-      <Route path="/portal" element={<UserPortal />} />
+    <AuthProvider>
+      <Routes>
+        <Route path="/" element={<Navigate to="/admin" replace />} />
+        <Route path="/login" element={<Login />} />
 
-      <Route path="/admin" element={<AdminLayout />}>
-        <Route index element={<DashboardHome />} />
-        <Route path="sessions" element={<LiveSessions />} />
-        <Route path="trust-score" element={<TrustScorePage />} />
-        <Route path="alerts" element={<SecurityAlerts />} />
-        <Route path="acl" element={<ACLMonitor />} />
-        <Route path="analytics" element={<Analytics />} />
-        <Route path="simulation" element={<AttackSimulation />} />
-        <Route path="status" element={<SystemStatus />} />
-      </Route>
+        {/* Any authenticated user */}
+        <Route element={<ProtectedRoute />}>
+          <Route path="/portal" element={<UserPortal />} />
+        </Route>
 
-      <Route path="*" element={<Navigate to="/admin" replace />} />
-    </Routes>
+        {/* Admin-only SOC dashboard */}
+        <Route element={<ProtectedRoute requireAdmin />}>
+          <Route path="/admin" element={<AdminLayout />}>
+            <Route index element={<DashboardHome />} />
+            <Route path="sessions" element={<LiveSessions />} />
+            <Route path="trust-score" element={<TrustScorePage />} />
+            <Route path="alerts" element={<SecurityAlerts />} />
+            <Route path="acl" element={<ACLMonitor />} />
+            <Route path="analytics" element={<Analytics />} />
+            <Route path="simulation" element={<AttackSimulation />} />
+            <Route path="status" element={<SystemStatus />} />
+          </Route>
+        </Route>
+
+        <Route path="*" element={<Navigate to="/admin" replace />} />
+      </Routes>
+    </AuthProvider>
   )
 }
 

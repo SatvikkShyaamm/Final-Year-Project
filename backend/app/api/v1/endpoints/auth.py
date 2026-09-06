@@ -1,32 +1,107 @@
 """
-Placeholder for Module 2 — Authentication.
+Module 2 — Authentication endpoints.
 
-Will implement: POST /auth/register, POST /auth/login (returns JWT),
-POST /auth/logout, GET /auth/me. Endpoints intentionally return 501 for now
-so the route is real and discoverable in OpenAPI docs, but nothing pretends
-to authenticate anyone until Module 2 is implemented.
+Scope (per the Master Project Context, Module 2): user registration, login
+issuing a JWT, JWT validation, and an authenticated "who am I" endpoint.
+This module answers only "who are you?". Session lifecycle (Module 3),
+trust scoring (Module 5) and MFA (Module 6) are separate and layer on top of
+the `get_current_user` dependency this module makes available.
+
+    POST /auth/register  -> create account, return JWT + user
+    POST /auth/login     -> verify credentials, return JWT + user
+    GET  /auth/me        -> current user (requires Bearer token)
+    POST /auth/logout    -> client-side token disposal (stateless JWT)
 """
-from fastapi import APIRouter, status
-from fastapi.responses import JSONResponse
+from __future__ import annotations
 
-router = APIRouter()
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
 
-_NOT_IMPLEMENTED = JSONResponse(
-    status_code=status.HTTP_501_NOT_IMPLEMENTED,
-    content={"detail": "Not implemented yet — planned for Module 2 (Authentication)."},
+from app.api.deps import CurrentUser, get_db
+from app.core.config import get_settings
+from app.core.security import create_access_token
+from app.schemas.auth import LoginRequest, Token, UserCreate, UserRead
+from app.services.auth import (
+    DuplicateUserError,
+    InvalidCredentialsError,
+    authenticate_user,
+    register_user,
 )
 
-
-@router.post("/auth/register", tags=["auth"])
-def register():
-    return _NOT_IMPLEMENTED
+router = APIRouter()
+settings = get_settings()
 
 
-@router.post("/auth/login", tags=["auth"])
-def login():
-    return _NOT_IMPLEMENTED
+def _issue_token(user) -> Token:
+    access_token = create_access_token(user.id)
+    return Token(
+        access_token=access_token,
+        token_type="bearer",
+        expires_in=settings.access_token_expire_minutes * 60,
+        user=UserRead.model_validate(user),
+    )
 
 
-@router.post("/auth/logout", tags=["auth"])
-def logout():
-    return _NOT_IMPLEMENTED
+@router.post(
+    "/auth/register",
+    tags=["auth"],
+    response_model=Token,
+    status_code=status.HTTP_201_CREATED,
+    summary="Register a new user and return an access token",
+)
+def register(payload: UserCreate, db: Session = Depends(get_db)) -> Token:
+    try:
+        user = register_user(
+            db,
+            username=payload.username,
+            email=str(payload.email),
+            password=payload.password,
+        )
+    except DuplicateUserError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return _issue_token(user)
+
+
+@router.post(
+    "/auth/login",
+    tags=["auth"],
+    response_model=Token,
+    summary="Verify credentials and return an access token",
+)
+def login(payload: LoginRequest, db: Session = Depends(get_db)) -> Token:
+    try:
+        user = authenticate_user(
+            db, username=payload.username, password=payload.password
+        )
+    except InvalidCredentialsError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return _issue_token(user)
+
+
+@router.get(
+    "/auth/me",
+    tags=["auth"],
+    response_model=UserRead,
+    summary="Return the currently authenticated user",
+)
+def read_me(current_user: CurrentUser) -> UserRead:
+    return UserRead.model_validate(current_user)
+
+
+@router.post(
+    "/auth/logout",
+    tags=["auth"],
+    summary="Log out (stateless — client discards the token)",
+)
+def logout(current_user: CurrentUser) -> dict:
+    """
+    With stateless JWTs there is no server-side session to destroy here; the
+    client drops the token. Real server-enforced revocation is bound to the
+    WebSocket session lifecycle in Module 3 (and to unacceptable trust in
+    Module 7), which is where a deny-list / session teardown belongs.
+    """
+    return {"detail": "Logged out. Discard the access token on the client."}

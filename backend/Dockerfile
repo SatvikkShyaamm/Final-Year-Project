@@ -15,4 +15,7 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# Apply DB migrations before serving. From Module 2 on there is real schema
+# (starting with the users table), so the container brings the DB up to head
+# on every start; `alembic upgrade` is a no-op when already current.
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"]

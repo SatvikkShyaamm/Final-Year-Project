@@ -28,10 +28,10 @@ def test_health_shape():
 
 
 def test_placeholder_endpoints_return_501():
-    # Confirms module-2..9 stubs are wired but honestly report "not implemented"
-    # rather than silently succeeding.
+    # Confirms the still-unbuilt module stubs (3-9) are wired but honestly
+    # report "not implemented" rather than silently succeeding. Module 2
+    # (/api/v1/auth/*) is now implemented and is covered by tests/test_auth.py.
     for method, path in [
-        ("post", "/api/v1/auth/login"),
         ("get", "/api/v1/sessions"),
         ("get", "/api/v1/acl/rules"),
         ("get", "/api/v1/trust-score/some-user"),

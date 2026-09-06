@@ -1,8 +1,8 @@
 # ============================================================================
-# Backend dependencies — Module 1 (Foundation) baseline.
-# Auth/MFA/Trust-score specific libraries (passlib, pyotp, python-jose, etc.)
-# are added when their respective modules (2, 5, 6) are implemented, to avoid
-# pulling in unused dependencies before they're needed.
+# Backend dependencies.
+# Module 1 (Foundation) baseline + Module 2 (Authentication).
+# MFA/Trust-score specific libraries (pyotp, etc.) are still added later with
+# their owning modules (5, 6) to avoid pulling in unused dependencies early.
 # ============================================================================
 
 # --- Web framework & server ---
@@ -20,6 +20,11 @@ alembic==1.17.1
 
 # --- Redis ---
 redis==6.4.0
+
+# --- Authentication (Module 2) ---
+PyJWT==2.10.1                # JWT encode/decode (pure-Python, no build step)
+bcrypt==4.3.0               # password hashing, used directly (no passlib shim)
+email-validator==2.2.0     # backs pydantic's EmailStr in schemas/auth.py
 
 # --- WebSocket support (pulled in by uvicorn[standard] via websockets, listed
 #     explicitly since Module 3 depends on it directly) ---

@@ -6,11 +6,10 @@ Continuous Trust Evaluation, presented through a SOC-style admin
 dashboard. See `docs/architecture.md` and the project's Claude project
 docs for full context before making architectural changes.
 
-**Module status:** Module 1 (Project Foundation) only. Everything below
-is scaffolding — real Authentication/Session/ACL/Trust-Score/MFA logic is
-added module by module (see `Project status.md`). Endpoints for modules
-2-9 exist as routes but honestly return `501 Not Implemented`; nothing is
-mocked to look like it works.
+**Module status:** Modules 1 (Project Foundation) and 2 (Authentication)
+are implemented. Modules 3-9 are still scaffolding — their endpoints exist
+as routes but honestly return `501 Not Implemented`; nothing is mocked to
+look like it works. See `Project status.md`.
 
 ## What actually works right now
 
@@ -18,8 +17,20 @@ mocked to look like it works.
   a **live** `SELECT 1` against Postgres and a **live** `PING` against
   Redis — it reports "unreachable" if either is actually down, it doesn't
   fake success.
-- Frontend (React + Vite + Tailwind + React Router) boots, and its
-  **System Status** page (`/admin/status`) calls that real health
+- **Authentication (Module 2)** — real:
+  - `POST /api/v1/auth/register` hashes the password with bcrypt, stores a
+    `users` row, returns a signed JWT. The **first** account on a fresh DB
+    becomes `admin`; the rest are `user`.
+  - `POST /api/v1/auth/login` verifies credentials and returns a JWT.
+  - `GET /api/v1/auth/me` validates the `Authorization: Bearer` token and
+    returns the current user; bad/expired/forged tokens get `401`.
+  - `get_current_user` / `get_current_admin` dependencies in
+    `app/api/deps.py` are the auth middleware every later module reuses.
+- Frontend: a real login/register screen, a JWT-aware axios client
+  (attaches the token, redirects to `/login` on `401`), an `AuthProvider`
+  that rehydrates the session on refresh, and route guards — `/admin` is
+  admin-only, `/portal` needs any logged-in user.
+- Its **System Status** page (`/admin/status`) still calls the real health
   endpoint and renders the real result.
 - Every planned dashboard section (Live Sessions, Trust Score, Security
   Alerts, ACL Monitor, Analytics, Attack Simulation) has a real route and
@@ -32,6 +43,7 @@ mocked to look like it works.
 |------------|---------------------------------------------------------|
 | Frontend   | React 19, TypeScript, Vite, Tailwind CSS v4, React Router, Recharts, Axios |
 | Backend    | FastAPI, SQLAlchemy 2, Alembic, Pydantic Settings        |
+| Auth       | JWT (PyJWT, HS256), bcrypt password hashing              |
 | Database   | PostgreSQL 16                                            |
 | Cache/Queue| Redis 7                                                  |
 | Infra      | Docker, Docker Compose                                   |
@@ -50,12 +62,14 @@ ztsaacm-dashboard/
 │   ├── app/
 │   │   ├── main.py              # FastAPI app + CORS + router mount
 │   │   ├── core/                # config, DB session, Redis client, logging
+│   │   ├── api/deps.py          # get_db + get_current_user/get_current_admin (Module 2)
 │   │   ├── api/v1/endpoints/    # one file per module's REST endpoints
-│   │   ├── models/              # SQLAlchemy models (empty until Module 2+)
-│   │   ├── schemas/             # Pydantic request/response schemas
-│   │   ├── services/            # business logic, one sub-package per module
+│   │   ├── core/security.py     # bcrypt hashing + JWT encode/decode (Module 2)
+│   │   ├── models/              # SQLAlchemy models — user.py (Module 2)
+│   │   ├── schemas/             # Pydantic request/response schemas — auth.py (Module 2)
+│   │   ├── services/            # business logic, one sub-package per module — auth/ (Module 2)
 │   │   └── ws/                  # WebSocket session layer (Module 3)
-│   ├── alembic/                 # DB migrations
+│   ├── alembic/versions/        # DB migrations — 0001 creates the users table
 │   ├── tests/
 │   └── requirements.txt
 └── frontend/
@@ -94,8 +108,14 @@ cd backend
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env          # edit if your local Postgres/Redis differ
+alembic upgrade head          # from Module 2 on there is real schema (users table)
 uvicorn app.main:app --reload --port 8000
 ```
+
+> Use CPython 3.11 or 3.12 for a native run — that's what the Docker image
+> (`python:3.11-slim`) uses and what the pinned `requirements.txt` has
+> prebuilt wheels for. The Docker container runs `alembic upgrade head`
+> automatically on start.
 
 **Frontend** (separate terminal):
 ```bash
@@ -110,7 +130,7 @@ your `.env`) and Redis reachable at the hosts/ports in `backend/.env` —
 or just use Docker Compose for those two services only:
 `docker compose up postgres redis`.
 
-## Verifying the foundation works
+## Verifying it works
 
 ```bash
 curl http://localhost:8000/api/v1/health
@@ -120,8 +140,29 @@ curl http://localhost:8000/api/v1/health
 Then open http://localhost:5173/admin/status in a browser — it should
 show the same result rendered live.
 
+**Authentication (Module 2)** end to end:
+
 ```bash
-cd backend && pytest        # 3 tests: root, health response shape, module stubs return 501
+# register (first account on a fresh DB is the admin)
+curl -s -X POST http://localhost:8000/api/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","email":"admin@example.com","password":"change-me-123"}'
+
+# log in, capture the token
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"change-me-123"}' | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+# use it
+curl -s http://localhost:8000/api/v1/auth/me -H "Authorization: Bearer $TOKEN"
+```
+
+In the browser: http://localhost:5173/login → register/sign in → the admin
+lands on the SOC dashboard, a normal user on `/portal`; a missing/expired
+token bounces back to `/login`.
+
+```bash
+cd backend && pytest          # 19 tests: health/stubs + full auth flow (tests/test_auth.py)
 cd frontend && npm run build  # type-checks and builds to dist/
 ```
 
@@ -135,6 +176,8 @@ placeholder values before any shared or deployed use.
 
 ## Next module
 
-Module 2 — Authentication (registration, login, password hashing, JWT
-issuance/validation, auth middleware). Do not start Module 3+ before
-Module 2 is working end to end, per the project's development order.
+Module 3 — Session Lifecycle (WebSocket session open/close driving the base
+paper's S1→S2→S3 FSM, session state in Redis, logout/timeout/termination).
+It builds directly on Module 2's `get_current_user` dependency for the
+WebSocket handshake. Do not start Module 4+ before Module 3 works end to end,
+per the project's development order.
