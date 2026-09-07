@@ -119,10 +119,17 @@ async def terminate_session(
     updated = session_service.terminate_session(
         db, session_id, reason=TerminationReason.ADMIN_TERMINATED
     )
-    # Shut the live socket now if we hold it; otherwise the session's own
-    # heartbeat loop notices the state change within one heartbeat.
+    # Shut the live socket now if we hold it. The session.terminated message
+    # MUST go out before the close frame -- ConnectionManager.close() sends it
+    # first for exactly this reason: once the socket is closed, a send to it
+    # silently fails, the client's SessionSocket sees an ordinary drop instead
+    # of an intentional end, and its reconnect-with-backoff logic opens a
+    # brand-new session right behind the one that was just terminated.
     await manager.close(
-        session_id, code=status.WS_1000_NORMAL_CLOSURE, reason="admin_terminated"
+        session_id,
+        code=status.WS_1000_NORMAL_CLOSURE,
+        reason="admin_terminated",
+        message={"type": "session.terminated", "reason": "admin_terminated"},
     )
     assert updated is not None  # row existed a line above
     return SessionTerminateResponse(

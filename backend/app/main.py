@@ -14,6 +14,7 @@ from app.api.v1.router import api_router
 from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.core.logging import configure_logging, get_logger
+from app.models.session import Session as SessionModel
 from app.services import session as session_service
 from app.ws.connection_manager import manager
 
@@ -36,10 +37,28 @@ async def _session_sweeper() -> None:
             db = SessionLocal()
             try:
                 closed = session_service.sweep_expired_sessions(db)
+                # Look up the reason the sweeper actually recorded for each
+                # session (idle_timeout vs max_lifetime) so the client gets an
+                # accurate session.terminated message -- sent before the close
+                # frame, same as admin-terminate and logout, so the socket
+                # closing doesn't race the frontend into treating this as an
+                # ordinary drop and reconnecting into a brand-new session.
+                reasons = {
+                    row.id: row.termination_reason
+                    for row in db.query(SessionModel).filter(
+                        SessionModel.id.in_(closed)
+                    )
+                } if closed else {}
             finally:
                 db.close()
             for session_id in closed:
-                await manager.close(session_id, code=1000, reason="session timeout")
+                reason = reasons.get(session_id) or "session_timeout"
+                await manager.close(
+                    session_id,
+                    code=1000,
+                    reason="session timeout",
+                    message={"type": "session.terminated", "reason": reason},
+                )
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - a transient DB blip must not kill the loop

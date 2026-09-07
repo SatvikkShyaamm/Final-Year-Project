@@ -13,6 +13,8 @@ in services/session/store.py is where it would hook in.
 """
 from __future__ import annotations
 
+from typing import Any
+
 from starlette.websockets import WebSocket
 
 from app.core.logging import get_logger
@@ -40,12 +42,36 @@ class ConnectionManager:
         return set(self._connections)
 
     async def close(
-        self, session_id: str, *, code: int = 1000, reason: str = ""
+        self,
+        session_id: str,
+        *,
+        code: int = 1000,
+        reason: str = "",
+        message: dict[str, Any] | None = None,
     ) -> bool:
-        """Force-close a session's socket if we hold it. Returns True if we did."""
+        """
+        Force-close a session's socket if we hold it. Returns True if we did.
+
+        If `message` is given, it is sent (best-effort, as JSON) *before* the
+        close frame goes out. This is what lets a server-initiated termination
+        (admin DELETE, idle/lifetime sweep) tell the client's SessionSocket
+        "this was intentional, do not reconnect" via a `session.terminated`
+        payload -- sending it after close() is too late: closing flips the
+        connection's state to disconnected immediately, so a send attempted
+        afterwards silently fails and the client sees an ordinary drop and
+        auto-reconnects, opening a brand-new session right behind the one that
+        was just terminated.
+        """
         websocket = self._connections.get(session_id)
         if websocket is None:
             return False
+        if message is not None:
+            try:
+                await websocket.send_json(message)
+            except Exception:  # noqa: BLE001 - socket may already be gone
+                logger.debug(
+                    "pre-close send_json failed for session %s", session_id
+                )
         try:
             await websocket.close(code=code, reason=reason)
         except Exception:  # noqa: BLE001 - socket may already be gone

@@ -112,7 +112,17 @@ async def logout(current_user: CurrentUser, db: Session = Depends(get_db)) -> di
         db, current_user.id, reason=TerminationReason.LOGOUT
     )
     for session_id in terminated:
-        await manager.close(session_id, code=1000, reason="logout")
+        # Send session.terminated before the close frame -- see the comment on
+        # ConnectionManager.close() for why the order matters. The frontend
+        # normally tears its own socket down on logout anyway, but this closes
+        # the same race window admin-terminate had if that teardown is ever
+        # delayed relative to this server-side close.
+        await manager.close(
+            session_id,
+            code=1000,
+            reason="logout",
+            message={"type": "session.terminated", "reason": "logout"},
+        )
     return {
         "detail": "Logged out. Discard the access token on the client.",
         "terminated_sessions": terminated,
