@@ -4,25 +4,59 @@ FastAPI application entrypoint.
 Run directly with:  uvicorn app.main:app --reload --port 8000
 (from the backend/ directory, with the virtualenv from requirements.txt active)
 """
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.router import api_router
 from app.core.config import get_settings
+from app.core.database import SessionLocal
 from app.core.logging import configure_logging, get_logger
+from app.services import session as session_service
+from app.ws.connection_manager import manager
 
 settings = get_settings()
 configure_logging()
 logger = get_logger(__name__)
 
 
+async def _session_sweeper() -> None:
+    """
+    Periodically close sessions whose signalling socket has gone quiet past the
+    idle timeout, or that have exceeded the max lifetime (Module 3). The normal
+    close path is the WebSocket dropping; this only catches half-open/zombie
+    sockets and enforces the hard lifetime cap.
+    """
+    interval = max(5, settings.session_sweep_interval_seconds)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            db = SessionLocal()
+            try:
+                closed = session_service.sweep_expired_sessions(db)
+            finally:
+                db.close()
+            for session_id in closed:
+                await manager.close(session_id, code=1000, reason="session timeout")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a transient DB blip must not kill the loop
+            logger.warning("session sweeper iteration failed", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("%s starting up in '%s' mode", settings.project_name, settings.environment)
-    yield
-    logger.info("%s shutting down", settings.project_name)
+    sweeper = asyncio.create_task(_session_sweeper())
+    try:
+        yield
+    finally:
+        sweeper.cancel()
+        with suppress(asyncio.CancelledError):
+            await sweeper
+        logger.info("%s shutting down", settings.project_name)
 
 
 app = FastAPI(

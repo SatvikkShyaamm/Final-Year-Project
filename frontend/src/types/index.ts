@@ -55,3 +55,42 @@ export interface RegisterPayload {
   email: string
   password: string
 }
+
+/* --------------------------------------------------------------------------
+ * Module 3 — Session Lifecycle
+ * Mirrors backend/app/schemas/session.py.
+ * ---------------------------------------------------------------------- */
+
+export type SessionState = 'active' | 'terminated'
+
+export interface Session {
+  id: string
+  user_id: number
+  username: string | null
+  ip_address: string | null
+  user_agent: string | null
+  state: SessionState
+  ws_connected: boolean
+  created_at: string
+  last_seen_at: string
+  terminated_at: string | null
+  termination_reason: string | null
+  duration_seconds: number
+  /** Reserved — filled in by Modules 4/5. Always null in Module 3. */
+  trust_score: number | null
+  risk_level: RiskLevel | null
+  acl_status: string | null
+}
+
+export interface SessionListResponse {
+  sessions: Session[]
+  active_count: number
+  generated_at: string
+}
+
+/** State of the client's own signalling WebSocket. */
+export type SessionSocketStatus =
+  | 'idle'
+  | 'connecting'
+  | 'connected'
+  | 'disconnected'

@@ -1,6 +1,6 @@
 # ============================================================================
 # Backend dependencies.
-# Module 1 (Foundation) baseline + Module 2 (Authentication).
+# Modules 1 (Foundation) + 2 (Authentication) + 3 (Session Lifecycle).
 # MFA/Trust-score specific libraries (pyotp, etc.) are still added later with
 # their owning modules (5, 6) to avoid pulling in unused dependencies early.
 # ============================================================================
@@ -37,3 +37,4 @@ python-multipart==0.0.20
 pytest==8.4.2
 httpx==0.28.1
 pytest-asyncio==1.2.0
+fakeredis==2.31.3            # in-memory Redis for the session-lifecycle tests

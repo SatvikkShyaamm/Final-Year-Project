@@ -15,6 +15,17 @@ migration:
 Import new models in this file so Alembic's autogenerate can discover them
 via Base.metadata.
 """
+from app.models.session import (  # noqa: F401  (Module 3)
+    Session,
+    SessionState,
+    TerminationReason,
+)
 from app.models.user import User, UserRole  # noqa: F401  (Module 2)
 
-__all__ = ["User", "UserRole"]
+__all__ = [
+    "User",
+    "UserRole",
+    "Session",
+    "SessionState",
+    "TerminationReason",
+]

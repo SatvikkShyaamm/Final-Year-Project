@@ -26,12 +26,12 @@ the same S2→S3 revocation path the base paper already defines
 
 | Paper concept        | This codebase (from the module that implements it)         |
 |-----------------------|--------------------------------------------------------------|
-| SS-PDP                | `backend/app/ws/` (Module 3) + `backend/app/api` auth (Module 2) |
+| SS-PDP                | `backend/app/ws/` + `app/api/v1/endpoints/sessions.py` (M3) + `app/api` auth (M2) |
 | L-PEP                 | `infra/l-pep/` + `backend/app/services/acl/` (Module 4)       |
-| Intermediate layer     | Redis — `backend/app/core/redis_client.py` (wired in Module 1, used from Module 3 onward) |
+| Intermediate layer     | Redis — active-session index + `ztsaacm:events:session` pub/sub in `app/services/session/store.py` (Module 3); Postgres stays source of truth |
 | FSM S0->S1 (`auth_success`) | Module 2 (Authentication)                              |
-| FSM S1->S2 (`session_open`) | Module 3 (Session Lifecycle) gated by Modules 5/6      |
-| FSM S2->S3 (`session_close`)| Module 3, additionally triggered by Module 7 on unacceptable risk |
+| FSM S1->S2 (`session_open`) | Module 3 — WebSocket connect creates the `sessions` row. Modules 5/6 will gate this; Module 4 will attach an ACL rule here |
+| FSM S2->S3 (`session_close`)| Module 3 — `terminate_session` (ws drop / logout / admin / idle+lifetime sweep); additionally triggered by Module 7 on unacceptable risk |
 | Trust Score            | `backend/app/services/trust_score/` (Module 5)                |
 | Adaptive MFA            | `backend/app/services/mfa/` (Module 6)                        |
 | Continuous evaluation   | Composition of trust_score + mfa + acl services (Module 7), no separate service package |
@@ -39,21 +39,27 @@ the same S2→S3 revocation path the base paper already defines
 ## Module -> folder map (Module 1 baseline)
 
 ```
-backend/app/api/v1/endpoints/   one file per module's REST surface
+backend/app/api/v1/endpoints/   one file per module's REST surface (+ the WS route in sessions.py)
 backend/app/api/deps.py          shared deps: get_db, get_current_user, get_current_admin (Module 2)
 backend/app/core/security.py     password hashing + JWT primitives (Module 2)
-backend/app/services/            one sub-package per module's business logic (auth/ is Module 2)
-backend/app/models/              one file per module's ORM model(s) (user.py is Module 2)
-backend/app/ws/                  Module 3's WebSocket signaling layer
+backend/app/services/            one sub-package per module (auth/ M2, session/ M3: fsm+store+service)
+backend/app/models/              one file per module's ORM model(s) (user.py M2, session.py M3)
+backend/app/ws/                  connection_manager.py + handshake auth.py (Module 3)
 frontend/src/auth/               token store, AuthProvider, useAuth, ProtectedRoute (Module 2)
+frontend/src/session/            SessionProvider, useSession (Module 3)
+frontend/src/ws/socket.ts        SessionSocket signalling client (Module 3)
 frontend/src/pages/admin/        one page per Module 8 dashboard section
 infra/l-pep/                     Module 4's enforcement component
 ```
 
-Status: Modules 1-2 implemented. The base paper's "JWT verification" step of
-the SS-PDP is `app/core/security.decode_access_token` + the `get_current_user`
-dependency; Module 3 reuses it for the WebSocket handshake rather than
-re-parsing tokens.
+Status: Modules 1-3 implemented. The base paper's "JWT verification" step of
+the SS-PDP is `app/core/security.decode_access_token` — reused by the REST
+`get_current_user` dependency (M2) and by `app/ws/auth.resolve_ws_user` for
+the `?token=` WebSocket handshake (M3). Session state lives in Postgres
+(`sessions` table, authoritative); Redis mirrors the active set and carries
+`session.opened`/`session.closed` events for Module 8 to subscribe to.
+Module 4 hooks ACL create/remove onto those same events / the
+`terminate_session` path.
 
 Do not add cross-module imports that blur these boundaries (e.g. the MFA
 service should not import ACL internals directly — it returns a decision;

@@ -41,6 +41,15 @@ class Settings(BaseSettings):
     jwt_secret_key: str = "change_me_dev_secret_key"
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
+
+    # ---- Session lifecycle (Module 3) ----
+    # An application session ends when its WebSocket closes; these bound how
+    # long an *idle* or *very old* session may linger if the socket somehow
+    # stays half-open. All tunable for Module 10's evaluation.
+    session_idle_timeout_minutes: int = 30
+    session_max_lifetime_minutes: int = 480
+    session_sweep_interval_seconds: int = 30
+    session_ws_heartbeat_seconds: int = 20
     # Kept as a raw comma-separated string (not List[str]) because
     # pydantic-settings tries to JSON-decode list-typed env vars before any
     # validator runs, which breaks on a plain "http://a,http://b" value.

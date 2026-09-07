@@ -20,13 +20,16 @@ from sqlalchemy.orm import Session
 from app.api.deps import CurrentUser, get_db
 from app.core.config import get_settings
 from app.core.security import create_access_token
+from app.models.session import TerminationReason
 from app.schemas.auth import LoginRequest, Token, UserCreate, UserRead
+from app.services import session as session_service
 from app.services.auth import (
     DuplicateUserError,
     InvalidCredentialsError,
     authenticate_user,
     register_user,
 )
+from app.ws.connection_manager import manager
 
 router = APIRouter()
 settings = get_settings()
@@ -95,13 +98,22 @@ def read_me(current_user: CurrentUser) -> UserRead:
 @router.post(
     "/auth/logout",
     tags=["auth"],
-    summary="Log out (stateless — client discards the token)",
+    summary="Log out — terminate the user's active session(s)",
 )
-def logout(current_user: CurrentUser) -> dict:
+async def logout(current_user: CurrentUser, db: Session = Depends(get_db)) -> dict:
     """
-    With stateless JWTs there is no server-side session to destroy here; the
-    client drops the token. Real server-enforced revocation is bound to the
-    WebSocket session lifecycle in Module 3 (and to unacceptable trust in
-    Module 7), which is where a deny-list / session teardown belongs.
+    The access token itself is stateless (the client discards it), but from
+    Module 3 on "logout" also means "end the application session": this walks
+    the FSM S2 -> S3 for every active session the user holds and closes the
+    signalling socket. This is the deliberate cross-module call the deliverable
+    "Logout -> WebSocket Closed -> Session Terminated" requires.
     """
-    return {"detail": "Logged out. Discard the access token on the client."}
+    terminated = session_service.terminate_user_sessions(
+        db, current_user.id, reason=TerminationReason.LOGOUT
+    )
+    for session_id in terminated:
+        await manager.close(session_id, code=1000, reason="logout")
+    return {
+        "detail": "Logged out. Discard the access token on the client.",
+        "terminated_sessions": terminated,
+    }

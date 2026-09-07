@@ -1,9 +1,11 @@
 import { Outlet, useNavigate } from 'react-router-dom'
 import { useAuth } from '../../auth/useAuth'
+import { useSession } from '../../session/useSession'
 import { Sidebar } from './Sidebar'
 
 export function AdminLayout() {
   const { user, logout } = useAuth()
+  const { socketStatus } = useSession()
   const navigate = useNavigate()
 
   async function handleLogout() {
@@ -20,6 +22,19 @@ export function AdminLayout() {
             Zero Trust Security Operations
           </span>
           <div className="flex items-center gap-4 text-sm">
+            <span
+              className={`inline-flex items-center gap-1.5 text-xs ${
+                socketStatus === 'connected'
+                  ? 'text-[color:var(--color-risk-low)]'
+                  : socketStatus === 'connecting'
+                    ? 'text-[color:var(--color-risk-medium)]'
+                    : 'text-[color:var(--color-text-muted)]'
+              }`}
+              title="Your session signalling WebSocket"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-current" />
+              session {socketStatus}
+            </span>
             <span className="text-[color:var(--color-text-muted)]">
               {user?.username}
               <span className="ml-2 rounded-full border border-[color:var(--color-border)] px-2 py-0.5 text-xs uppercase tracking-wide">
