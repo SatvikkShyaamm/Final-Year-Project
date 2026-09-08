@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth/useAuth'
 import { useSession } from '../session/useSession'
+import { AclBadge } from '../components/common/AclBadge'
 import type { SessionSocketStatus } from '../types'
 
 /**
@@ -60,7 +61,7 @@ export function UserPortal() {
             />
             <Row label="Duration" value={<LiveDuration since={session.created_at} />} />
             <Row label="IP" value={session.ip_address ?? '—'} />
-            <Row label="ACL" value="— (Module 4)" />
+            <Row label="ACL" value={<AclBadge state={session.acl_status ?? 'none'} />} />
           </dl>
         ) : endedReason ? (
           <p className="mt-3 text-sm text-[color:var(--color-risk-high)]">

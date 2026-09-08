@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { listSessions, terminateSession } from '../../api/sessions'
+import { AclBadge } from '../../components/common/AclBadge'
 import type { Session } from '../../types'
 
 /**
  * Module 3 — real Live Session Monitoring. Polls GET /api/v1/sessions every
- * few seconds and renders whatever the backend reports; the Trust Score / Risk
- * / ACL columns are shown as "—" until Modules 5 and 4 fill them in.
+ * few seconds and renders whatever the backend reports. The ACL column is real
+ * from Module 4 on; Trust Score / Risk stay "—" until Module 5.
  */
 const POLL_MS = 5000
 
@@ -119,7 +120,9 @@ export function LiveSessions() {
                 </Td>
                 <Td className="text-[color:var(--color-text-muted)]">—</Td>
                 <Td className="text-[color:var(--color-text-muted)]">—</Td>
-                <Td className="text-[color:var(--color-text-muted)]">—</Td>
+                <Td>
+                  <AclBadge state={s.acl_status ?? 'none'} />
+                </Td>
                 <Td>
                   {s.state === 'active' && (
                     <button

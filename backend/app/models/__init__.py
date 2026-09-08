@@ -15,6 +15,11 @@ migration:
 Import new models in this file so Alembic's autogenerate can discover them
 via Base.metadata.
 """
+from app.models.acl import (  # noqa: F401  (Module 4)
+    ACLRule,
+    ACLState,
+    EnforcementBackend,
+)
 from app.models.session import (  # noqa: F401  (Module 3)
     Session,
     SessionState,
@@ -28,4 +33,7 @@ __all__ = [
     "Session",
     "SessionState",
     "TerminationReason",
+    "ACLRule",
+    "ACLState",
+    "EnforcementBackend",
 ]

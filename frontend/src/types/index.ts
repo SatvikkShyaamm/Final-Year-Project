@@ -94,3 +94,47 @@ export type SessionSocketStatus =
   | 'connecting'
   | 'connected'
   | 'disconnected'
+
+/* --------------------------------------------------------------------------
+ * Module 4 — Dynamic ACL Management
+ * Mirrors backend/app/schemas/acl.py.
+ * ---------------------------------------------------------------------- */
+
+export type ACLState = 'pending' | 'active' | 'removing' | 'removed' | 'failed'
+
+export interface ACLRule {
+  id: string
+  session_id: string
+  user_id: number
+  username: string | null
+  client_ip: string
+  resource: string
+  ipset_name: string
+  state: ACLState
+  enforcement: 'ipset' | 'simulated'
+  created_at: string
+  activated_at: string | null
+  removed_at: string | null
+  authorization_latency_ms: number | null
+  revocation_latency_ms: number | null
+  removal_reason: string | null
+  last_error: string | null
+}
+
+export interface ACLRuleListResponse {
+  rules: ACLRule[]
+  active_count: number
+  enforcement_backend: string
+  avg_authorization_latency_ms: number | null
+  avg_revocation_latency_ms: number | null
+  generated_at: string
+}
+
+export interface ACLStatusResponse {
+  enforcement_backend: string
+  worker_enabled: boolean
+  queue_depth: number
+  active_rules: number
+  kernel_entries: Record<string, number>
+  generated_at: string
+}

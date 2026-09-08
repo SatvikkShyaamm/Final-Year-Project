@@ -73,10 +73,11 @@ def test_ws_connect_opens_active_session(client, admin_token, user_token):
         assert row["state"] == "active"
         assert row["ws_connected"] is True
         assert row["username"] == "alice"
-        # reserved-for-later columns are present but null
+        # trust_score / risk_level are still reserved (Module 5); acl_status is
+        # populated from Module 4 on (an ACL rule was just requested).
         assert row["trust_score"] is None
         assert row["risk_level"] is None
-        assert row["acl_status"] is None
+        assert row["acl_status"] in ("pending", "active")
 
 
 def test_ws_disconnect_terminates_session(client, admin_token, user_token):

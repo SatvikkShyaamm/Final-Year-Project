@@ -50,6 +50,28 @@ class Settings(BaseSettings):
     session_max_lifetime_minutes: int = 480
     session_sweep_interval_seconds: int = 30
     session_ws_heartbeat_seconds: int = 20
+
+    # ---- Dynamic ACL (Module 4) ----
+    # Which enforcement backend the L-PEP worker uses:
+    #   auto      - use real ipset if the `ipset` command works, else simulate
+    #   ipset     - always shell out to ipset/ip6tables (needs a Linux host +
+    #               NET_ADMIN; this is what the standalone infra/l-pep runs)
+    #   simulated - record the kernel allow-list in Redis only (dev / Docker / CI)
+    acl_enforcement_backend: str = "auto"
+    # Label for what the allow-list entry grants reach to (the paper's
+    # "protected resource" behind the enforcement point).
+    acl_protected_resource: str = "protected-app"
+    # ipset set names, matching the base paper's ztsaacm_allowed / _v6.
+    acl_ipset_v4: str = "ztsaacm_allowed"
+    acl_ipset_v6: str = "ztsaacm_allowed_v6"
+    # Fail-safe TTL (seconds) on each kernel allow-list entry so a lost
+    # revocation can't leave access open forever. 0 disables it.
+    acl_entry_ttl_seconds: int = 900
+    # Run the L-PEP task consumer inside this process (single-container dev /
+    # demo). Set false when running the standalone infra/l-pep worker instead.
+    l_pep_worker_enabled: bool = True
+    l_pep_poll_timeout_seconds: int = 1
+
     # Kept as a raw comma-separated string (not List[str]) because
     # pydantic-settings tries to JSON-decode list-typed env vars before any
     # validator runs, which breaks on a plain "http://a,http://b" value.

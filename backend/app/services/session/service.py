@@ -20,6 +20,7 @@ from app.core.logging import get_logger
 from app.models.session import Session, SessionState, TerminationReason, utcnow
 from app.services.session import store
 from app.services.session.fsm import assert_transition
+from app.services.session.hooks import emit_session_closed, emit_session_opened
 
 logger = get_logger(__name__)
 settings = get_settings()
@@ -106,6 +107,9 @@ def create_session(
         },
     )
     logger.info("session opened id=%s user_id=%s ip=%s", session.id, user.id, ip_address)
+    # Downstream reactions (Module 4 attaches an ACL rule here). Failures are
+    # logged inside emit_* and never propagate — the session still opens.
+    emit_session_opened(db, session)
     return session
 
 
@@ -162,6 +166,8 @@ def terminate_session(
         },
     )
     logger.info("session closed id=%s user_id=%s reason=%s", session.id, session.user_id, reason)
+    # Downstream reactions (Module 4 removes the session's ACL rule here).
+    emit_session_closed(db, session.id, session.user_id, reason)
     return session
 
 

@@ -16,6 +16,7 @@ from app.core.database import SessionLocal
 from app.core.logging import configure_logging, get_logger
 from app.models.session import Session as SessionModel
 from app.services import session as session_service
+from app.services.acl.worker import run_worker as run_acl_worker
 from app.ws.connection_manager import manager
 
 settings = get_settings()
@@ -68,13 +69,24 @@ async def _session_sweeper() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("%s starting up in '%s' mode", settings.project_name, settings.environment)
-    sweeper = asyncio.create_task(_session_sweeper())
+    tasks: list[asyncio.Task] = [asyncio.create_task(_session_sweeper())]
+
+    acl_stop = asyncio.Event()
+    if settings.l_pep_worker_enabled:
+        # In-process L-PEP (base paper's data plane) for the single-container
+        # dev/demo setup. Set L_PEP_WORKER_ENABLED=false when running the
+        # standalone infra/l-pep worker instead.
+        tasks.append(asyncio.create_task(run_acl_worker(acl_stop)))
+
     try:
         yield
     finally:
-        sweeper.cancel()
-        with suppress(asyncio.CancelledError):
-            await sweeper
+        acl_stop.set()
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
         logger.info("%s shutting down", settings.project_name)
 
 

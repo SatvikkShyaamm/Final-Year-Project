@@ -60,6 +60,40 @@ services:
     networks:
       - ztsaacm-net
 
+  # Optional: run the base paper's L-PEP as a *separate* process (data plane),
+  # instead of the in-process worker. Enable with:  docker compose --profile lpep up
+  # On a real deploy this needs a Linux host, the ipset/iptables tooling in the
+  # image, and NET_ADMIN; also set L_PEP_WORKER_ENABLED=false on the backend so
+  # the Redis task queue isn't consumed twice. See infra/l-pep/README.md.
+  l-pep:
+    profiles: ["lpep"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ztsaacm-l-pep
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      REDIS_HOST: redis
+      POSTGRES_HOST: postgres
+      ACL_ENFORCEMENT_BACKEND: ipset
+      L_PEP_WORKER_ENABLED: "false"
+    cap_add:
+      - NET_ADMIN
+    # ipset/iptables aren't in the base image; install them, then run the worker.
+    # Create the sets + rules once on the host first (infra/l-pep/setup-ipset.sh).
+    command: >
+      sh -c "apt-get update && apt-get install -y --no-install-recommends ipset iptables
+      && python -m app.lpep"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - ztsaacm-net
+
   frontend:
     build:
       context: ./frontend

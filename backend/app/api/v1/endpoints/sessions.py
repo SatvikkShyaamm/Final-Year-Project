@@ -37,6 +37,7 @@ from app.schemas.session import (
     SessionRead,
     SessionTerminateResponse,
 )
+from app.services import acl as acl_service
 from app.services import session as session_service
 from app.ws.auth import WsAuthError, resolve_ws_user
 from app.ws.connection_manager import manager
@@ -48,6 +49,12 @@ settings = get_settings()
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _with_acl(session_read: SessionRead, acl_state: str | None) -> SessionRead:
+    """Populate the reserved acl_status field (Module 4) on a session view."""
+    session_read.acl_status = acl_state or "none"
+    return session_read
 
 
 # --------------------------------------------------------------------------- #
@@ -67,8 +74,12 @@ def list_sessions(
     ),
 ) -> SessionListResponse:
     rows = session_service.list_sessions(db, include_terminated=include_terminated)
+    acl_map = acl_service.acl_status_map(db, [row.id for row in rows])
     return SessionListResponse(
-        sessions=[SessionRead.model_validate(row) for row in rows],
+        sessions=[
+            _with_acl(SessionRead.model_validate(row), acl_map.get(row.id))
+            for row in rows
+        ],
         active_count=session_service.count_active(db),
     )
 
@@ -83,7 +94,10 @@ def get_current_session(
     current_user: CurrentUser, db: DbSession = Depends(get_db)
 ) -> SessionRead | None:
     row = session_service.get_current_session_for_user(db, current_user.id)
-    return SessionRead.model_validate(row) if row is not None else None
+    if row is None:
+        return None
+    rule = acl_service.get_rule_for_session(db, row.id)
+    return _with_acl(SessionRead.model_validate(row), rule.state if rule else None)
 
 
 @router.get(
@@ -100,7 +114,8 @@ def get_session(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
     if not current_user.is_admin and row.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your session")
-    return SessionRead.model_validate(row)
+    rule = acl_service.get_rule_for_session(db, row.id)
+    return _with_acl(SessionRead.model_validate(row), rule.state if rule else None)
 
 
 @router.delete(

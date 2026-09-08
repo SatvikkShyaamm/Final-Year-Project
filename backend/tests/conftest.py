@@ -18,21 +18,34 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import app.models  # noqa: F401  (register all ORM models on Base.metadata)
+from app.core.config import get_settings
 from app.core.database import Base, get_db
 from app.main import app
+from app.services.acl.enforcer import reset_enforcer
 
 
 @pytest.fixture(autouse=True)
 def fake_redis(monkeypatch):
     """Swap the shared Redis client for an in-memory fake for every test.
 
-    Module 3's session store goes through ``app.core.redis_client.get_redis()``,
-    which reads this module attribute at call time — so patching it here is
-    enough.
+    The session store and the ACL store both go through
+    ``app.core.redis_client.get_redis()``, which reads this module attribute at
+    call time — so patching it here is enough.
     """
     client = fakeredis.FakeRedis(decode_responses=True)
     monkeypatch.setattr("app.core.redis_client.redis_client", client)
     return client
+
+
+@pytest.fixture(autouse=True)
+def _acl_test_env(monkeypatch):
+    """Deterministic ACL layer for tests: no background L-PEP worker (tests
+    drain the queue explicitly), and a fresh enforcer selection each test."""
+    settings = get_settings()
+    monkeypatch.setattr(settings, "l_pep_worker_enabled", False, raising=False)
+    reset_enforcer()
+    yield
+    reset_enforcer()
 
 
 @pytest.fixture()
@@ -52,13 +65,27 @@ def db_engine():
 
 
 @pytest.fixture()
-def client(db_engine):
-    TestingSessionLocal = sessionmaker(
+def _testing_session_local(db_engine):
+    return sessionmaker(
         bind=db_engine, autocommit=False, autoflush=False, future=True
     )
 
+
+@pytest.fixture()
+def db_session(_testing_session_local):
+    """A plain DB session on the same engine the TestClient uses — for calling
+    service/worker functions directly (e.g. acl.drain_queue)."""
+    session = _testing_session_local()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+@pytest.fixture()
+def client(_testing_session_local):
     def override_get_db():
-        db = TestingSessionLocal()
+        db = _testing_session_local()
         try:
             yield db
         finally:

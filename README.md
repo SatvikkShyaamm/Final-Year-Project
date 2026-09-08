@@ -6,10 +6,12 @@ Continuous Trust Evaluation, presented through a SOC-style admin
 dashboard. See `docs/architecture.md` and the project's Claude project
 docs for full context before making architectural changes.
 
-**Module status:** Modules 1 (Project Foundation), 2 (Authentication) and
-3 (Session Lifecycle) are implemented. Modules 4-9 are still scaffolding —
-their endpoints exist as routes but honestly return `501 Not Implemented`;
-nothing is mocked to look like it works. See `Project status.md`.
+**Module status:** Modules 1-4 (Project Foundation, Authentication, Session
+Lifecycle, Dynamic ACL) are implemented — the core base-paper flow (login →
+session → ACL created → session ends → ACL removed) works end to end.
+Modules 5-9 are still scaffolding — their endpoints exist as routes but
+honestly return `501 Not Implemented`; nothing is mocked to look like it
+works. See `Project status.md`.
 
 ## What actually works right now
 
@@ -37,13 +39,31 @@ nothing is mocked to look like it works. See `Project status.md`.
     `GET /api/v1/sessions/current` is the caller's own session.
   - Redis holds the active-session index + a `session.opened`/`.closed`
     pub/sub channel for Module 8; Postgres stays the source of truth.
+- **Dynamic ACL (Module 4)** — real:
+  - A session opening fires a session hook that creates an `acl_rules` row
+    and pushes an `add` task onto a Redis queue; the **L-PEP worker** pulls
+    it, ref-counts the client IP, applies the kernel allow-list entry, and
+    marks the rule `active` with a measured authorization latency. A session
+    closing (any path) reverses it: `remove` task → rule `removed`, IP pulled
+    from the allow-list, revocation latency recorded.
+  - Ref-counting means two sessions from one IP share one kernel entry —
+    closing one doesn't cut the other's access.
+  - Enforcement backend is `ipset`/`iptables` on a Linux host
+    (`infra/l-pep/`, `python -m app.lpep`) or **simulated** (allow-list
+    mirrored in Redis) everywhere else — auto-detected. The whole
+    control-plane mechanism is real either way; only the final syscall is
+    swapped, and the dashboard reports which backend is live.
+  - `GET /api/v1/acl/rules` + `GET /api/v1/acl/status` (admin) feed the ACL
+    Monitor. ACL rules are not hand-editable — terminating a session removes
+    its rule.
 - Frontend: a real login/register screen, a JWT-aware axios client
   (attaches the token, redirects to `/login` on `401`), an `AuthProvider`
   that rehydrates the session on refresh, route guards (`/admin` admin-only,
   `/portal` any logged-in user), a `SessionProvider` that opens the
   signalling WebSocket after login and reconnects on unexpected drops, a
-  **live Live Sessions** table (auto-refreshing, with per-row Terminate),
-  and a session card + WebSocket status indicator in the portal/header.
+  **live Live Sessions** table (auto-refreshing, per-row Terminate, real ACL
+  column), a **live ACL Monitor** (rules table + enforcement-plane stats),
+  and a session card with WebSocket + ACL status in the portal/header.
 - The **System Status** page (`/admin/status`) still calls the real health
   endpoint and renders the real result.
 - Every planned dashboard section (Live Sessions, Trust Score, Security
@@ -59,6 +79,7 @@ nothing is mocked to look like it works. See `Project status.md`.
 | Backend    | FastAPI, SQLAlchemy 2, Alembic, Pydantic Settings        |
 | Auth       | JWT (PyJWT, HS256), bcrypt password hashing              |
 | Sessions   | FastAPI WebSocket signalling + Redis active-session index |
+| ACL        | Redis task queue + L-PEP worker → ipset/iptables (or simulated) |
 | Database   | PostgreSQL 16                                            |
 | Cache/Queue| Redis 7                                                  |
 | Infra      | Docker, Docker Compose                                   |
@@ -72,20 +93,20 @@ ztsaacm-dashboard/
 ├── docs/
 │   └── architecture.md         # paper-to-code mapping, module boundaries
 ├── infra/
-│   └── l-pep/                  # reserved for Module 4's ACL enforcement component
+│   └── l-pep/                  # Module 4 L-PEP: setup-ipset.sh + how-to-run notes
 ├── backend/
 │   ├── app/
-│   │   ├── main.py              # FastAPI app + CORS + router mount
-│   │   ├── core/                # config, DB session, Redis client, logging
+│   │   ├── main.py              # FastAPI app + CORS + router mount + bg tasks
+│   │   ├── core/                # config, DB session, Redis client, logging, security
 │   │   ├── api/deps.py          # get_db + get_current_user/get_current_admin (Module 2)
 │   │   ├── api/v1/endpoints/    # one file per module's REST endpoints
-│   │   ├── core/security.py     # bcrypt hashing + JWT encode/decode (Module 2)
-│   │   ├── models/              # SQLAlchemy models — user.py (M2), session.py (M3)
-│   │   ├── schemas/             # Pydantic schemas — auth.py (M2), session.py (M3)
-│   │   ├── services/            # business logic per module — auth/ (M2), session/ (M3)
-│   │   └── ws/                  # connection_manager.py + handshake auth.py (Module 3)
-│   ├── alembic/versions/        # DB migrations — 0001 users, 0002 sessions
-│   ├── tests/                   # test_health / test_auth / test_sessions
+│   │   ├── models/              # ORM — user.py (M2), session.py (M3), acl.py (M4)
+│   │   ├── schemas/             # Pydantic schemas per module
+│   │   ├── services/            # business logic per module — auth/ session/ acl/
+│   │   ├── ws/                  # connection_manager.py + handshake auth.py (Module 3)
+│   │   └── lpep/                # `python -m app.lpep` — standalone L-PEP worker (M4)
+│   ├── alembic/versions/        # DB migrations — 0001 users, 0002 sessions, 0003 acl_rules
+│   ├── tests/                   # test_health / test_auth / test_sessions / test_acl
 │   └── requirements.txt
 └── frontend/
     └── src/
@@ -93,7 +114,7 @@ ztsaacm-dashboard/
         ├── auth/                # AuthProvider, ProtectedRoute, token store (M2)
         ├── session/            # SessionProvider, useSession (Module 3)
         ├── components/layout/   # Sidebar, AdminLayout
-        ├── components/common/   # RiskBadge, PlaceholderCard
+        ├── components/common/   # RiskBadge, PlaceholderCard, AclBadge (M4)
         ├── api/                 # axios client + typed API calls
         ├── ws/                  # SessionSocket client (Module 3)
         └── types/
@@ -197,8 +218,28 @@ Or just use the browser: log in at `/login`, watch the "session connected"
 indicator, open `/admin/sessions` as an admin to see the live table, and
 click Terminate or Log out to watch the row flip to `terminated`.
 
+**Dynamic ACL (Module 4)** end to end (with a session open, as above):
+
 ```bash
-cd backend && pytest          # 31 tests: health/stubs + auth + session lifecycle
+curl -s http://localhost:8000/api/v1/acl/rules -H "Authorization: Bearer $TOKEN"
+# -> {"rules":[{...,"state":"active","client_ip":"...","enforcement":"simulated",
+#     "authorization_latency_ms": 3}], "active_count":1, "enforcement_backend":"simulated"}
+
+curl -s http://localhost:8000/api/v1/acl/status -H "Authorization: Bearer $TOKEN"
+# -> {"enforcement_backend":"simulated","queue_depth":0,"active_rules":1,
+#     "kernel_entries":{"ztsaacm_allowed":1,"ztsaacm_allowed_v6":0}}
+
+# close the session's websocket -> the rule goes to state "removed" and the IP
+# leaves kernel_entries, with a revocation_latency_ms recorded.
+```
+
+In the browser, `/admin/acl` shows the live rules table + enforcement-plane
+stats; the Live Sessions table's ACL column and the portal's session card
+both show the rule state. On a Linux host, `ACL_ENFORCEMENT_BACKEND=ipset`
+plus `infra/l-pep/setup-ipset.sh` makes the allow-list a real kernel ipset.
+
+```bash
+cd backend && pytest          # 44 tests: health/stubs + auth + sessions + ACL
 cd frontend && npm run build  # type-checks and builds to dist/
 ```
 
@@ -212,9 +253,8 @@ placeholder values before any shared or deployed use.
 
 ## Next module
 
-Module 4 — Dynamic ACL Management (create an ACL rule when a session opens,
-remove it when the session ends, bound to the FSM S2 state; iptables/ipset on
-Linux). It hooks into the `session.opened` / `session.closed` events and the
-`terminate_session` path this module already emits. Completing it makes the
-core base-paper implementation work end to end. Do not start Module 5+ before
-Module 4 works, per the project's development order.
+Module 5 — Trust Score Engine (configurable weighted-factor score at login,
+risk classification, score storage/history). It gates the FSM S1→S2 transition
+that Module 3 currently makes unconditionally, and its output fills the
+`trust_score` / `risk_level` columns Module 3 reserved. Do not start Module 6+
+before Module 5 works, per the project's development order.
