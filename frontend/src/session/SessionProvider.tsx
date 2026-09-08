@@ -12,9 +12,22 @@ import { SessionContext } from './context'
  * authenticated (Module 3), and tears it down on logout / auth loss. Also
  * keeps a copy of GET /sessions/current so the portal can show session
  * details. No-ops while unauthenticated.
+ *
+ * A server-driven end (session.terminated — admin terminate, idle/lifetime
+ * sweep, and later a Module 7 risk-based revocation) means "this session's
+ * network access is over," but the JWT is still technically valid: without
+ * this, the client would sit on the same page with a dead socket, and a
+ * refresh would silently open a brand-new session with the same token. That
+ * defeats the point of terminating it. So on session.terminated this calls
+ * `forceLogout()`, which drops the token client-side; ProtectedRoute's
+ * existing status check then sends the user back to /login on its own — no
+ * extra navigation logic needed here. A page refresh while still ACTIVE is
+ * unaffected: the tab is torn down by the browser before any message can
+ * arrive, so the valid JWT correctly opens a fresh session on reload, per
+ * docs/architecture.md.
  */
 export function SessionProvider({ children }: { children: ReactNode }) {
-  const { status } = useAuth()
+  const { status, forceLogout } = useAuth()
 
   const [socketStatus, setSocketStatus] = useState<SessionSocketStatus>('idle')
   const [sessionId, setSessionId] = useState<string | null>(null)
@@ -48,6 +61,10 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         setEndedReason(reason)
         setSession(null)
         setSessionId(null)
+        // The backend already ended this session (admin / sweep / etc.) — an
+        // unexpired JWT must not silently reopen a new one behind it. Drop
+        // it client-side; ProtectedRoute takes it from here.
+        forceLogout()
       },
     })
     socketRef.current = socket
@@ -60,7 +77,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       setSessionId(null)
       setSession(null)
     }
-  }, [status, refresh])
+  }, [status, refresh, forceLogout])
 
   const value = useMemo(
     () => ({ socketStatus, sessionId, session, endedReason, refresh }),

@@ -67,6 +67,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setStatus('unauthenticated')
   }, [])
 
+  /**
+   * Local-only counterpart to `logout()` — no /auth/logout call. Used when
+   * the *server* already ended this session (session.terminated arrived on
+   * the signalling socket) rather than the user asking to leave. See the
+   * doc comment on AuthContextValue.forceLogout.
+   */
+  const forceLogout = useCallback(() => {
+    clearToken()
+    setUser(null)
+    setStatus('unauthenticated')
+  }, [])
+
   const value = useMemo(
     () => ({
       user,
@@ -75,8 +87,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       login,
       register,
       logout,
+      forceLogout,
     }),
-    [user, status, login, register, logout],
+    [user, status, login, register, logout, forceLogout],
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

@@ -15,6 +15,16 @@ export interface AuthContextValue {
   login: (credentials: LoginCredentials) => Promise<User>
   register: (payload: RegisterPayload) => Promise<User>
   logout: () => Promise<void>
+  /**
+   * Locally drop the token and mark the app logged out, WITHOUT calling
+   * /auth/logout. For when the backend has already ended this session on its
+   * own (admin terminate, idle/lifetime sweep, a future risk-based
+   * revocation) and pushed session.terminated — the server already knows;
+   * this just brings the client's auth state in line with it so
+   * ProtectedRoute sends the user back to /login. `logout()` above is for
+   * the user's own "Log out" click, which should still notify the server.
+   */
+  forceLogout: () => void
 }
 
 export const AuthContext = createContext<AuthContextValue | null>(null)

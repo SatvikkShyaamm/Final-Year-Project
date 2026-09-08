@@ -3,8 +3,10 @@
  *
  * Dependency-free on purpose so both the axios interceptor (api/client.ts) and
  * the auth context can import it without a cycle. localStorage keeps the user
- * logged in across refreshes; Module 3 will additionally tie liveness to the
- * WebSocket session, at which point a closed socket also means "logged out".
+ * logged in across refreshes; a server-driven session end now also clears it
+ * (SessionProvider calls AuthContext.forceLogout() on session.terminated —
+ * see its doc comment), so a closed-for-cause socket really does mean
+ * "logged out," not just "reconnect with the same token."
  */
 const TOKEN_KEY = 'ztsaacm.access_token'
 
