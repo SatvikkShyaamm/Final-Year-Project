@@ -72,6 +72,37 @@ class Settings(BaseSettings):
     l_pep_worker_enabled: bool = True
     l_pep_poll_timeout_seconds: int = 1
 
+    # ---- Trust Score Engine (Module 5) ----
+    # These are the FINALIZED Section-6 factor weights (approved). They live in
+    # config so Module 10 can tune them for evaluation without touching code.
+    # Formula: score = clamp(baseline + Σ positives - Σ negatives, 0, 100),
+    # computed ONCE at session creation (static score). Dynamic in-session
+    # recalculation is Module 7, not Module 5.
+    trust_score_baseline: int = 70
+    trust_weight_known_device: int = 15        # + : User-Agent seen before for this user
+    trust_weight_known_ip: int = 10            # + : IP / same /24 (or /64) as a recent session
+    trust_weight_typical_hour: int = 5         # + : login within the user's usual hour range
+    trust_weight_unknown_device: int = 10      # - : new User-Agent, user has history
+    trust_weight_ip_changed: int = 10          # - : IP differs from the most recent session
+    trust_weight_approved_vpn: int = 10        # + : source IP in an org-approved VPN CIDR
+    trust_weight_unknown_vpn: int = 15         # - : source IP in a known public VPN/proxy CIDR
+    trust_weight_failed_logins: int = 15       # - : >= threshold failed logins in the window
+    trust_weight_off_hours: int = 5            # - : login 00:00-05:00, fallback when no hour history
+    trust_failed_login_threshold: int = 3
+    trust_failed_login_window_minutes: int = 15
+    trust_typical_hour_min_sessions: int = 5   # need this many prior sessions to learn a range
+    trust_off_hours_start_hour: int = 0        # inclusive, local time (see offset below)
+    trust_off_hours_end_hour: int = 5          # exclusive
+    trust_local_utc_offset_hours: int = 0      # shift session timestamps for the hour-of-day checks
+    # Risk bands (feed Module 6): score >= low_min -> LOW; >= medium_min -> MEDIUM; else HIGH.
+    trust_risk_low_min: int = 80
+    trust_risk_medium_min: int = 50
+    # VPN CIDR allow/deny lists. STATIC DEMO SAMPLES, not a live threat feed —
+    # named as a limitation in the writeup. Module 9's "Simulate Approved/Unknown
+    # VPN" buttons draw a source IP from these ranges.
+    trust_approved_vpn_cidrs_raw: str = "10.8.0.0/24,10.9.0.0/24"
+    trust_known_vpn_cidrs_raw: str = "185.220.100.0/22,185.220.101.0/24,51.75.0.0/16,45.83.220.0/22"
+
     # Kept as a raw comma-separated string (not List[str]) because
     # pydantic-settings tries to JSON-decode list-typed env vars before any
     # validator runs, which breaks on a plain "http://a,http://b" value.
@@ -81,6 +112,14 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins_raw.split(",") if origin.strip()]
+
+    @property
+    def trust_approved_vpn_cidrs(self) -> list[str]:
+        return [c.strip() for c in self.trust_approved_vpn_cidrs_raw.split(",") if c.strip()]
+
+    @property
+    def trust_known_vpn_cidrs(self) -> list[str]:
+        return [c.strip() for c in self.trust_known_vpn_cidrs_raw.split(",") if c.strip()]
 
     @property
     def database_url(self) -> str:

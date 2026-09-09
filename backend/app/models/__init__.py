@@ -25,6 +25,11 @@ from app.models.session import (  # noqa: F401  (Module 3)
     SessionState,
     TerminationReason,
 )
+from app.models.trust_score import (  # noqa: F401  (Module 5)
+    FactorKind,
+    RiskLevel,
+    TrustScoreFactor,
+)
 from app.models.user import User, UserRole  # noqa: F401  (Module 2)
 
 __all__ = [
@@ -36,4 +41,7 @@ __all__ = [
     "ACLRule",
     "ACLState",
     "EnforcementBackend",
+    "TrustScoreFactor",
+    "FactorKind",
+    "RiskLevel",
 ]

@@ -4,13 +4,14 @@ import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth/useAuth'
 import { useSession } from '../session/useSession'
 import { AclBadge } from '../components/common/AclBadge'
+import { RiskBadge } from '../components/common/RiskBadge'
 import type { SessionSocketStatus } from '../types'
 
 /**
- * End-user portal. Module 3 adds the live session card: it reflects the
- * backend session opened by the signalling WebSocket, and a logout here walks
- * the server-side FSM S2 -> S3 (Logout -> WebSocket Closed -> Session
- * Terminated). Trust score / access state land here in Modules 5 and 6.
+ * End-user portal. The live session card reflects the backend session opened
+ * by the signalling WebSocket; a logout here walks the server-side FSM
+ * S2 -> S3. Module 5 adds the session's static trust score + risk band.
+ * Access grant/restrict/revoke state lands here in Module 6.
  */
 export function UserPortal() {
   const { user, logout } = useAuth()
@@ -62,6 +63,20 @@ export function UserPortal() {
             <Row label="Duration" value={<LiveDuration since={session.created_at} />} />
             <Row label="IP" value={session.ip_address ?? '—'} />
             <Row label="ACL" value={<AclBadge state={session.acl_status ?? 'none'} />} />
+            <Row
+              label="Trust score"
+              value={
+                session.trust_score != null
+                  ? `${session.trust_score} / 100`
+                  : '—'
+              }
+            />
+            <Row
+              label="Risk"
+              value={
+                session.risk_level ? <RiskBadge level={session.risk_level} /> : '—'
+              }
+            />
           </dl>
         ) : endedReason ? (
           <p className="mt-3 text-sm text-[color:var(--color-risk-high)]">
@@ -79,8 +94,9 @@ export function UserPortal() {
       </div>
 
       <p className="mt-6 text-sm text-[color:var(--color-text-muted)]">
-        Trust score and access grant/restrict/revoke state will appear here once
-        Modules 5 and 6 are implemented.
+        The trust score above is the static score from session creation. Whether
+        a MEDIUM/HIGH score means "verify with MFA" or "block" is decided by
+        Module 6; in-session re-scoring is Module 7.
       </p>
     </div>
   )

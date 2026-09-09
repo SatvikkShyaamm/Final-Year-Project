@@ -215,6 +215,9 @@ async def session_ws(
             "state": SessionState.ACTIVE,
             "server_time": _now_iso(),
             "user": {"id": user.id, "username": user.username, "role": user.role},
+            # Static trust score, computed by the session_opened hook (Module 5).
+            "trust_score": session.trust_score,
+            "risk_level": session.risk_level,
         },
     )
     logger.info("ws attached session=%s user_id=%s", session_id, user.id)

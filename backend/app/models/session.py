@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -93,6 +93,13 @@ class Session(Base):
         DateTime(timezone=False), nullable=True
     )
     termination_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # ---- Trust Score (Module 5) ----
+    # The static/initial trust score computed once at session creation, and its
+    # risk band. Null until Module 5's session-open hook fills them in; Module 7
+    # will later overwrite them as it recomputes the score in-session.
+    trust_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    risk_level: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     user = relationship("User", lazy="joined")
 

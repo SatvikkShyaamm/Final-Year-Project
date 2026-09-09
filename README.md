@@ -6,10 +6,11 @@ Continuous Trust Evaluation, presented through a SOC-style admin
 dashboard. See `docs/architecture.md` and the project's Claude project
 docs for full context before making architectural changes.
 
-**Module status:** Modules 1-4 (Project Foundation, Authentication, Session
-Lifecycle, Dynamic ACL) are implemented — the core base-paper flow (login →
-session → ACL created → session ends → ACL removed) works end to end.
-Modules 5-9 are still scaffolding — their endpoints exist as routes but
+**Module status:** Modules 1-5 (Project Foundation, Authentication, Session
+Lifecycle, Dynamic ACL, Trust Score Engine) are implemented. The core
+base-paper flow (login → session → ACL created → session ends → ACL removed)
+works end to end, and every session now carries a static trust score + risk
+band. Modules 6-9 are still scaffolding — their endpoints exist as routes but
 honestly return `501 Not Implemented`; nothing is mocked to look like it
 works. See `Project status.md`.
 
@@ -56,14 +57,33 @@ works. See `Project status.md`.
   - `GET /api/v1/acl/rules` + `GET /api/v1/acl/status` (admin) feed the ACL
     Monitor. ACL rules are not hand-editable — terminating a session removes
     its rule.
+- **Trust Score Engine (Module 5)** — real, per the finalized Section-6 spec:
+  - A session opening also fires a hook that computes a **static** trust
+    score: `clamp(70 + Σ positive − Σ negative, 0, 100)` over the finalized
+    factor table (known/unknown device, known IP / IP-changed, approved vs
+    known-public VPN CIDR, ≥3 failed logins in 15 min, typical-hour vs
+    off-hours). It's written to `sessions.trust_score` / `sessions.risk_level`
+    with a per-factor breakdown in `trust_score_factors`.
+  - First-ever login for a user has no history, so it lands at ~70 = MEDIUM →
+    every user gets challenged on first login once Module 6 exists (a
+    deliberate, approved Zero-Trust consequence).
+  - Failed logins are counted in Redis (`ztsaacm:failed_logins:{user_id}`,
+    15-min TTL), incremented from `POST /auth/login` failures.
+  - Module 5 only *computes and reports* the score — turning MEDIUM/HIGH into
+    "require MFA" / "block" is Module 6; in-session re-scoring is Module 7.
+  - `GET /api/v1/trust-score/{session_id}` (score + breakdown),
+    `/trust-score/user/{id}/history`, `/trust-score/config` (the live weight
+    table) feed the Trust Score Monitoring page.
 - Frontend: a real login/register screen, a JWT-aware axios client
   (attaches the token, redirects to `/login` on `401`), an `AuthProvider`
   that rehydrates the session on refresh, route guards (`/admin` admin-only,
   `/portal` any logged-in user), a `SessionProvider` that opens the
   signalling WebSocket after login and reconnects on unexpected drops, a
   **live Live Sessions** table (auto-refreshing, per-row Terminate, real ACL
-  column), a **live ACL Monitor** (rules table + enforcement-plane stats),
-  and a session card with WebSocket + ACL status in the portal/header.
+  + trust/risk columns), a **live ACL Monitor**, a **live Trust Score
+  Monitoring** page (score meter, factor breakdown, per-user history chart,
+  live weight table), and a session card with WebSocket + ACL + trust/risk
+  status in the portal/header.
 - The **System Status** page (`/admin/status`) still calls the real health
   endpoint and renders the real result.
 - Every planned dashboard section (Live Sessions, Trust Score, Security
@@ -80,6 +100,7 @@ works. See `Project status.md`.
 | Auth       | JWT (PyJWT, HS256), bcrypt password hashing              |
 | Sessions   | FastAPI WebSocket signalling + Redis active-session index |
 | ACL        | Redis task queue + L-PEP worker → ipset/iptables (or simulated) |
+| Trust Score| Weighted-factor engine (config-driven weights) + Redis failed-login counter |
 | Database   | PostgreSQL 16                                            |
 | Cache/Queue| Redis 7                                                  |
 | Infra      | Docker, Docker Compose                                   |
@@ -100,13 +121,13 @@ ztsaacm-dashboard/
 │   │   ├── core/                # config, DB session, Redis client, logging, security
 │   │   ├── api/deps.py          # get_db + get_current_user/get_current_admin (Module 2)
 │   │   ├── api/v1/endpoints/    # one file per module's REST endpoints
-│   │   ├── models/              # ORM — user.py (M2), session.py (M3), acl.py (M4)
+│   │   ├── models/              # ORM — user (M2), session (M3), acl (M4), trust_score (M5)
 │   │   ├── schemas/             # Pydantic schemas per module
-│   │   ├── services/            # business logic per module — auth/ session/ acl/
+│   │   ├── services/            # business logic per module — auth/ session/ acl/ trust_score/
 │   │   ├── ws/                  # connection_manager.py + handshake auth.py (Module 3)
 │   │   └── lpep/                # `python -m app.lpep` — standalone L-PEP worker (M4)
-│   ├── alembic/versions/        # DB migrations — 0001 users, 0002 sessions, 0003 acl_rules
-│   ├── tests/                   # test_health / test_auth / test_sessions / test_acl
+│   ├── alembic/versions/        # migrations — 0001 users, 0002 sessions, 0003 acl, 0004 trust
+│   ├── tests/                   # test_health / _auth / _sessions / _acl / _trust_score
 │   └── requirements.txt
 └── frontend/
     └── src/
@@ -238,8 +259,30 @@ stats; the Live Sessions table's ACL column and the portal's session card
 both show the rule state. On a Linux host, `ACL_ENFORCEMENT_BACKEND=ipset`
 plus `infra/l-pep/setup-ipset.sh` makes the allow-list a real kernel ipset.
 
+**Trust Score (Module 5)** end to end (with a session open, as above):
+
 ```bash
-cd backend && pytest          # 44 tests: health/stubs + auth + sessions + ACL
+# the score is on the WS establish message and on the session row
+curl -s http://localhost:8000/api/v1/sessions -H "Authorization: Bearer $TOKEN"
+# -> {"sessions":[{...,"trust_score":70,"risk_level":"MEDIUM"}], ...}
+
+curl -s "http://localhost:8000/api/v1/trust-score/$SESSION_ID" -H "Authorization: Bearer $TOKEN"
+# -> {"trust_score":70,"risk_level":"MEDIUM","factors":[
+#      {"factor_name":"baseline","weight_applied":70,"reason":"Zero Trust neutral-positive baseline"},
+#      ... ]}
+
+curl -s http://localhost:8000/api/v1/trust-score/config -H "Authorization: Bearer $TOKEN"
+# -> the live weight table + risk bands
+
+# 3 bad-password logins then a new session -> the failed_login_burst factor (-15) appears
+```
+
+`/admin/trust-score` shows the score meter, the exact per-factor breakdown,
+the user's score history, and the live weight table. Weights/thresholds/VPN
+CIDRs are all in `app/core/config.py` (env-overridable).
+
+```bash
+cd backend && pytest          # 56 tests: health/stubs + auth + sessions + ACL + trust score
 cd frontend && npm run build  # type-checks and builds to dist/
 ```
 
@@ -253,8 +296,8 @@ placeholder values before any shared or deployed use.
 
 ## Next module
 
-Module 5 — Trust Score Engine (configurable weighted-factor score at login,
-risk classification, score storage/history). It gates the FSM S1→S2 transition
-that Module 3 currently makes unconditionally, and its output fills the
-`trust_score` / `risk_level` columns Module 3 reserved. Do not start Module 6+
-before Module 5 works, per the project's development order.
+Module 6 — Adaptive MFA (TOTP-based MFA generation/verification, expiry, retry
+handling). It reads the Module 5 `risk_level` and turns it into an
+allow / require-MFA / block decision at the FSM S1→S2 transition — the gate
+Module 5 deliberately does *not* apply. Do not start Module 7+ before Module 6
+works, per the project's development order.

@@ -23,6 +23,7 @@ from app.core.security import create_access_token
 from app.models.session import TerminationReason
 from app.schemas.auth import LoginRequest, Token, UserCreate, UserRead
 from app.services import session as session_service
+from app.services import trust_score as trust_score_service
 from app.services.auth import (
     DuplicateUserError,
     InvalidCredentialsError,
@@ -77,6 +78,9 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> Token:
             db, username=payload.username, password=payload.password
         )
     except InvalidCredentialsError as exc:
+        # Feed Module 5's failed-login burst counter (Redis, 15-min TTL). Only
+        # counts against a known username; a no-op otherwise.
+        trust_score_service.record_failed_login_attempt(db, username=payload.username)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(exc),

@@ -73,11 +73,13 @@ def test_ws_connect_opens_active_session(client, admin_token, user_token):
         assert row["state"] == "active"
         assert row["ws_connected"] is True
         assert row["username"] == "alice"
-        # trust_score / risk_level are still reserved (Module 5); acl_status is
-        # populated from Module 4 on (an ACL rule was just requested).
-        assert row["trust_score"] is None
-        assert row["risk_level"] is None
+        # acl_status populated from Module 4; trust_score / risk_level from
+        # Module 5 (static score computed at session open — first-ever session
+        # for this user lands in the MEDIUM band, baseline 70 give or take the
+        # off-hours factor).
         assert row["acl_status"] in ("pending", "active")
+        assert 60 <= row["trust_score"] <= 100
+        assert row["risk_level"] in ("LOW", "MEDIUM", "HIGH")
 
 
 def test_ws_disconnect_terminates_session(client, admin_token, user_token):

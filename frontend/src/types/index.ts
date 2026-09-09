@@ -138,3 +138,62 @@ export interface ACLStatusResponse {
   kernel_entries: Record<string, number>
   generated_at: string
 }
+
+/* --------------------------------------------------------------------------
+ * Module 5 — Trust Score Engine
+ * Mirrors backend/app/schemas/trust_score.py.
+ * ---------------------------------------------------------------------- */
+
+export type FactorKind = 'baseline' | 'positive' | 'negative'
+
+export interface TrustFactor {
+  factor_name: string
+  factor_kind: FactorKind
+  weight_applied: number
+  reason: string
+}
+
+export interface SessionTrustScore {
+  session_id: string
+  user_id: number
+  username: string | null
+  trust_score: number | null
+  risk_level: RiskLevel | null
+  evaluated_at: string | null
+  factors: TrustFactor[]
+}
+
+export interface TrustScoreHistoryEntry {
+  session_id: string
+  trust_score: number | null
+  risk_level: RiskLevel | null
+  created_at: string
+  ip_address: string | null
+  state: SessionState
+}
+
+export interface TrustScoreHistoryResponse {
+  user_id: number
+  username: string | null
+  entries: TrustScoreHistoryEntry[]
+  average_trust_score: number | null
+}
+
+export interface TrustFactorCatalogEntry {
+  factor_name: string
+  factor_kind: FactorKind
+  weight: number
+  applies_when: string
+}
+
+export interface TrustScoreConfigResponse {
+  baseline: number
+  risk_bands: Record<string, string>
+  factors: TrustFactorCatalogEntry[]
+  failed_login_threshold: number
+  failed_login_window_minutes: number
+  approved_vpn_cidrs: string[]
+  known_vpn_cidrs: string[]
+  known_vpn_list_is_static_sample: boolean
+  generated_at: string
+}
