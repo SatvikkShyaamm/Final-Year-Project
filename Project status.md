@@ -1269,3 +1269,147 @@ first real login could ever be risk-evaluated from a clean slate. Fixed by
 no longer treating a successful registration as an authenticated session.
 Modules 1-5, Module 6's decision logic, and the section-10/11 hardening are
 all unaffected. Module 7 is unaffected and still not started.
+
+## 13. Post-Section-12 Regression — First-Time-Login 500 (Reported as a CORS Error) from an Unapplied Alembic Migration — Diagnosed and Fixed (2026-09-10)
+
+Right after verifying the section-12 fix, the developer registered two new
+accounts and tried logging in to both, to confirm MFA now actually
+triggers. Both failed. The browser (Firefox) reported:
+
+> Cross-Origin Request Blocked: The Same Origin Policy disallows reading
+> the remote resource at http://localhost:8000/api/v1/auth/login. (Reason:
+> CORS header 'Access-Control-Allow-Origin' missing). Status code: 500.
+
+The developer also reported this was **not** limited to the two new
+accounts — pre-existing accounts that had been created earlier but never
+successfully logged in failed the exact same way.
+
+### Diagnosis
+
+The CORS wording is a red herring. The line the browser itself prints —
+`Status code: 500` — is the real signal: the backend threw an unhandled
+exception while handling the request, and FastAPI/Starlette's CORS
+middleware only attaches `Access-Control-Allow-Origin` to responses that
+pass back through its own `send` wrapper normally. An unhandled 500 can
+skip that, so the browser sees a response with no CORS header and reports
+"CORS blocked" instead of surfacing the real 500. This is a backend crash,
+not a credentials problem and not a cross-origin misconfiguration.
+
+Traced the request path end to end through the actual code (not assumed):
+`authenticate_user` (username/password check), `trust_score_service.
+evaluate_login`, `mfa_service.decide`, and — for a MEDIUM-risk decision —
+`mfa_service.create_challenge`. Nothing in the decision logic itself was
+broken. The distinguishing fact that cracked it: every affected account had
+**zero prior session history** — either brand new, or old and never
+logged in. Section 6/7's Module 5 guarantee is that a first-ever login
+with no history always lands in MEDIUM risk, which means `/auth/login`
+always calls `mfa_service.create_challenge` for these accounts. That
+function does:
+
+```python
+challenge = MFAChallenge(
+    ...
+    code_hash=email_otp.hash_code(code, salt),
+    code_salt=salt,
+    delivered_via=delivered_via,
+    ...
+)
+db.add(challenge)
+db.commit()
+```
+
+`code_hash`, `code_salt`, and `delivered_via` are exactly the three columns
+added by Alembic migration `0007_mfa_email_otp.py` (`alembic/versions/
+0007_mfa_email_otp.py`), authored earlier the same day (2026-09-10) as part
+of the section-11 TOTP-to-email-OTP redesign. `alembic upgrade head` had
+not been re-run against the developer's actual running Postgres database
+after that migration was written, so the live `mfa_challenges` table was
+still missing those three columns. Every attempt to insert a challenge row
+for a MEDIUM-risk login therefore failed at the database level with a SQL
+error, which FastAPI turned into an unhandled 500 — and, per the CORS
+mechanism above, a browser-side "CORS blocked" message instead of a
+readable error.
+
+This also explains why the symptom looked account-independent: any account
+with an *existing* session history (known device/IP) lands in LOW risk,
+never calls `create_challenge` at all, and would have logged in fine — the
+developer did not report any account working, consistent with every
+account tested at that point being either brand-new or never-logged-in.
+
+### Fix
+
+No source code was changed — Modules 2, 5, and 6's logic was correct and
+untouched. This was a deployment/ops gap: the migration existed in the
+repo but had not been applied to the live database. Resolved by running,
+in the backend's virtualenv:
+
+```
+alembic current
+alembic upgrade head
+```
+
+followed by a backend restart.
+
+### Verification
+
+Developer confirmed, after applying the migration and restarting the
+backend, that login now completes normally for both newly-registered
+accounts and pre-existing accounts that had never logged in before.
+
+**Conclusion:** not a regression from the section-12 fix, and not a bug in
+the trust-score/MFA decision code — a migration that had been written but
+not yet applied to the real database. Worth remembering for future
+migrations: a schema change to `mfa_challenges` (or any table) only takes
+effect once `alembic upgrade head` is actually re-run against the running
+database — writing the migration file is not enough by itself.
+
+## 14. Module 6 — SMTP Configured for Real Email Delivery of MFA Codes (2026-09-10)
+
+Sections 7 and 9 both flagged that Module 6's email-OTP delivery had only
+ever run in its `dev_logged` fallback mode — `SMTP_USERNAME`/`SMTP_PASSWORD`
+were blank in `backend/.env`, so every verification code was logged
+server-side and surfaced to the UI as `dev_code` instead of actually being
+emailed. This section configures the real send path.
+
+### What was done
+
+`backend/app/services/mfa/email_otp.py` already implemented both paths
+(`is_smtp_configured()` gates between a real `smtplib.SMTP` send and the
+dev-log fallback) — no source file was touched. The developer filled in
+the previously-blank SMTP settings in `backend/.env`:
+
+```
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USE_TLS=true
+SMTP_USERNAME=<a Gmail address with 2-Step Verification on>
+SMTP_PASSWORD=<a 16-character Gmail App Password for that address>
+```
+
+`MFA_DEV_EXPOSE_CODE` was left unset, which defaults to `false` in
+`app/core/config.py` — and per the code comment in `email_otp.py`, once
+`SMTP_USERNAME`/`SMTP_PASSWORD` are set, real email is always sent and
+`dev_code` is never returned regardless of that flag anyway.
+
+`backend/.env` is listed in `.gitignore` (confirmed via `git check-ignore
+-v backend/.env`) and was not, and will never be, committed — the Gmail
+App Password never enters git history. This is purely a local
+configuration change; there is no corresponding code diff to commit for
+this step.
+
+### Status — configured, delivery not yet confirmed live
+
+As of this entry, the SMTP values are set but the developer has **not yet**
+triggered a real MEDIUM-risk login to confirm the code actually arrives in
+the registered address's inbox. Per the developer's explicit instruction
+from when SMTP setup was first requested, the `dev_code` field in
+`Login.tsx`'s MFA step is being left in place until that live delivery is
+confirmed — it will be removed as a separate, deliberate follow-up once
+confirmed, not bundled into this configuration step.
+
+### Next step
+
+Developer to trigger a first-time (MEDIUM-risk) login on an account whose
+registered email is a real, checkable inbox, and confirm the code arrives.
+Once confirmed, report back so the `dev_code` UI element can be removed
+from `Login.tsx`.
