@@ -1169,3 +1169,103 @@ allow/challenge/block exactly as before), nor any other module. Modules
 unaffected — verified by the full regression-tested suite above. Module 7
 is unaffected and still not started; this section records a constraint
 Module 7 should follow (email, not TOTP) rather than any Module 7 work.
+
+---
+
+## 12. First-Login MFA Bypass via Registration-Triggered Session — Diagnosed and Fixed (2026-09-10)
+
+Found while the developer was live-testing the email-OTP MFA flow from
+section 11: registering a brand-new account, then logging out and logging
+back in as that same account, skipped the MFA challenge entirely — even
+though Module 5/6 are supposed to guarantee that a genuinely first-ever
+login always lands in MEDIUM risk and gets challenged.
+
+### Root cause
+
+Not a defect in the trust-score or MFA decision code itself — both were
+verified to do exactly what they're told with the history they were given.
+The gap is one step upstream, in how the frontend treats registration:
+
+1. `AuthProvider.register()` set auth status to `'authenticated'` the
+   instant `POST /auth/register` returned. This was intentional — Module 6
+   was never meant to gate registration, since the user already proved
+   their credentials in that same request (see the Module 6 subsection in
+   section 3 and Section 7 of `MASTER_PROJECT_CONTEXT.docx`).
+2. `SessionProvider` opens the app's WebSocket as soon as auth status
+   becomes `'authenticated'`, with no distinction between "just registered"
+   and "just logged in."
+3. That WebSocket connect calls Module 3's `create_session`, which persists
+   a real `sessions` row recording the browser's User-Agent and IP — and
+   Module 5's `session_opened` hook silently computes and stores a trust
+   score for it, with no gate of any kind (Module 5 was never designed to
+   gate anything; it just scores and stores).
+4. So by the time the developer logged out and back in, the account already
+   had **one prior session on file**. Module 5's `evaluate_login` therefore
+   saw `has_history = True`, and since the login came from the same
+   browser/machine that had just registered: `known_device` (+15,
+   `trust_weight_known_device` in `app/core/config.py`) and `known_ip`
+   (+10, `trust_weight_known_ip`) both applied. `70 (baseline) + 15 + 10 =
+   95` — comfortably inside the LOW band (≥80) — so `mfa.decide()` correctly
+   returned `ALLOW`, not `MFA`.
+
+In short: registering quietly seeded exactly the "known device, known IP"
+history that Module 5 is supposed to reward on a *second* login — before
+the account's first real login ever ran the risk check at all. The
+"first-ever login is always MEDIUM and gets MFA" guarantee (Section 6 of
+the master context, and the Module 5 test suite's own
+`test_second_session_is_recognised_as_known_device_and_ip` case) technically
+still holds for a session with zero prior history; the frontend flow just
+made sure no real login ever saw zero prior history.
+
+### Fix (frontend only, no backend/API contract change)
+
+- `frontend/src/auth/context.ts` — `register()`'s return type changed from
+  `Promise<User>` to `Promise<void>`: creating an account no longer implies
+  an authenticated outcome.
+- `frontend/src/auth/AuthProvider.tsx` — `register()` still calls
+  `POST /auth/register` (the account is created exactly as before), but now
+  discards the returned token/user instead of storing it and flipping auth
+  status to `'authenticated'`. With auth status never becoming
+  `'authenticated'` off the back of a register call, `SessionProvider` never
+  opens a WebSocket for it, so no session — and no trust history — is
+  seeded.
+- `frontend/src/pages/Login.tsx` — after a successful registration, the form
+  now switches back to sign-in mode (with an "Account created. Sign in to
+  continue." notice, and the email/password fields cleared) instead of
+  routing straight into the dashboard. The user's very next action is a
+  real `POST /auth/login`, which runs Module 5/6's risk check against a
+  genuinely empty history — so a first-ever login is now actually
+  challenged with MFA, matching the documented design.
+
+`POST /auth/register`'s own contract (still returns a `Token`) is
+unchanged — this is purely about what the frontend chooses to do with that
+response. No backend file was touched; Modules 1-6 and the section-10/11
+hardening are unaffected.
+
+### Verification
+
+- Diff reviewed: exactly 3 frontend files touched
+  (`auth/context.ts`, `auth/AuthProvider.tsx`, `pages/Login.tsx`),
+  39 insertions / 8 deletions — all additive except the register-branch
+  rewrite in `Login.tsx`'s `handleCredentials`. No backend file in the diff.
+- Grepped the whole frontend source tree for other `register(` call sites —
+  the only one was the `Login.tsx` call already updated to the new
+  `Promise<void>` signature.
+- `npx tsc -b --noEmit` → 0 errors.
+- Each file was patched in place preserving its own pre-existing
+  line-ending convention (`context.ts` / `AuthProvider.tsx` are CRLF,
+  `Login.tsx` is LF, per the section-9 housekeeping note) — `git diff` and
+  `git diff -w` stats match exactly, so no line-ending noise was
+  introduced.
+- Not yet re-run live end-to-end by the developer (register → sign in →
+  confirm the MFA step now appears) — that confirmation is the developer's
+  next step; the reasoning above is the actual mechanism traced through the
+  code, not an assumption.
+
+**Conclusion:** the MFA/trust-score decision logic in Modules 5 and 6 was
+correct all along; the bug was that the app's own registration flow
+inadvertently gave every account a "known device" head start before its
+first real login could ever be risk-evaluated from a clean slate. Fixed by
+no longer treating a successful registration as an authenticated session.
+Modules 1-5, Module 6's decision logic, and the section-10/11 hardening are
+all unaffected. Module 7 is unaffected and still not started.
