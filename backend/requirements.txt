@@ -1,8 +1,6 @@
 # ============================================================================
 # Backend dependencies.
-# Modules 1 (Foundation) + 2 (Authentication) + 3 (Session Lifecycle).
-# MFA/Trust-score specific libraries (pyotp, etc.) are still added later with
-# their owning modules (5, 6) to avoid pulling in unused dependencies early.
+# Modules 1-6 (Foundation, Auth, Session, ACL, Trust Score, Adaptive MFA).
 # ============================================================================
 
 # --- Web framework & server ---
@@ -25,6 +23,9 @@ redis==6.4.0
 PyJWT==2.10.1                # JWT encode/decode (pure-Python, no build step)
 bcrypt==4.3.0               # password hashing, used directly (no passlib shim)
 email-validator==2.2.0     # backs pydantic's EmailStr in schemas/auth.py
+
+# --- Adaptive MFA (Module 6) ---
+pyotp==2.9.0                # RFC 6238 TOTP generation/verification (pure-Python)
 
 # --- WebSocket support (pulled in by uvicorn[standard] via websockets, listed
 #     explicitly since Module 3 depends on it directly) ---

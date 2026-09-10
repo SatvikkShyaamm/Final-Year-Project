@@ -103,6 +103,23 @@ class Settings(BaseSettings):
     trust_approved_vpn_cidrs_raw: str = "10.8.0.0/24,10.9.0.0/24"
     trust_known_vpn_cidrs_raw: str = "185.220.100.0/22,185.220.101.0/24,51.75.0.0/16,45.83.220.0/22"
 
+    # ---- Adaptive MFA (Module 6) ----
+    # Decision at login (Section 6 bands, reusing the trust_risk_* thresholds
+    # above): risk LOW -> allow, MEDIUM -> require MFA, HIGH -> block.
+    # mfa_enabled is the MFA-step master switch: when false, MEDIUM logins are
+    # allowed straight through (HIGH is still blocked). For Module 10 perf runs.
+    mfa_enabled: bool = True
+    mfa_challenge_ttl_minutes: int = 5
+    mfa_max_attempts: int = 5
+    mfa_totp_issuer: str = "ZTSAACM"
+    mfa_totp_digits: int = 6
+    mfa_totp_interval_seconds: int = 30
+    mfa_totp_valid_window: int = 1        # +/- this many 30s steps of clock-skew tolerance
+    # When true (or environment == "development"), MFA challenge responses also
+    # carry the currently-valid TOTP code so the demo/tests work without an
+    # authenticator app. MUST be false in a real deployment.
+    mfa_dev_expose_code: bool = False
+
     # Kept as a raw comma-separated string (not List[str]) because
     # pydantic-settings tries to JSON-decode list-typed env vars before any
     # validator runs, which breaks on a plain "http://a,http://b" value.

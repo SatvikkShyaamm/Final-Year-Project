@@ -2,18 +2,30 @@ import { apiClient } from './client'
 import type {
   AuthToken,
   LoginCredentials,
+  LoginResponse,
   RegisterPayload,
   User,
 } from '../types'
 
 /**
- * Typed wrappers over the Module 2 backend auth endpoints. All token handling
- * (storage, header injection, 401 handling) lives in the axios client and the
- * auth context — these functions just describe the HTTP contract.
+ * Typed wrappers over the auth endpoints. All token handling (storage, header
+ * injection, 401 handling) lives in the axios client and the auth context.
+ *
+ * Module 6: /auth/login is now a risk decision — it returns either an access
+ * token (LOW) or an MFA challenge (MEDIUM), or fails 403 (HIGH). Completing the
+ * challenge at /mfa/verify returns a normal AuthToken.
  */
 
-export async function login(credentials: LoginCredentials): Promise<AuthToken> {
-  const { data } = await apiClient.post<AuthToken>('/api/v1/auth/login', credentials)
+export async function login(credentials: LoginCredentials): Promise<LoginResponse> {
+  const { data } = await apiClient.post<LoginResponse>('/api/v1/auth/login', credentials)
+  return data
+}
+
+export async function verifyMfa(body: {
+  mfa_token: string
+  code: string
+}): Promise<AuthToken> {
+  const { data } = await apiClient.post<AuthToken>('/api/v1/mfa/verify', body)
   return data
 }
 
@@ -39,11 +51,21 @@ export async function logout(): Promise<void> {
 
 /** Pull a human-readable message out of an axios error from these endpoints. */
 export function authErrorMessage(error: unknown, fallback: string): string {
-  if (typeof error === 'object' && error !== null && 'response' in error) {
-    const detail = (error as { response?: { data?: { detail?: unknown } } })
-      .response?.data?.detail
-    if (typeof detail === 'string') return detail
-    if (Array.isArray(detail) && detail[0]?.msg) return String(detail[0].msg)
+  const detail = axiosErrorDetail(error)
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail) && detail[0]?.msg) return String(detail[0].msg)
+  if (detail && typeof detail === 'object' && 'message' in detail) {
+    return String((detail as { message: unknown }).message)
   }
   return fallback
+}
+
+/** The raw `detail` payload of a FastAPI error response (string, list, or the
+ * structured objects Module 6's block / MFA-verify errors return). */
+export function axiosErrorDetail(error: unknown): unknown {
+  if (typeof error === 'object' && error !== null && 'response' in error) {
+    return (error as { response?: { data?: { detail?: unknown } } }).response?.data
+      ?.detail
+  }
+  return undefined
 }

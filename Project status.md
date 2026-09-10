@@ -2,9 +2,10 @@
 
 ## 1. Current Status
 
-Current Module: Module 6 – Adaptive MFA (next)
+Current Module: Module 7 – Continuous Trust Evaluation (next)
 Overall Project Status: Core base-paper flow complete (Modules 1-4) + static
-Trust Score on every session (Module 5). Modules 6-10 not started.
+Trust Score (Module 5) + risk-gated Adaptive MFA at login (Module 6).
+Modules 7-10 not started.
 
 |         Module                         |              Status          |
 |----------------------------------------|------------------------------|
@@ -13,7 +14,7 @@ Trust Score on every session (Module 5). Modules 6-10 not started.
 | Module 3 – Session Lifecycle           | Completed                    |
 | Module 4 – Dynamic ACL                 | Completed & independently verified |
 | Module 5 – Trust Score Engine          | Completed                    |
-| Module 6 – Adaptive MFA                | Not started                  |
+| Module 6 – Adaptive MFA                | Completed                    |
 | Module 7 – Continuous Trust Evaluation | Not started                  |
 | Module 8 – Security Dashboard          | Not started                  |
 | Module 9 – Attack Simulation           | Not started                  |
@@ -30,7 +31,8 @@ Trust Score on every session (Module 5). Modules 6-10 not started.
 - WebSocket: FastAPI/Starlette WebSocket — the session signalling channel (Module 3)
 - Network access control: Redis task queue + L-PEP worker → ipset/iptables on Linux, or a simulated backend elsewhere (Module 4)
 - Trust Score: config-driven weighted-factor engine (Module 5), static score at session creation, Redis failed-login burst counter
-- Other important technologies: Redis 7 (session active-set + events; ACL task queue + ref-counts + receipts + events; failed-login counter), Docker + Docker Compose
+- Adaptive MFA: TOTP (pyotp / RFC 6238), risk-band gated at `POST /auth/login` (Module 6)
+- Other important technologies: Redis 7 (session active-set + events; ACL task queue + ref-counts + receipts + events; failed-login counter; MFA event stream), Docker + Docker Compose
 
 ---
 
@@ -204,11 +206,75 @@ Implemented against the **finalized Section 6** of `MASTER_PROJECT_CONTEXT.docx`
   known-device/known-IP → LOW, failed-login burst applies −15, evaluator unit
   tests (first-time-user = exact baseline, off-hours fallback, approved vs
   known VPN CIDR, risk-band classification), config endpoint + RBAC, session
-  trust-score RBAC + 404, per-user history + RBAC. Full backend suite:
-  **56 passing**. Migration `0004` verified to produce the same schema as the
-  ORM (which the suite exercises). `frontend` type-checks and builds clean
-  (Recharts pushes the bundle >500 kB — informational Vite warning only;
-  Module 8 will code-split the dashboard).
+  trust-score RBAC + 404, per-user history + RBAC. Migration `0004` verified to
+  produce the same schema as the ORM.
+
+### Module 6 — Adaptive MFA
+
+Implemented against Master Context Section 6 (risk bands) + Section 7/8
+(Module 6). TOTP (RFC 6238) via `pyotp`.
+
+- **The gate is at `POST /auth/login`**, after the credential check and before
+  any session — matching Section 4/13 (JWT → trust score → risk decision →
+  *then* WebSocket). `trust_score.evaluate_login()` (new, non-persisting entry
+  point) produces a risk band; `mfa.decide()` maps it:
+  - **LOW** → normal access token (`LoginResponse.mfa_required=false`).
+  - **MEDIUM** → an `mfa_challenges` row + a short-lived `mfa_pending` token;
+    the client completes it at `POST /mfa/verify` (TOTP code, ±1 step skew),
+    which returns a real `Token`. `MFA_ENABLED=false` downgrades MEDIUM to
+    allow (HIGH still blocks) for Module 10 perf runs.
+  - **HIGH** → HTTP 403, no token.
+- **Every first-ever login is MEDIUM** (no history → baseline 70) → every user
+  enrols an authenticator on first sign-in. Section 6 confirmed + accepted
+  this.
+- **Registration is NOT gated** — `POST /auth/register` still returns a token
+  directly (you created + proved the credentials in the same request; the
+  gate is on *returning*). Deliberate scope line — keeps Module 2's contract
+  and ~50 existing tests intact.
+- **`mfa_pending` token** (`app/core/security.create_mfa_token`, type
+  `mfa_pending`, carries `sub`+`cid`, expires with the challenge):
+  `decode_access_token` rejects it, so it can't open a session, hit
+  `/auth/me`, or start a step-up — only `/mfa/verify`.
+- **Storage** (Alembic `0005_add_mfa`, additive — Modules 1-5 tables
+  untouched): `mfa_credentials` (one TOTP secret per user; `confirmed` flips
+  true on first successful verify, and the enrolment payload — secret +
+  `otpauth://` URI — is only returned until then); `mfa_challenges` (status
+  pending→verified/failed/expired, `attempts`/`max_attempts`, `expires_at`,
+  the triggering `trust_score`/`risk_level`, and a `reason`: `login_risk` /
+  `step_up` / `risk_retrigger` reserved for Module 7).
+- **Retry / expiry / success-failure**, all server-enforced on the row:
+  `MFA_MAX_ATTEMPTS` (5) wrong codes → `failed` → 403; past
+  `MFA_CHALLENGE_TTL_MINUTES` (5) → `expired` → 403; a closed challenge → 409;
+  a good code → `verified`, credential confirmed, real token issued.
+- **Dev convenience**: when `ENVIRONMENT=development` (or
+  `MFA_DEV_EXPOSE_CODE=true`) the challenge response carries `dev_code` — the
+  currently-valid TOTP code — so demos/tests work without a phone. Off in
+  production; documented in config / `.env.example` / architecture.md.
+- **No session hook** (unlike M4/M5): the gate is upstream of the session, so
+  `app/services/mfa/` registers nothing on `session/hooks.py`.
+- **Endpoints**: `POST /mfa/verify`, `POST /mfa/challenge` (step-up for an
+  authed user — Module 7's re-challenge entry point), `GET /mfa/challenge/{id}`
+  (owner or admin), `GET /mfa/challenges` (admin — dashboard feed),
+  `GET /mfa/config` (admin — live policy).
+- **Frontend**: `Login.tsx` is now a two-step form (credentials → MFA step:
+  authenticator key + `otpauth://` URI + 6-digit code, retry/expiry handling,
+  dev-code hint); `AuthContext.login()` returns a `LoginOutcome` discriminated
+  union and gains `verifyMfa()`; `api/mfa.ts`; **Security Alerts** page
+  (`/admin/alerts`) is now a real MFA events feed (triggered / verified /
+  failed / expired + counts).
+- **Integration check**: opening a session / ACL rule / trust score is
+  unchanged — all Module 1-5 tests still pass. Only `test_auth.py`'s two
+  login-success tests needed a helper to complete the MFA step; every other
+  test uses a *registration* token (ungated).
+- **Tests**: `backend/tests/test_mfa.py` (16): first login → MFA, verify with
+  dev code → access token, LOW-risk login skips MFA, HIGH-risk login 403,
+  `MFA_ENABLED=false` lets MEDIUM through, wrong-code decrement → exhaustion →
+  409, expired challenge → 403, confirmed credential stops re-enrolling,
+  `mfa_pending` token rejected as access + for step-up, registration not
+  gated, step-up create+verify, admin-only feed, `/mfa/config`, `decide()`
+  band mapping, TOTP roundtrip. Migration `0005` verified against the ORM
+  schema. Full backend suite: **72 passing**. `frontend` type-checks and
+  builds clean.
 
 ---
 

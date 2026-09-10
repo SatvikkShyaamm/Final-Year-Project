@@ -5,10 +5,11 @@ import {
   login as apiLogin,
   logout as apiLogout,
   register as apiRegister,
+  verifyMfa as apiVerifyMfa,
 } from '../api/auth'
 import type { LoginCredentials, RegisterPayload, User } from '../types'
 import { AuthContext } from './context'
-import type { AuthStatus } from './context'
+import type { AuthStatus, LoginOutcome } from './context'
 import { clearToken, getToken, setToken } from './tokenStore'
 
 /**
@@ -44,8 +45,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  const login = useCallback(async (credentials: LoginCredentials) => {
-    const auth = await apiLogin(credentials)
+  const login = useCallback(
+    async (credentials: LoginCredentials): Promise<LoginOutcome> => {
+      const resp = await apiLogin(credentials)
+      if (resp.mfa_required && resp.mfa) {
+        // do NOT store anything yet — the mfa_token isn't an access token
+        return { kind: 'mfa_required', challenge: resp.mfa }
+      }
+      setToken(resp.access_token as string)
+      setUser(resp.user as User)
+      setStatus('authenticated')
+      return { kind: 'authenticated', user: resp.user as User }
+    },
+    [],
+  )
+
+  const verifyMfa = useCallback(async (mfaToken: string, code: string) => {
+    const auth = await apiVerifyMfa({ mfa_token: mfaToken, code })
     setToken(auth.access_token)
     setUser(auth.user)
     setStatus('authenticated')
@@ -85,11 +101,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       status,
       isAdmin: user?.role === 'admin',
       login,
+      verifyMfa,
       register,
       logout,
       forceLogout,
     }),
-    [user, status, login, register, logout, forceLogout],
+    [user, status, login, verifyMfa, register, logout, forceLogout],
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

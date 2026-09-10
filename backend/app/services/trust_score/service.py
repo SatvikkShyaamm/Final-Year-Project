@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session as DbSession
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.models.session import Session as SessionModel
+from app.models.session import utcnow
 from app.models.trust_score import FactorKind, TrustScoreFactor
 from app.services.auth import get_user_by_username
 from app.services.trust_score import store
@@ -64,6 +65,23 @@ def evaluate_for_session(db: DbSession, session: SessionModel) -> TrustEvaluatio
         )
     db.commit()
     return evaluation
+
+
+def evaluate_login(
+    db: DbSession, *, user_id: int, ip_address: str | None, user_agent: str | None
+) -> TrustEvaluation:
+    """Compute the static trust score for a *login attempt* — read-only, nothing
+    persisted (the session-open hook stores the score when the WS connects a
+    moment later). Module 6's /auth/login uses this to pick allow / MFA / block.
+    Same algorithm and factors as ``evaluate_for_session``."""
+    return evaluate(
+        db,
+        user_id=user_id,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        login_time=utcnow(),
+        exclude_session_id=None,
+    )
 
 
 def record_failed_login_attempt(db: DbSession, *, username: str) -> None:

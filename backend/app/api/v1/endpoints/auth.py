@@ -1,27 +1,28 @@
 """
-Module 2 — Authentication endpoints.
+Authentication endpoints — Module 2, with the Module 6 risk gate on /auth/login.
 
-Scope (per the Master Project Context, Module 2): user registration, login
-issuing a JWT, JWT validation, and an authenticated "who am I" endpoint.
-This module answers only "who are you?". Session lifecycle (Module 3),
-trust scoring (Module 5) and MFA (Module 6) are separate and layer on top of
-the `get_current_user` dependency this module makes available.
-
-    POST /auth/register  -> create account, return JWT + user
-    POST /auth/login     -> verify credentials, return JWT + user
-    GET  /auth/me        -> current user (requires Bearer token)
-    POST /auth/logout    -> client-side token disposal (stateless JWT)
+    POST /auth/register  -> create account, return JWT + user (no MFA gate:
+                            you just created + proved these credentials in this
+                            same request; the risk gate is on *returning*)
+    POST /auth/login     -> verify credentials, then a trust-score decision:
+                            LOW   -> access token
+                            MEDIUM -> `mfa_required` + an mfa_pending token to
+                                      complete at POST /mfa/verify
+                            HIGH  -> HTTP 403 (blocked by risk policy)
+    GET  /auth/me        -> current user (requires a real Bearer access token)
+    POST /auth/logout    -> terminate the user's active session(s)
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUser, get_db
 from app.core.config import get_settings
-from app.core.security import create_access_token
+from app.core.security import create_access_token, create_mfa_token
 from app.models.session import TerminationReason
-from app.schemas.auth import LoginRequest, Token, UserCreate, UserRead
+from app.schemas.auth import LoginRequest, LoginResponse, Token, UserCreate, UserRead
+from app.services import mfa as mfa_service
 from app.services import session as session_service
 from app.services import trust_score as trust_score_service
 from app.services.auth import (
@@ -44,6 +45,13 @@ def _issue_token(user) -> Token:
         expires_in=settings.access_token_expire_minutes * 60,
         user=UserRead.model_validate(user),
     )
+
+
+def _client_ip(request: Request) -> str | None:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else None
 
 
 @router.post(
@@ -69,10 +77,12 @@ def register(payload: UserCreate, db: Session = Depends(get_db)) -> Token:
 @router.post(
     "/auth/login",
     tags=["auth"],
-    response_model=Token,
-    summary="Verify credentials and return an access token",
+    response_model=LoginResponse,
+    summary="Verify credentials, then apply the trust-score risk gate",
 )
-def login(payload: LoginRequest, db: Session = Depends(get_db)) -> Token:
+def login(
+    payload: LoginRequest, request: Request, db: Session = Depends(get_db)
+) -> LoginResponse:
     try:
         user = authenticate_user(
             db, username=payload.username, password=payload.password
@@ -86,7 +96,55 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> Token:
             detail=str(exc),
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return _issue_token(user)
+
+    # ---- Module 6: trust-score risk decision (Section 6 bands) ----
+    evaluation = trust_score_service.evaluate_login(
+        db,
+        user_id=user.id,
+        ip_address=_client_ip(request),
+        user_agent=request.headers.get("user-agent"),
+    )
+    decision = mfa_service.decide(evaluation.risk_level)
+
+    if decision == mfa_service.Decision.BLOCK:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "message": "Access blocked by risk policy",
+                "decision": decision,
+                "trust_score": evaluation.score,
+                "risk_level": evaluation.risk_level,
+            },
+        )
+
+    if decision == mfa_service.Decision.ALLOW:
+        token = _issue_token(user)
+        return LoginResponse(
+            mfa_required=False,
+            decision=decision,
+            trust_score=evaluation.score,
+            risk_level=evaluation.risk_level,
+            access_token=token.access_token,
+            token_type=token.token_type,
+            expires_in=token.expires_in,
+            user=token.user,
+        )
+
+    # decision == MFA
+    credential = mfa_service.get_or_create_credential(db, user)
+    challenge = mfa_service.create_challenge(
+        db, user=user, trust_score=evaluation.score, risk_level=evaluation.risk_level
+    )
+    mfa_token = create_mfa_token(
+        user.id, challenge.id, expires_minutes=settings.mfa_challenge_ttl_minutes
+    )
+    return LoginResponse(
+        mfa_required=True,
+        decision=decision,
+        trust_score=evaluation.score,
+        risk_level=evaluation.risk_level,
+        mfa=mfa_service.build_challenge_out(challenge, credential, mfa_token=mfa_token),
+    )
 
 
 @router.get(

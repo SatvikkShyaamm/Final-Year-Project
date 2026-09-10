@@ -6,13 +6,13 @@ Continuous Trust Evaluation, presented through a SOC-style admin
 dashboard. See `docs/architecture.md` and the project's Claude project
 docs for full context before making architectural changes.
 
-**Module status:** Modules 1-5 (Project Foundation, Authentication, Session
-Lifecycle, Dynamic ACL, Trust Score Engine) are implemented. The core
-base-paper flow (login → session → ACL created → session ends → ACL removed)
-works end to end, and every session now carries a static trust score + risk
-band. Modules 6-9 are still scaffolding — their endpoints exist as routes but
-honestly return `501 Not Implemented`; nothing is mocked to look like it
-works. See `Project status.md`.
+**Module status:** Modules 1-6 (Project Foundation, Authentication, Session
+Lifecycle, Dynamic ACL, Trust Score Engine, Adaptive MFA) are implemented.
+The core base-paper flow works end to end; every login runs a trust-score
+risk decision and MEDIUM-risk logins are gated by TOTP MFA. Modules 7-9 are
+still scaffolding — their endpoints exist as routes but honestly return
+`501 Not Implemented`; nothing is mocked to look like it works. See
+`Project status.md`.
 
 ## What actually works right now
 
@@ -22,11 +22,14 @@ works. See `Project status.md`.
   fake success.
 - **Authentication (Module 2)** — real:
   - `POST /api/v1/auth/register` hashes the password with bcrypt, stores a
-    `users` row, returns a signed JWT. The **first** account on a fresh DB
-    becomes `admin`; the rest are `user`.
-  - `POST /api/v1/auth/login` verifies credentials and returns a JWT.
+    `users` row, returns a signed JWT (no MFA gate — you just created and
+    proved these credentials in the same request). The **first** account on a
+    fresh DB becomes `admin`; the rest are `user`.
+  - `POST /api/v1/auth/login` verifies credentials, then runs the Module 6
+    risk decision (below).
   - `GET /api/v1/auth/me` validates the `Authorization: Bearer` token and
-    returns the current user; bad/expired/forged tokens get `401`.
+    returns the current user; bad/expired/forged tokens — and the
+    `mfa_pending` token — get `401`.
   - `get_current_user` / `get_current_admin` dependencies in
     `app/api/deps.py` are the auth middleware every later module reuses.
 - **Session Lifecycle (Module 3)** — real:
@@ -74,7 +77,25 @@ works. See `Project status.md`.
   - `GET /api/v1/trust-score/{session_id}` (score + breakdown),
     `/trust-score/user/{id}/history`, `/trust-score/config` (the live weight
     table) feed the Trust Score Monitoring page.
-- Frontend: a real login/register screen, a JWT-aware axios client
+- **Adaptive MFA (Module 6)** — real, TOTP (RFC 6238):
+  - `POST /api/v1/auth/login` computes a login-time trust score and applies
+    the Section-6 bands: **LOW → access token**, **MEDIUM → MFA required**
+    (returns a short-lived `mfa_pending` token + an `mfa_challenges` row),
+    **HIGH → 403 blocked**. Because a first-ever login has no history it
+    lands MEDIUM, so every user enrols an authenticator on first sign-in.
+  - `POST /api/v1/mfa/verify` checks the 6-digit TOTP code (±1 step skew) and
+    exchanges the `mfa_pending` token for a real access token. Expiry
+    (5 min), retry limit (5 attempts) and success/failure are all enforced
+    server-side; the `mfa_pending` token opens nothing else.
+  - `POST /api/v1/mfa/challenge` is a step-up for an already-authenticated
+    user (also Module 7's re-challenge hook); `GET /api/v1/mfa/challenges`
+    (admin) is the dashboard's MFA events feed; `/mfa/config` shows the live
+    policy.
+  - In `ENVIRONMENT=development` the challenge response also carries the
+    currently-valid code (`dev_code`) so the demo works without a phone —
+    off in production.
+- Frontend: a real login/register screen (with the **MFA step**: authenticator
+  enrolment + 6-digit code + retry/expiry handling), a JWT-aware axios client
   (attaches the token, redirects to `/login` on `401`), an `AuthProvider`
   that rehydrates the session on refresh, route guards (`/admin` admin-only,
   `/portal` any logged-in user), a `SessionProvider` that opens the
@@ -82,8 +103,9 @@ works. See `Project status.md`.
   **live Live Sessions** table (auto-refreshing, per-row Terminate, real ACL
   + trust/risk columns), a **live ACL Monitor**, a **live Trust Score
   Monitoring** page (score meter, factor breakdown, per-user history chart,
-  live weight table), and a session card with WebSocket + ACL + trust/risk
-  status in the portal/header.
+  live weight table), a **live Security Alerts** page (the MFA events feed),
+  and a session card with WebSocket + ACL + trust/risk status in the
+  portal/header.
 - The **System Status** page (`/admin/status`) still calls the real health
   endpoint and renders the real result.
 - Every planned dashboard section (Live Sessions, Trust Score, Security
@@ -101,6 +123,7 @@ works. See `Project status.md`.
 | Sessions   | FastAPI WebSocket signalling + Redis active-session index |
 | ACL        | Redis task queue + L-PEP worker → ipset/iptables (or simulated) |
 | Trust Score| Weighted-factor engine (config-driven weights) + Redis failed-login counter |
+| MFA        | TOTP (pyotp / RFC 6238), risk-band gated at login       |
 | Database   | PostgreSQL 16                                            |
 | Cache/Queue| Redis 7                                                  |
 | Infra      | Docker, Docker Compose                                   |
@@ -121,13 +144,13 @@ ztsaacm-dashboard/
 │   │   ├── core/                # config, DB session, Redis client, logging, security
 │   │   ├── api/deps.py          # get_db + get_current_user/get_current_admin (Module 2)
 │   │   ├── api/v1/endpoints/    # one file per module's REST endpoints
-│   │   ├── models/              # ORM — user (M2), session (M3), acl (M4), trust_score (M5)
+│   │   ├── models/              # ORM — user session acl trust_score (M5) mfa (M6)
 │   │   ├── schemas/             # Pydantic schemas per module
-│   │   ├── services/            # business logic per module — auth/ session/ acl/ trust_score/
+│   │   ├── services/            # per module — auth/ session/ acl/ trust_score/ mfa/
 │   │   ├── ws/                  # connection_manager.py + handshake auth.py (Module 3)
 │   │   └── lpep/                # `python -m app.lpep` — standalone L-PEP worker (M4)
-│   ├── alembic/versions/        # migrations — 0001 users, 0002 sessions, 0003 acl, 0004 trust
-│   ├── tests/                   # test_health / _auth / _sessions / _acl / _trust_score
+│   ├── alembic/versions/        # migrations — 0001 users … 0004 trust, 0005 mfa
+│   ├── tests/                   # test_health / _auth / _sessions / _acl / _trust_score / _mfa
 │   └── requirements.txt
 └── frontend/
     └── src/
@@ -199,26 +222,39 @@ curl http://localhost:8000/api/v1/health
 Then open http://localhost:5173/admin/status in a browser — it should
 show the same result rendered live.
 
-**Authentication (Module 2)** end to end:
+**Authentication + Adaptive MFA (Modules 2 + 6)** end to end:
 
 ```bash
-# register (first account on a fresh DB is the admin)
-curl -s -X POST http://localhost:8000/api/v1/auth/register \
+# register (first account on a fresh DB is the admin). Register returns a
+# usable access token directly — no MFA gate on registration.
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/register \
   -H 'Content-Type: application/json' \
-  -d '{"username":"admin","email":"admin@example.com","password":"change-me-123"}'
+  -d '{"username":"admin","email":"admin@example.com","password":"change-me-123"}' \
+  | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
 
-# log in, capture the token
-TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"change-me-123"}' | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
-
-# use it
 curl -s http://localhost:8000/api/v1/auth/me -H "Authorization: Bearer $TOKEN"
+
+# LOGIN, by contrast, runs the risk decision. A first-ever login has no
+# history -> MEDIUM -> MFA required:
+curl -s -X POST http://localhost:8000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"change-me-123"}'
+# -> {"mfa_required":true,"decision":"mfa","trust_score":70,"risk_level":"MEDIUM",
+#     "mfa":{"challenge_id":"...","mfa_token":"<jwt>","enrollment":{"secret":"...",
+#            "provisioning_uri":"otpauth://totp/..."},"dev_code":"123456"}}
+
+# in ENVIRONMENT=development the response includes dev_code — the currently
+# valid TOTP code — so you can complete it without an authenticator app:
+curl -s -X POST http://localhost:8000/api/v1/mfa/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"mfa_token":"<mfa_token from above>","code":"<dev_code from above>"}'
+# -> {"access_token":"<real access token>","token_type":"bearer",...}
 ```
 
-In the browser: http://localhost:5173/login → register/sign in → the admin
-lands on the SOC dashboard, a normal user on `/portal`; a missing/expired
-token bounces back to `/login`.
+In the browser: http://localhost:5173/login → sign in → on first login the
+MFA step appears (authenticator key + 6-digit code; dev shows the code) →
+verify → the admin lands on the SOC dashboard. A HIGH-risk login (e.g. from a
+known-VPN IP after several failed attempts) is refused outright.
 
 **Session Lifecycle (Module 3)** end to end (reuse `$TOKEN` from above):
 
@@ -278,11 +314,12 @@ curl -s http://localhost:8000/api/v1/trust-score/config -H "Authorization: Beare
 ```
 
 `/admin/trust-score` shows the score meter, the exact per-factor breakdown,
-the user's score history, and the live weight table. Weights/thresholds/VPN
-CIDRs are all in `app/core/config.py` (env-overridable).
+the user's score history, and the live weight table. `/admin/alerts` is the
+MFA events feed. Weights/thresholds/VPN CIDRs/MFA policy are all in
+`app/core/config.py` (env-overridable).
 
 ```bash
-cd backend && pytest          # 56 tests: health/stubs + auth + sessions + ACL + trust score
+cd backend && pytest          # 72 tests: health/stubs + auth + sessions + ACL + trust + MFA
 cd frontend && npm run build  # type-checks and builds to dist/
 ```
 
@@ -296,8 +333,9 @@ placeholder values before any shared or deployed use.
 
 ## Next module
 
-Module 6 — Adaptive MFA (TOTP-based MFA generation/verification, expiry, retry
-handling). It reads the Module 5 `risk_level` and turns it into an
-allow / require-MFA / block decision at the FSM S1→S2 transition — the gate
-Module 5 deliberately does *not* apply. Do not start Module 7+ before Module 6
-works, per the project's development order.
+Module 7 — Continuous Trust Evaluation: keep re-scoring the trust score during
+an *active* session in response to security events (IP change, VPN, abnormal
+download/request rate), re-triggering MFA (reusing Module 6's
+`create_challenge`) or forcing the S2→S3 revocation Module 3 already defines
+when risk becomes unacceptable. Do not start Module 8+ before Module 7 works,
+per the project's development order.

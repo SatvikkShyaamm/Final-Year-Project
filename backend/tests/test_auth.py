@@ -20,6 +20,25 @@ def _register(client, body):
     return client.post("/api/v1/auth/register", json=body)
 
 
+def _login_token(client, username, password) -> str:
+    """Log in, completing the Module 6 MFA step with the dev code if the risk
+    band requires it. Returns the final access token."""
+    resp = client.post(
+        "/api/v1/auth/login", json={"username": username, "password": password}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    if not body["mfa_required"]:
+        return body["access_token"]
+    mfa = body["mfa"]
+    verify = client.post(
+        "/api/v1/mfa/verify",
+        json={"mfa_token": mfa["mfa_token"], "code": mfa["dev_code"]},
+    )
+    assert verify.status_code == 200, verify.text
+    return verify.json()["access_token"]
+
+
 # --------------------------------------------------------------------------- #
 # Registration
 # --------------------------------------------------------------------------- #
@@ -76,12 +95,9 @@ def test_register_rejects_password_over_72_bytes(client):
 # --------------------------------------------------------------------------- #
 def test_login_success_returns_jwt_with_correct_subject(client):
     user_id = _register(client, ALICE).json()["user"]["id"]
-    resp = client.post(
-        "/api/v1/auth/login",
-        json={"username": "alice", "password": ALICE["password"]},
-    )
-    assert resp.status_code == 200
-    token = resp.json()["access_token"]
+    # A first-ever login has no history -> MEDIUM band -> MFA (Module 6);
+    # _login_token completes it with the dev code and returns the access token.
+    token = _login_token(client, "alice", ALICE["password"])
     claims = jwt.decode(
         token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm]
     )
@@ -106,10 +122,7 @@ def test_login_unknown_user_is_401(client):
 
 def test_login_updates_last_login_at(client):
     _register(client, ALICE)
-    before = client.post(
-        "/api/v1/auth/login", json={"username": "alice", "password": ALICE["password"]}
-    )
-    token = before.json()["access_token"]
+    token = _login_token(client, "alice", ALICE["password"])
     me = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
     assert me.json()["last_login_at"] is not None
 

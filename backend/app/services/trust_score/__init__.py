@@ -22,6 +22,7 @@ from app.services.trust_score.factors import (
 from app.services.trust_score.service import (
     average_trust_score,
     evaluate_for_session,
+    evaluate_login,
     factor_catalogue,
     get_factors_for_session,
     get_user_score_history,
@@ -37,6 +38,7 @@ __all__ = [
     "classify_risk",
     "average_trust_score",
     "evaluate_for_session",
+    "evaluate_login",
     "factor_catalogue",
     "get_factors_for_session",
     "get_user_score_history",

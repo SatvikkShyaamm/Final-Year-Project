@@ -11,6 +11,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
+from app.schemas.mfa import MFAChallengeOut
+
 # bcrypt hashes at most the first 72 *bytes* of a password. We reject anything
 # longer outright rather than silently truncating it (a silent truncation would
 # make "correct horse battery staple ..." and a different 73rd byte log in with
@@ -87,3 +89,29 @@ class TokenPayload(BaseModel):
     type: str
     exp: int
     iat: int
+
+
+class LoginResponse(BaseModel):
+    """Response of POST /auth/login (Module 6 turns login into a risk decision).
+
+    `mfa_required` is the discriminator:
+      - false -> `access_token` + `user` are present (risk band LOW, or MFA
+        disabled); use them exactly like a Module 2 token.
+      - true  -> `mfa` is present; complete it at POST /mfa/verify, which
+        returns a normal `Token`.
+    A HIGH-risk login does not reach this model at all — it is HTTP 403.
+    """
+
+    mfa_required: bool
+    decision: str                      # "allow" | "mfa"
+    trust_score: int | None = None
+    risk_level: str | None = None
+
+    # present iff mfa_required is False
+    access_token: str | None = None
+    token_type: str | None = None
+    expires_in: int | None = None
+    user: UserRead | None = None
+
+    # present iff mfa_required is True
+    mfa: MFAChallengeOut | None = None

@@ -1,18 +1,31 @@
 import { createContext } from 'react'
-import type { LoginCredentials, RegisterPayload, User } from '../types'
+import type {
+  LoginCredentials,
+  MFAChallenge,
+  RegisterPayload,
+  User,
+} from '../types'
 
 /**
- * Auth context shape (Module 2). Split from the provider component and the
- * `useAuth` hook so each file has a single kind of export (keeps the
- * fast-refresh / only-export-components lint rule happy).
+ * Auth context shape (Module 2, + the Module 6 MFA step). Split from the
+ * provider component and the `useAuth` hook so each file has a single kind of
+ * export (keeps the fast-refresh / only-export-components lint rule happy).
  */
 export type AuthStatus = 'loading' | 'authenticated' | 'unauthenticated'
+
+/** Result of `login()` — either straight in, or an MFA challenge to satisfy. */
+export type LoginOutcome =
+  | { kind: 'authenticated'; user: User }
+  | { kind: 'mfa_required'; challenge: MFAChallenge }
 
 export interface AuthContextValue {
   user: User | null
   status: AuthStatus
   isAdmin: boolean
-  login: (credentials: LoginCredentials) => Promise<User>
+  login: (credentials: LoginCredentials) => Promise<LoginOutcome>
+  /** Complete the Module 6 MFA step with the mfa_token from a `mfa_required`
+   * outcome and a TOTP code. Resolves to the now-authenticated user. */
+  verifyMfa: (mfaToken: string, code: string) => Promise<User>
   register: (payload: RegisterPayload) => Promise<User>
   logout: () => Promise<void>
   /**

@@ -37,7 +37,8 @@ export interface User {
   last_login_at: string | null
 }
 
-/** Response of POST /auth/login and POST /auth/register. */
+/** Response of POST /auth/register, POST /mfa/verify, and the allow branch of
+ * POST /auth/login. */
 export interface AuthToken {
   access_token: string
   token_type: 'bearer'
@@ -54,6 +55,72 @@ export interface RegisterPayload {
   username: string
   email: string
   password: string
+}
+
+/* --------------------------------------------------------------------------
+ * Module 6 — Adaptive MFA
+ * Mirrors backend/app/schemas/mfa.py + the LoginResponse in schemas/auth.py.
+ * ---------------------------------------------------------------------- */
+
+export interface MFAEnrollment {
+  secret: string
+  provisioning_uri: string
+  digits: number
+  interval_seconds: number
+}
+
+export type MFAChallengeStatus = 'pending' | 'verified' | 'failed' | 'expired'
+
+/** A live challenge to satisfy — from /auth/login or POST /mfa/challenge. */
+export interface MFAChallenge {
+  challenge_id: string
+  mfa_token: string
+  method: string
+  reason: string
+  status: MFAChallengeStatus
+  expires_at: string
+  attempts_remaining: number
+  max_attempts: number
+  trust_score: number | null
+  risk_level: RiskLevel | null
+  enrollment: MFAEnrollment | null
+  dev_code: string | null
+}
+
+/** POST /auth/login response — `mfa_required` is the discriminator. */
+export interface LoginResponse {
+  mfa_required: boolean
+  decision: 'allow' | 'mfa'
+  trust_score: number | null
+  risk_level: RiskLevel | null
+  access_token: string | null
+  token_type: 'bearer' | null
+  expires_in: number | null
+  user: User | null
+  mfa: MFAChallenge | null
+}
+
+/** Read-only challenge record (admin feed / status poll). */
+export interface MFAChallengeRecord {
+  id: string
+  user_id: number
+  username: string | null
+  method: string
+  reason: string
+  status: MFAChallengeStatus
+  attempts: number
+  max_attempts: number
+  trust_score: number | null
+  risk_level: RiskLevel | null
+  created_at: string
+  expires_at: string
+  verified_at: string | null
+}
+
+export interface MFAChallengeListResponse {
+  challenges: MFAChallengeRecord[]
+  counts: Record<string, number>
+  generated_at: string
 }
 
 /* --------------------------------------------------------------------------

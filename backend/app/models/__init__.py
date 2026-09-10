@@ -20,6 +20,13 @@ from app.models.acl import (  # noqa: F401  (Module 4)
     ACLState,
     EnforcementBackend,
 )
+from app.models.mfa import (  # noqa: F401  (Module 6)
+    MFAChallenge,
+    MFAChallengeReason,
+    MFAChallengeStatus,
+    MFACredential,
+    MFAMethod,
+)
 from app.models.session import (  # noqa: F401  (Module 3)
     Session,
     SessionState,
@@ -44,4 +51,9 @@ __all__ = [
     "TrustScoreFactor",
     "FactorKind",
     "RiskLevel",
+    "MFACredential",
+    "MFAChallenge",
+    "MFAMethod",
+    "MFAChallengeStatus",
+    "MFAChallengeReason",
 ]

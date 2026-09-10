@@ -26,10 +26,13 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-# Marks the token kind in the payload. Module 6 (Adaptive MFA) will add a
-# short-lived "mfa_pending" token type alongside this one; keeping the claim
-# explicit from the start means that change won't be ambiguous.
+# Marks the token kind in the payload. The "mfa_pending" token (Module 6) is a
+# short-lived token issued by /auth/login when the risk band requires MFA: it
+# proves "credentials were correct, MFA still owed" and is ONLY accepted by
+# /mfa/verify. `decode_access_token` rejects it, so it cannot open a session,
+# hit /auth/me, or reach any get_current_user route.
 ACCESS_TOKEN_TYPE = "access"
+MFA_PENDING_TOKEN_TYPE = "mfa_pending"
 
 
 # --------------------------------------------------------------------------- #
@@ -89,6 +92,24 @@ def create_access_token(
     )
 
 
+def create_mfa_token(
+    subject: str | int, challenge_id: str, *, expires_minutes: int
+) -> str:
+    """Short-lived token for the MFA step: carries the user id (`sub`) and the
+    challenge id (`cid`). Type `mfa_pending` — only /mfa/verify honours it."""
+    now = datetime.now(timezone.utc)
+    payload: dict[str, Any] = {
+        "sub": str(subject),
+        "type": MFA_PENDING_TOKEN_TYPE,
+        "cid": challenge_id,
+        "iat": now,
+        "exp": now + timedelta(minutes=expires_minutes),
+    }
+    return jwt.encode(
+        payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm
+    )
+
+
 class TokenError(Exception):
     """Raised when a token is missing, malformed, expired, or wrong-typed.
 
@@ -97,13 +118,7 @@ class TokenError(Exception):
     """
 
 
-def decode_access_token(token: str) -> dict[str, Any]:
-    """
-    Verify signature + expiry and return the claims dict.
-
-    Raises `TokenError` on any problem so callers have a single exception type
-    to handle regardless of the underlying PyJWT error.
-    """
+def _decode(token: str, *, expected_type: str) -> dict[str, Any]:
     try:
         payload = jwt.decode(
             token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm]
@@ -113,9 +128,27 @@ def decode_access_token(token: str) -> dict[str, Any]:
     except jwt.PyJWTError as exc:
         raise TokenError("Could not validate token") from exc
 
-    if payload.get("type") != ACCESS_TOKEN_TYPE:
+    if payload.get("type") != expected_type:
         raise TokenError("Wrong token type")
     if not payload.get("sub"):
         raise TokenError("Token missing subject")
-
     return payload
+
+
+def decode_mfa_token(token: str) -> dict[str, Any]:
+    """Verify an mfa_pending token; returns claims incl. `sub` and `cid`."""
+    payload = _decode(token, expected_type=MFA_PENDING_TOKEN_TYPE)
+    if not payload.get("cid"):
+        raise TokenError("MFA token missing challenge id")
+    return payload
+
+
+def decode_access_token(token: str) -> dict[str, Any]:
+    """
+    Verify signature + expiry and return the claims dict.
+
+    Raises `TokenError` on any problem so callers have a single exception type
+    to handle regardless of the underlying PyJWT error. An `mfa_pending` token
+    fails the type check here — it is not a usable access token.
+    """
+    return _decode(token, expected_type=ACCESS_TOKEN_TYPE)
