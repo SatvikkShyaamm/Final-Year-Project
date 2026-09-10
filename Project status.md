@@ -4,7 +4,9 @@
 
 Current Module: Module 7 – Continuous Trust Evaluation (next)
 Overall Project Status: Core base-paper flow complete (Modules 1-4) + static
-Trust Score (Module 5) + risk-gated Adaptive MFA at login (Module 6).
+Trust Score (Module 5) + risk-gated Adaptive MFA at login (Module 6), plus a
+post-Module-6 hardening pass closing the server-side token-revocation and
+cross-tab storage gaps found during live testing.
 Modules 7-10 not started.
 
 |         Module                         |              Status          |
@@ -14,7 +16,7 @@ Modules 7-10 not started.
 | Module 3 – Session Lifecycle           | Completed                    |
 | Module 4 – Dynamic ACL                 | Completed & independently verified |
 | Module 5 – Trust Score Engine          | Completed                    |
-| Module 6 – Adaptive MFA                | Completed                    |
+| Module 6 – Adaptive MFA                | Completed & independently verified |
 | Module 7 – Continuous Trust Evaluation | Not started                  |
 | Module 8 – Security Dashboard          | Not started                  |
 | Module 9 – Attack Simulation           | Not started                  |
@@ -32,7 +34,7 @@ Modules 7-10 not started.
 - Network access control: Redis task queue + L-PEP worker → ipset/iptables on Linux, or a simulated backend elsewhere (Module 4)
 - Trust Score: config-driven weighted-factor engine (Module 5), static score at session creation, Redis failed-login burst counter
 - Adaptive MFA: TOTP (pyotp / RFC 6238), risk-band gated at `POST /auth/login` (Module 6)
-- Other important technologies: Redis 7 (session active-set + events; ACL task queue + ref-counts + receipts + events; failed-login counter; MFA event stream), Docker + Docker Compose
+- Other important technologies: Redis 7 (session active-set + events; ACL task queue + ref-counts + receipts + events; failed-login counter; MFA event stream; token-revocation denylist), Docker + Docker Compose
 
 ---
 
@@ -450,7 +452,11 @@ ever created for them) and self-clean via the existing idle sweeper
 **Process note for later modules**: remember to run `alembic upgrade head`
 after pulling in any module that adds a migration, before starting the
 backend — worth adding to the README/runbook as an explicit step so this
-isn't rediscovered the same way next time.
+isn't rediscovered the same way next time. (Update, Module 6 verification:
+`backend/Dockerfile`'s CMD now runs `alembic upgrade head` automatically
+before `uvicorn` on every container start, so this specific gap can no
+longer recur for docker-based runs. A bare `uvicorn` dev run outside Docker
+still needs it done by hand.)
 
 ### 6b. Real gap found: session termination didn't end the client's authenticated state
 
@@ -480,7 +486,7 @@ termination an ACL consequence worth noticing:
 - Notably, `tokenStore.ts` had a comment from when Module 2 was originally
   built stating the intended design: "Module 3 will additionally tie
   liveness to the WebSocket session, at which point a closed socket also
-  means 'logged out'." That wiring was never actually completed — this was
+  means 'logged out.'" That wiring was never actually completed — this was
   confirmed to be an implementation gap against the original plan, not a
   new requirement.
 
@@ -524,7 +530,12 @@ termination an ACL consequence worth noticing:
   Deliberately not built now — natural to schedule alongside Module 6,
   since MFA and credential re-verification are the same neighborhood of
   concern. Not required for Module 4, and not implied by Modules 5-7's
-  listed deliverables either.
+  listed deliverables either. **FIXED 2026-09-10 — see section 10.** Module 6
+  itself shipped without this (confirmed still open during the Module 6
+  independent verification in section 9), and it was closed immediately
+  afterward as a dedicated hardening pass: session termination now revokes
+  the specific access token that opened it, server-side, for every
+  "terminated for cause" reason.
 - `tokenStore.ts` persists the JWT in `localStorage`, shared across all tabs
   of the same browser. With this fix, terminating one tab's session logs
   the whole browser out on its next auth check, not just that tab. Flagged
@@ -550,7 +561,7 @@ Module 4 regression.
 
 ---
 
-## 7. Cross-Tab / Cross-Account Auth Bug — Diagnosed, Not Yet Fixed (2026-09-08)
+## 7. Cross-Tab / Cross-Account Auth Bug — Diagnosed, FIXED 2026-09-10 (see section 10)
 
 Following the section 6b fix, the developer found the concrete case the
 "out of scope" caveat in 6b had only flagged in the abstract: with an admin
@@ -604,24 +615,22 @@ and does not occur across separate browser applications, or (by the same
 reasoning) within a single tab, or across multiple tabs logged into the
 *same* account.
 
-**Status: identified, not yet fixed.** Proposed fix (not yet applied):
-switch `tokenStore.ts` from `localStorage` to `sessionStorage`, which is
-scoped per tab even for the same origin — this would isolate each tab's
-token from every other tab's, eliminating the collision at its source with
-no backend change required. This has been proposed to the developer twice
-and is awaiting an explicit go-ahead before implementation, since it also
-means a token no longer survives a tab being closed and reopened (a
-`sessionStorage`-vs-`localStorage` trade-off worth the developer
-consciously choosing rather than having it made silently). The developer
-has explicitly said not to apply this fix for now — it remains proposed
-only.
+**Status: FIXED 2026-09-10 — see section 10.** For a long time the proposed
+fix (switch `tokenStore.ts` from `localStorage` to `sessionStorage`, scoped
+per tab even for the same origin) sat here awaiting an explicit go-ahead,
+since it also means a token no longer survives a tab being closed and
+reopened — a trade-off worth consciously choosing rather than having it made
+silently. It remained unapplied through the entire Module 6 build (confirmed
+still open during the Module 6 independent verification in section 9). The
+go-ahead was given immediately afterward and the fix was applied as part of
+the same post-Module-6 hardening pass as section 6b's fix — see section 10
+for the change and its verification.
 
-**Current known-good workaround, confirmed working:** test multiple
-accounts in separate browser applications (e.g. admin in Firefox, other
-accounts in Chrome) rather than in multiple tabs of the same browser. This
-avoids the bug entirely and is a reasonable way to keep testing Modules 5+
-in the meantime, but is a workaround, not a fix — multi-tab/single-browser,
-multi-account use will still trigger this until `tokenStore.ts` is changed.
+**Historical workaround (no longer needed after the section 10 fix, kept
+here for the record):** test multiple accounts in separate browser
+applications (e.g. admin in Firefox, other accounts in Chrome) rather than
+in multiple tabs of the same browser. This avoided the bug entirely while it
+was still open.
 
 **Not a Module 4 or Module 3 regression** — both root causes here
 (`localStorage` scoping and the 401 hard-navigate interceptor) predate
@@ -657,3 +666,277 @@ longer cascade into an unrelated failure downstream.
 **Verification:** full backend suite re-run — **56/56 passing**, unchanged
 (the fix only affects the error path, which no test currently exercises).
 Frontend untouched.
+
+---
+
+## 9. Module 6 — Independent Verification (2026-09-10)
+
+Module 6 was independently re-verified against MASTER PROJECT CONTEXT.docx's
+Module 6 requirements, the Base Paper's risk-gate description, and the
+actual code in the repo (commit `02b57b9`, on top of the `0005_add_mfa`
+migration) — not just the status doc's own claims above. Method: connected
+directly to the developer's machine, read every backend file in the
+login → risk-decision → MFA path plus the trust-score entry point it calls,
+diffed the Module 6 commit against the prior (post-hardening) Module 5
+commit file-by-file, reinstalled backend dependencies into a clean
+virtualenv and re-ran the full test suite, and ran the frontend TypeScript
+compiler.
+
+**Requirements checklist (MASTER PROJECT CONTEXT.docx, Module 6 / Section 6):**
+
+| Requirement | Verified |
+|---|---|
+| Risk-gated decision at login (LOW allow / MEDIUM MFA / HIGH block) | Yes — `POST /auth/login` calls `trust_score.evaluate_login()` then `mfa.decide(risk_level)`; confirmed in `app/api/v1/endpoints/auth.py` and `app/services/mfa/service.py` |
+| TOTP (RFC 6238) generation + verification | Yes — `app/services/mfa/totp.py`, a thin `pyotp` wrapper (secret generation, `otpauth://` provisioning URI, ±1-step skew verification) |
+| Challenge lifecycle: create / verify / expire / retry-exhaust | Yes — `mfa_challenges` row per challenge, server-enforced `max_attempts` (403 on exhaustion), `expires_at` (403 on expiry), re-verifying a closed challenge (409) — all in `app/services/mfa/service.py` |
+| `mfa_pending` token cannot be used as a real access token | Yes — `create_mfa_token` stamps `type=mfa_pending`; `decode_access_token` only accepts `type=access`, so the pending token is rejected by `get_current_user`, `/auth/me`, and `POST /mfa/challenge` (step-up) alike |
+| Registration not gated (scope boundary) | Yes — `POST /auth/register` is untouched, still returns a token directly |
+| Admin visibility (dashboard feed + live policy) | Yes — `GET /mfa/challenges` (admin, counts by status) and `GET /mfa/config` (admin, live decision thresholds + TOTP params) |
+| Storage additive only | Yes — Alembic `0005_add_mfa` only creates `mfa_credentials` / `mfa_challenges`; no existing table altered |
+
+**Regression check against Modules 1-5 (nothing disturbed):**
+
+- Diffed the Module 6 commit (`02b57b9`) against the prior commit
+  (`cf10e8b`, the hooks.py hardening fix) file-by-file: 17 files changed,
+  1283 insertions / 60 deletions. Every backend file touched is either new
+  (`app/models/mfa.py`, `app/schemas/mfa.py`, `app/services/mfa/*`,
+  `backend/tests/test_mfa.py`) or a small, additive change to an existing
+  one:
+  - `app/api/v1/endpoints/auth.py` — the login handler now computes the
+    risk decision and branches; no change to `/auth/register`, `/auth/me`,
+    or `/auth/logout`.
+  - `app/core/security.py` — adds `create_mfa_token` / `decode_mfa_token` /
+    the `mfa_pending` type constant; `create_access_token` and
+    `decode_access_token`'s existing behavior is unchanged (verified by
+    reading the diff, not just the file).
+  - `app/services/trust_score/service.py` / `__init__.py` — adds one new
+    function, `evaluate_login` (read-only, nothing persisted); does not
+    touch `evaluate_for_session`, so the Module 5 session-open scoring path
+    is byte-for-byte unchanged.
+  - `app/core/config.py`, `app/schemas/auth.py`, `app/models/__init__.py`
+    — additive fields/registrations only.
+  - `backend/tests/test_health.py` — the `/mfa/challenge` line is removed
+    from the "still a 501 stub" list (correct, since it's implemented now)
+    and the comment is updated; the two still-genuinely-unbuilt endpoints
+    (`/dashboard/overview`, `/simulate/ip_change`) are still checked.
+  - `backend/tests/test_auth.py` — a new `_login_token()` test helper
+    completes the MFA step with the dev code; only the two tests that
+    previously asserted on a bare `access_token` from `/auth/login` were
+    updated to use it. Every rejection-path test (`test_login_unknown_user_is_401`,
+    etc.) is untouched, and no assertion was weakened.
+  - `app/services/session/hooks.py`'s 2-line diff between these two commits
+    is the section-8 rollback fix, not Module 6 work — confirmed already
+    applied and unrelated to MFA.
+  - `backend/tests/test_sessions.py`, `test_acl.py`, `test_trust_score.py`
+    have **zero** diff.
+- `app/services/mfa/` registers no `session_opened` / `session_closed` hook
+  (confirmed by reading `app/services/mfa/__init__.py` and grepping for
+  hook registration) — matches the documented design that the MFA gate sits
+  upstream of the session, so Module 4's ACL wiring and Module 5's
+  trust-score wiring are structurally unreachable from Module 6's code.
+- `app/api/v1/router.py` includes `mfa.router` alongside the existing
+  Module 1-5 + 8/9 routers — additive registration, nothing reordered or
+  removed.
+- Full backend test suite reinstalled from scratch into a clean virtualenv
+  (FastAPI/SQLAlchemy/pydantic/pyotp/fakeredis per `requirements.txt`, not
+  trusting any previously-installed environment) and re-run: **72/72
+  passing**, matching the status doc's claim independently. This includes
+  all pre-existing Module 1-5 tests (auth, sessions, ACL, trust score)
+  alongside the 16 new `test_mfa.py` tests — no prior test was deleted,
+  skipped, or weakened to make the suite pass.
+- Frontend: `npx tsc -b --noEmit` → 0 errors (Login.tsx's two-step flow,
+  the `AuthContext`/`AuthProvider` `LoginOutcome`/`verifyMfa` additions,
+  `api/mfa.ts`, and the real `SecurityAlerts.tsx` MFA feed all type-check
+  cleanly). `npm run build` still fails on this dev machine with the same
+  pre-existing `Cannot find module '@rolldown/binding-linux-x64-gnu'`
+  native-binding error already flagged in the Module 4 verification
+  (section 5) — a `node_modules` platform mismatch in the verification
+  environment, not a Module 6 code defect, and not new.
+- Frontend diff (`git diff` between the two commits) touches exactly 8
+  files, all Module-6-shaped (`api/auth.ts`, `api/mfa.ts`, `auth/context.ts`,
+  `auth/AuthProvider.tsx`, `pages/Login.tsx`, `pages/admin/SecurityAlerts.tsx`,
+  `types/index.ts`, and a 1-line `Sidebar.tsx` label change) — no dashboard
+  page outside the MFA/login surface was touched.
+
+**Housekeeping note (not a Module 6 defect):** `git status` currently shows
+~90 files as modified in the working tree, across files well outside
+Module 6 (session, ACL, trust-score, infra scripts). Confirmed with
+`git diff --ignore-all-space` (empty) and a stat of exactly
+`9687 insertions(+), 9687 deletions(-)` that this is 100% line-ending churn
+(LF ↔ CRLF, and in fact mixed per-file — some files' committed blobs are LF,
+a few such as `sessions.py` and `tokenStore.ts` are CRLF) on this Windows
+checkout — not a real content change to any file. No functional risk, but
+worth normalizing (e.g. a `.gitattributes` with `* text=auto` and one clean
+re-checkout, or setting `git config core.autocrlf` consistently) before
+Module 7, so its diff is readable and this verification pass doesn't need to
+re-prove the same thing. (Still present as of section 10's fix — the fix
+commit was staged file-by-file, matching each touched file's own existing
+line-ending convention exactly, precisely to avoid adding to this noise.)
+
+**Design notes worth carrying into the write-up (not defects):**
+- `evaluate_login` (used for the login-time MFA decision) and
+  `evaluate_for_session` (persisted onto the session row moments later, once
+  the WebSocket connects) run the identical Section-6 algorithm but as two
+  independent calls at two slightly different instants. By design — the
+  session doesn't exist yet at login time — but means the `trust_score`
+  snapshotted onto an MFA challenge and the `trust_score` eventually stored
+  on that login's session row could, in a rare edge case (e.g. an hour
+  boundary crossed between the two calls), differ by a point or two. Not a
+  bug; worth a one-line mention in the report if asked why the two numbers
+  aren't guaranteed identical.
+- `dev_code` / the TOTP secret are only exposed when `ENVIRONMENT=development`
+  or `MFA_DEV_EXPOSE_CODE=true`; `.env.example` ships with
+  `ENVIRONMENT=development` as the default, which is appropriate for a
+  demo/student deployment but is a reminder to explicitly set
+  `ENVIRONMENT=production` (or `MFA_DEV_EXPOSE_CODE=false`, already its
+  default) wherever this is ever deployed for real.
+- The Security Alerts "Triggered" stat counts the currently-fetched page of
+  challenges (server caps `GET /mfa/challenges` at the 100 most recent),
+  not a true lifetime total. Fine at current scale; would need a dedicated
+  count endpoint if the challenge volume ever exceeds that.
+- The section-6b JWT-revocation gap and the section-7 `localStorage` cross-tab
+  issue were both still open at the time of this Module 6 verification —
+  **both were closed immediately afterward, the same day, as a dedicated
+  post-Module-6 hardening pass. See section 10.**
+
+**Conclusion:** Module 6 — Adaptive MFA is genuinely, fully implemented per
+the defined requirements, with no gaps found and no regressions introduced
+to Modules 1-5. Every prior test still passes, the new tests exercise the
+full decision/challenge/token-scope surface (not just the happy path), and
+the diffs touching shared files are minimal, additive, and exactly where
+the status doc above said they'd be.
+
+Ready to proceed to **Module 7 — Continuous Trust Evaluation** without
+further Module 6 work needed.
+
+---
+
+## 10. Post-Module-6 Hardening — Server-Side Token Revocation + Per-Tab Storage (2026-09-10)
+
+Closes the two gaps left open at the end of section 9 (section 6b's
+JWT-revocation gap and section 7's `localStorage` cross-tab collision),
+applied as one combined hardening pass right after Module 6's independent
+verification, before starting Module 7.
+
+### 10a. Server-side access-token revocation (closes section 6b)
+
+**Problem:** ending a session (logout, admin terminate, idle/max-lifetime
+sweep) only ever ended the *session row* and its ACL rule. The JWT itself is
+stateless (signature + expiry only) and was never invalidated, so a copy of
+the token made before termination kept authenticating a brand-new session
+for the rest of its original lifetime.
+
+**Files added:**
+- `backend/app/services/auth/revocation.py` — a Redis denylist keyed by the
+  token's `jti`. `revoke_access_token(jti, exp)` sets `ztsaacm:revoked_tokens:{jti}`
+  with a TTL equal to the token's remaining lifetime (so entries self-expire
+  and the denylist never grows unbounded); `is_token_revoked(jti)` checks it.
+  Best-effort like every other Redis use in this codebase (session store, ACL
+  ref-counts, trust-score failed-login counter): fails open (treats a check
+  as "not revoked") if Redis is unreachable, rather than locking everyone out.
+- `backend/app/services/auth/wiring.py` — registers an `on_session_closed`
+  hook, same pattern as Module 4's ACL wiring / Module 5's trust-score
+  wiring (`acl -> session` / `trust_score -> session` one-directional import;
+  this is `auth -> session`). Looks up the closing session's `token_jti` /
+  `token_exp` and revokes that token — **but only** for a "terminated for
+  cause" reason: `logout`, `admin_terminated`, `idle_timeout`,
+  `max_lifetime`, or the reserved `risk_revoked`. An ordinary
+  `websocket_disconnect` (closed tab / page refresh) is deliberately
+  excluded from this list.
+- `backend/alembic/versions/0006_add_token_revocation.py` — additive:
+  `sessions.token_jti` (String(32), nullable) and `sessions.token_exp`
+  (DateTime, nullable). No other table touched.
+
+**Files changed (all additive):**
+- `backend/app/core/security.py` — every access token now carries a `jti`
+  (`uuid.uuid4().hex`), and a new `token_expiry_datetime()` helper converts a
+  decoded token's numeric `exp` claim to the naive-UTC datetime convention
+  the rest of the codebase uses. `decode_access_token`/`create_access_token`'s
+  existing behavior is otherwise unchanged.
+- `backend/app/ws/auth.py` — `resolve_ws_user` now also checks
+  `is_token_revoked` (rejecting a revoked token's attempt to open a *new*
+  session) and returns a small `ResolvedWsAuth(user, token_jti, token_exp)`
+  instead of a bare `User`, so the caller can stamp the token's identity onto
+  the session it's about to open.
+- `backend/app/services/session/service.py` — `create_session` gained two
+  optional keyword params, `token_jti` / `token_exp`, stored on the new
+  session row. Module 3 itself has no opinion on revocation; it just carries
+  the data for whoever does, matching how it already carries Module 5's
+  reserved trust-score columns.
+- `backend/app/api/v1/endpoints/sessions.py` — the WebSocket handshake passes
+  `resolved.token_jti` / `resolved.token_exp` into `create_session`.
+- `backend/app/api/deps.py` — `get_current_user` (the REST auth dependency)
+  now also checks `is_token_revoked` after decoding, 401'ing a revoked token
+  exactly like an expired one.
+- `backend/app/services/auth/__init__.py` — imports `wiring` for its side
+  effect (registers the hook), same pattern as `acl`/`trust_score`'s
+  `__init__.py`, and re-exports `is_token_revoked` / `revoke_access_token`.
+
+**A real bug caught during this fix, not shipped:** the first implementation
+revoked the token on *every* session close, with no reason filter. That
+immediately broke `test_get_current_session_for_caller`,
+`test_second_session_is_recognised_as_known_device_and_ip`, and
+`test_user_trust_history` — all of which rely on the documented, intended
+behavior that a page refresh (an ordinary `websocket_disconnect`) reopens a
+fresh session with the *same still-valid token*. Revoking unconditionally
+would have silently broken that refresh behavior and any legitimate
+multi-session use of one token. Root-caused from the failing tests and fixed
+by restricting the hook to the "terminated for cause" reason list above
+before this was committed — the broad version was never merged.
+
+**Deliberately scoped narrow:** revocation targets the *specific session's*
+token, not every token the user holds. Ending one session (e.g. from one
+device) must not silently sign the user out of a different, still-legitimate
+session on another device. A token that never opened a WebSocket session
+(e.g. used only for REST calls) has no `jti` recorded on any session row and
+so cannot be targeted by this mechanism — there is nothing to terminate for
+it, matching the pre-existing behavior for such tokens.
+
+### 10b. Per-tab token storage (closes section 7)
+
+**File changed:** `frontend/src/auth/tokenStore.ts` — switched from
+`localStorage` to `sessionStorage`. `sessionStorage` is scoped per tab even
+for the same origin, so each tab's token is fully isolated from every other
+tab's, eliminating the cross-tab collision at its source. `api/client.ts`
+needed no change — it already only calls `getToken()`/`setToken()`/
+`clearToken()` from `tokenStore.ts`, never touching browser storage directly.
+
+**Trade-off taken on purpose** (the same one section 7 had been flagging for
+a while before the go-ahead was given): a token no longer survives closing
+and reopening a tab — a fresh login is required. Refreshing a tab is
+unaffected either way; `sessionStorage` survives a same-tab reload, only a
+full tab close clears it.
+
+### Verification
+
+- Reinstalled the backend into a clean virtualenv (not trusting anything
+  already installed) and ran the full suite: **80/80 passing** — the prior
+  72 plus 8 new tests in `backend/tests/test_token_revocation.py`:
+  admin-terminate revokes the session's own token; logout revokes it; an
+  *ordinary disconnect does NOT revoke it* and the same token can still open
+  a brand-new session afterward (the regression guard for the bug caught
+  above); a revoked token cannot open a new WebSocket session; terminating
+  one session never revokes a different session's token (multi-device
+  safety); a token that never opened a session is unaffected by an unrelated
+  session ending; the idle sweeper's `idle_timeout` termination revokes its
+  session's token too (unit-level, mirroring the existing sweeper test); and
+  a unit-level roundtrip of `revoke_access_token`/`is_token_revoked` directly
+  against the Redis denylist.
+- Migration `0006` dry-run (both `upgrade head` and `downgrade -1`) against a
+  throwaway SQLite database: the resulting `sessions` schema matches the ORM
+  model exactly in both directions.
+- Frontend: `npx tsc -b --noEmit` → 0 errors.
+- Diff reviewed file-by-file before committing: 13 files, 591 insertions /
+  16 deletions, nothing outside the two gaps touched. Each file was staged
+  matching its own pre-existing line-ending convention (see the section 9
+  housekeeping note) so this commit adds zero new line-ending noise.
+- Committed locally as `2a12b9a` ("Server-side JWT revocation on session
+  termination + per-tab token storage") on `main`, one commit ahead of
+  `origin/main` at the time of this writing; the developer pushes it from
+  their own machine.
+
+**Conclusion:** both gaps flagged at the end of Module 6's independent
+verification are now closed, verified by an expanded regression-tested
+suite (72 → 80 passing) and a caught-before-shipping bug in the first draft
+of the fix. Modules 1-6 remain otherwise untouched. Ready to proceed to
+**Module 7 — Continuous Trust Evaluation**.
