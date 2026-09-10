@@ -19,6 +19,7 @@ from app.core.database import get_db  # noqa: F401  (re-exported)
 from app.core.security import TokenError, decode_access_token
 from app.models.user import User
 from app.services.auth import get_user_by_id
+from app.services.auth.revocation import is_token_revoked
 
 # tokenUrl is the login endpoint's path relative to the server root; it only
 # affects Swagger's "Authorize" dialog, not runtime behaviour.
@@ -40,7 +41,10 @@ def get_current_user(
 
     This is the "authentication middleware" deliverable: 401 on a missing,
     malformed, expired, or wrong-type token; 401 if the subject no longer
-    exists or has been deactivated.
+    exists or has been deactivated; 401 if the token has been server-side
+    revoked (its owning session was terminated — see
+    app.services.auth.revocation), so a copy of a dead session's token can't
+    keep authenticating REST calls after that session has ended.
     """
     if not token:
         raise _CREDENTIALS_EXC
@@ -49,6 +53,9 @@ def get_current_user(
         payload = decode_access_token(token)
         user_id = int(payload["sub"])
     except (TokenError, KeyError, ValueError):
+        raise _CREDENTIALS_EXC
+
+    if is_token_revoked(payload.get("jti")):
         raise _CREDENTIALS_EXC
 
     user = get_user_by_id(db, user_id)

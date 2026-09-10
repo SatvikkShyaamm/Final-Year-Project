@@ -64,7 +64,13 @@ def get_current_session_for_user(db: DbSession, user_id: int) -> Session | None:
 # Writes
 # --------------------------------------------------------------------------- #
 def create_session(
-    db: DbSession, *, user, ip_address: str | None, user_agent: str | None
+    db: DbSession,
+    *,
+    user,
+    ip_address: str | None,
+    user_agent: str | None,
+    token_jti: str | None = None,
+    token_exp=None,
 ) -> Session:
     """
     Open a new session (FSM S1 -> S2).
@@ -72,6 +78,15 @@ def create_session(
     In the full system Modules 5/6 decide whether this is allowed *before*
     calling here, and Module 4 attaches an ACL rule *after*. Module 3 just
     creates the row and announces it.
+
+    `token_jti` / `token_exp` are the `jti` and expiry of the access token
+    that opened this session (from the WebSocket handshake's decoded claims —
+    see app.ws.auth.resolve_ws_user). They are stored so that terminating this
+    session can later revoke that specific token server-side (see
+    app.services.auth.revocation) — Module 3 itself has no opinion on
+    revocation, it just carries the data for whoever does. Optional/None for
+    any caller that doesn't have a token to attach (e.g. a directly-created
+    test session).
     """
     assert_transition(None, SessionState.ACTIVE)
 
@@ -85,6 +100,8 @@ def create_session(
         ws_connected=False,
         created_at=now,
         last_seen_at=now,
+        token_jti=token_jti,
+        token_exp=token_exp,
     )
     db.add(session)
     db.commit()

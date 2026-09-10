@@ -184,10 +184,11 @@ async def session_ws(
 ) -> None:
     # --- handshake: verify the Module 2 JWT before accepting ---
     try:
-        user = resolve_ws_user(token, db)
+        resolved = resolve_ws_user(token, db)
     except WsAuthError:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="unauthenticated")
         return
+    user = resolved.user
 
     await websocket.accept()
 
@@ -198,6 +199,8 @@ async def session_ws(
             user=user,
             ip_address=_client_ip(websocket),
             user_agent=websocket.headers.get("user-agent"),
+            token_jti=resolved.token_jti,
+            token_exp=resolved.token_exp,
         )
     except Exception:  # noqa: BLE001
         logger.exception("failed to open session for user_id=%s", user.id)

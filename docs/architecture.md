@@ -168,3 +168,36 @@ via `pyotp`.
   `GET /mfa/config` (admin — the live policy).
 - **No session hook** — unlike M4/M5, the MFA gate is upstream of the session,
   so `app/services/mfa/` registers nothing on `session/hooks.py`.
+
+## Token revocation hardening (Module 2/3, 2026-09-10)
+
+Closes the gap in Project status.md section 6b: ending a session used to only
+end the *session row* + its ACL rule, never the JWT itself (stateless,
+signature/expiry-only). A copy of the token made before termination kept
+authenticating a brand-new session for the rest of its original lifetime.
+
+- Every access token now carries a `jti` (`app.core.security.create_access_token`).
+- `sessions.token_jti` / `sessions.token_exp` (Alembic `0006_add_token_revocation`,
+  additive) record the `jti`/expiry of the token that opened that session —
+  stamped in `create_session` from the WebSocket handshake's decoded claims
+  (`app.ws.auth.resolve_ws_user`).
+- `app.services.auth.revocation` is a Redis denylist keyed by `jti` (entries
+  expire at the token's own `exp`, so it never grows unbounded).
+  `app.services.auth.wiring` registers an `on_session_closed` hook — same
+  pattern as Module 4's ACL / Module 5's trust score — that revokes the
+  closing session's token, but **only** for a "terminated for cause" reason:
+  `logout`, `admin_terminated`, `idle_timeout`, `max_lifetime`, or (reserved)
+  `risk_revoked`. An ordinary `websocket_disconnect` (closed tab / page
+  refresh) is deliberately excluded — that reopening a fresh session with the
+  same still-valid token is documented, intended behaviour (see the Module 3
+  section above), not the gap this fix closes.
+- `get_current_user` (REST) and `resolve_ws_user` (WebSocket handshake) both
+  check the denylist after decoding a token, so a revoked token can no longer
+  authenticate a REST call or open a new session.
+- Scoped to the *specific session's* token, not every token the user holds —
+  ending one session must not sign the user out on another device.
+- Frontend: `tokenStore.ts` switched from `localStorage` to `sessionStorage`
+  (Project status.md section 7) — scoped per browser tab, closing the
+  same-browser/multiple-tabs/multiple-accounts collision where one tab's login
+  could overwrite another tab's token under the same key. Trade-off taken on
+  purpose: a token no longer survives closing and reopening a tab.

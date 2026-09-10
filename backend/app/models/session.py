@@ -101,6 +101,18 @@ class Session(Base):
     trust_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     risk_level: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
+    # ---- Token revocation hardening (Module 2/3, added alongside Module 6) ----
+    # The `jti` and `exp` of the access token that opened THIS session, so
+    # terminating the session can revoke that specific token server-side (see
+    # app.services.auth.revocation) instead of only ending the session row.
+    # Null for a session opened before this column existed, or in the rare
+    # case the opening token had no `jti` -- such a session simply can't be
+    # targeted for token revocation, matching pre-existing behaviour.
+    token_jti: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    token_exp: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=False), nullable=True
+    )
+
     user = relationship("User", lazy="joined")
 
     # ---- derived, read-only ----
