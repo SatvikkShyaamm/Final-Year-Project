@@ -1027,10 +1027,7 @@ design and asked for it explicitly:
 This is itself a further, explicit deviation from the Master Context Section
 7 draft (which keeps TOTP as the steady-state method) — a conscious,
 developer-directed simplification, not an oversight, and recorded here as
-such. `MASTER_PROJECT_CONTEXT.docx` itself has not been edited to match;
-it still describes the original TOTP-hybrid design and remains the
-project's historical planning document. If a future write-up needs the two
-to agree, that document should be revised too, or the mismatch explained.
+such.
 
 ### What changed
 
@@ -1140,14 +1137,27 @@ restart the backend. The recipient of each code is always the address the
 signing-in user registered with — no separate configuration needed for that
 side.
 
-### Open question carried forward, not yet decided
+### Master Context reconciliation — resolved 2026-09-10
 
-`MASTER_PROJECT_CONTEXT.docx` (the Projects-tool source-of-truth document)
-still describes the original TOTP-hybrid Section 7 design and has not been
-updated to reflect this change. Whether to revise that document to match, or
-to leave it as the historical planning record with this status doc as the
-authoritative "as implemented" account, is an open decision for the
-developer — not made unilaterally here.
+The "open question" originally left here (whether to update
+`MASTER_PROJECT_CONTEXT.docx` to match, or leave it as an untouched
+historical record) has been resolved: `MASTER_PROJECT_CONTEXT.docx` has now
+been revised. Its Section 7 is marked "REVISED 2026-09-10 (Module 6 design,
+as implemented)," describes the email-only-for-every-login design in full,
+explicitly states TOTP is not to be reintroduced for Module 7's future
+continuous-verification challenges either, and preserves the original
+TOTP-hybrid draft underneath as a clearly labeled "Superseded original
+spec" subsection for historical traceability rather than deleting it.
+Sections 8 (Module 6 description), 9 (project modules list), 10 (technology
+stack's MFA line), 14 (example final scenario), and 17/the final instruction
+footer were updated to match. `MASTER_PROJECT_CONTEXT.docx` has no physical
+file counterpart in the git repository — it exists only as a document in
+the Claude Projects tool — so this reconciliation reached that document
+directly there; there was no on-disk repo file to additionally update for
+it. This status doc (`Project status.md`) remains the authoritative,
+continuously-updated "as implemented" account for day-to-day development;
+`MASTER_PROJECT_CONTEXT.docx` is the longer-lived planning/context document,
+now brought back into agreement with it on the MFA method.
 
 **Conclusion:** Module 6's MFA *method* is now pure email one-time codes for
 every login, per the developer's explicit instruction, with TOTP fully
