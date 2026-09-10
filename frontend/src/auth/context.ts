@@ -27,7 +27,14 @@ export interface AuthContextValue {
    * outcome and the code emailed to the user's registered address. Resolves
    * to the now-authenticated user. */
   verifyMfa: (mfaToken: string, code: string) => Promise<User>
-  register: (payload: RegisterPayload) => Promise<User>
+  /** Create the account, but do NOT authenticate with it. Registration
+   * is deliberately not gated by MFA/trust-score (Module 6), but opening a
+   * session for it here would let that session's device/IP seed trust
+   * history before the user's first real login ever runs Module 5/6's
+   * risk check -- silently defeating the "first-ever login is always
+   * risk-evaluated" guarantee. So registering only creates the account;
+   * the caller sends the user back to sign in normally afterward. */
+  register: (payload: RegisterPayload) => Promise<void>
   logout: () => Promise<void>
   /**
    * Locally drop the token and mark the app logged out, WITHOUT calling

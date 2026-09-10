@@ -14,6 +14,13 @@ import type { MFAChallenge, User } from '../types'
  * MFA challenge — the first one and every one after — is a one-time code
  * emailed to the address the user registered with; there is no authenticator
  * app (TOTP was removed 2026-09-10 — see Project status.md section 11).
+ *
+ * Registering does NOT sign the user in. /auth/register still isn't
+ * MFA-gated (you just proved the credentials in that same request), but
+ * auto-authenticating here would open a session before the account's
+ * first real login ever ran Module 5/6's risk check, seeding trust
+ * history that would let that first login skip its MFA challenge. So
+ * a successful register just drops the user back on the sign-in form.
  */
 type Mode = 'login' | 'register'
 type Step = 'credentials' | 'mfa' | 'restart'
@@ -32,6 +39,7 @@ export function Login() {
   const [challenge, setChallenge] = useState<MFAChallenge | null>(null)
   const [code, setCode] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
   function routeOnward(user: User) {
@@ -46,15 +54,24 @@ export function Login() {
     setChallenge(null)
     setCode('')
     setError(null)
+    setNotice(null)
   }
 
   async function handleCredentials(event: FormEvent) {
     event.preventDefault()
     setError(null)
+    setNotice(null)
     setSubmitting(true)
     try {
       if (mode === 'register') {
-        routeOnward(await register({ username, email, password }))
+        await register({ username, email, password })
+        // Account created, but not signed in (see the note above) -- send
+        // the user back to the sign-in form so their first real login runs
+        // the normal risk/MFA gate from a clean trust-score history.
+        setMode('login')
+        setEmail('')
+        setPassword('')
+        setNotice('Account created. Sign in to continue.')
         return
       }
       const outcome = await login({ username, password })
@@ -134,6 +151,10 @@ export function Login() {
                 : 'The first account created becomes the administrator.'}
             </p>
 
+            {notice && (
+              <p className="mt-3 text-sm text-[color:var(--color-risk-low)]">{notice}</p>
+            )}
+
             <form onSubmit={handleCredentials} className="mt-6 space-y-4">
               <Field label="Username" value={username} onChange={setUsername}
                 autoComplete="username" required />
@@ -153,7 +174,7 @@ export function Login() {
             </form>
 
             <button type="button"
-              onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(null) }}
+              onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(null); setNotice(null) }}
               className="mt-4 w-full text-center text-xs text-[color:var(--color-text-muted)] hover:text-[color:var(--color-text)]">
               {mode === 'login' ? 'No account yet? Register' : 'Already registered? Sign in'}
             </button>

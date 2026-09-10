@@ -69,11 +69,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const register = useCallback(async (payload: RegisterPayload) => {
-    const auth = await apiRegister(payload)
-    setToken(auth.access_token)
-    setUser(auth.user)
-    setStatus('authenticated')
-    return auth.user
+    // Deliberately do not authenticate with the token /auth/register
+    // returns: doing so would open a session (SessionProvider connects the
+    // WebSocket as soon as status becomes 'authenticated'), and that
+    // session's device/IP would seed Module 5's trust history before the
+    // account's first real login -- silently skipping the MFA challenge
+    // that login is supposed to get. The account is created; the caller
+    // routes back to the sign-in form.
+    await apiRegister(payload)
   }, [])
 
   const logout = useCallback(async () => {
