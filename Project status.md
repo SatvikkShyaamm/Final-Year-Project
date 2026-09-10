@@ -1365,6 +1365,7 @@ database — writing the migration file is not enough by itself.
 
 ## 14. Module 6 — SMTP Configured for Real Email Delivery of MFA Codes (2026-09-10)
 
+
 Sections 7 and 9 both flagged that Module 6's email-OTP delivery had only
 ever run in its `dev_logged` fallback mode — `SMTP_USERNAME`/`SMTP_PASSWORD`
 were blank in `backend/.env`, so every verification code was logged
@@ -1397,19 +1398,83 @@ App Password never enters git history. This is purely a local
 configuration change; there is no corresponding code diff to commit for
 this step.
 
-### Status — configured, delivery not yet confirmed live
+### Verification tool added
 
-As of this entry, the SMTP values are set but the developer has **not yet**
-triggered a real MEDIUM-risk login to confirm the code actually arrives in
-the registered address's inbox. Per the developer's explicit instruction
-from when SMTP setup was first requested, the `dev_code` field in
-`Login.tsx`'s MFA step is being left in place until that live delivery is
-confirmed — it will be removed as a separate, deliberate follow-up once
-confirmed, not bundled into this configuration step.
+`backend/app/services/mfa/smtp_check.py` was added as a standalone
+connectivity check — `python -m app.services.mfa.smtp_check
+<recipient-email>` sends one real code through the exact same
+`send_verification_email()` function the live login flow uses, entirely
+outside the login/trust-score/MFA-challenge database flow, so SMTP itself
+can be verified with one command instead of registering an account and
+waiting for a MEDIUM-risk decision to fire.
 
-### Next step
+### `SMTP_USERNAME` typo found and fixed
 
-Developer to trigger a first-time (MEDIUM-risk) login on an account whose
-registered email is a real, checkable inbox, and confirm the code arrives.
-Once confirmed, report back so the `dev_code` UI element can be removed
-from `Login.tsx`.
+First run of `smtp_check.py` failed with Gmail's `535 5.7.8 Username and
+Password not accepted`. The script's own printed configuration line made
+the cause visible immediately: `backend/.env` had
+`SMTP_USERNAME=ztcaasm.noreply@gmail.com` — the letters transposed from
+the intended `ztsaacm.noreply@gmail.com`. Gmail was correctly rejecting
+authentication for a mismatched/non-existent account; the App Password
+itself was never the problem. Corrected the spelling in `backend/.env`
+(not committed — see above) and re-ran the check.
+
+### Status — confirmed working
+
+Second run of `smtp_check.py` succeeded (`delivered_via=sent`) and the
+developer confirmed the code was actually received in the target inbox.
+Module 6's email-OTP delivery is now live end-to-end: `SENT` is the real
+`delivered_via` value on every MEDIUM-risk login going forward, in place
+of `DEV_LOGGED`. See section 15 for the `dev_code` UI removal this
+unblocked.
+
+## 15. Module 6 — `dev_code` Removed from the MFA Screen (2026-09-10)
+
+With section 14's live SMTP delivery confirmed, the developer's original
+condition for this change ("remove `dev_code` once SMTP is set up and
+working, not before") was met.
+
+### Change
+
+`frontend/src/pages/Login.tsx` — removed the conditional block in the MFA
+verification step that displayed `challenge.dev_code`:
+
+```tsx
+{challenge.dev_code && (
+  <p className="text-xs text-[color:var(--color-text-muted)]">
+    dev environment (no SMTP configured) — current code:{' '}
+    <span className="font-mono">{challenge.dev_code}</span>
+  </p>
+)}
+```
+
+The MFA screen's doc comment was extended to note why: SMTP is configured
+as of 2026-09-10, so every code is genuinely emailed and the dev-mode
+readout no longer applies.
+
+This is a UI-only change. Nothing on the backend was touched:
+`MFAChallengeOut.dev_code` (the field) and the `email_otp.py`/
+`mfa/service.py` dev-logging fallback both still exist exactly as before —
+if SMTP is ever unconfigured again (blank `SMTP_USERNAME`/`SMTP_PASSWORD`),
+the backend will still dev-log the code server-side and still populate
+`dev_code` in the API response, per `_dev_exposed()` in `mfa/service.py`;
+the frontend now simply never displays it. `frontend/src/types/index.ts`'s
+`dev_code: string | null` field was left in place for the same reason —
+it is still part of the real API contract, only its UI rendering was
+removed.
+
+### Verification
+
+- `git diff -w` on `Login.tsx` shows exactly the 6-line JSX block removed
+  and a doc-comment addition — no other line touched, no line-ending
+  noise (file remains LF, per the section-9 housekeeping note).
+- `npx tsc -b --noEmit` → 0 errors.
+- Grepped the frontend source tree for `dev_code` — the only remaining
+  reference is the still-valid type declaration in `types/index.ts`; no
+  other component reads it.
+
+**Conclusion:** Module 6 is now feature-complete as originally designed —
+every MFA-required login gets a genuinely emailed one-time code, with no
+visible dev/test fallback in the UI, while the backend keeps its
+dev-logging safety net for any future environment where SMTP isn't
+configured (local dev machines, CI, etc.).
