@@ -47,6 +47,7 @@ def emit_session_opened(db: DbSession, session: "SessionModel") -> None:
         try:
             fn(db, session)
         except Exception:  # noqa: BLE001 - a hook failure must not fail the session
+            db.rollback()
             logger.exception("session_opened hook %r failed", getattr(fn, "__name__", fn))
 
 
@@ -57,6 +58,7 @@ def emit_session_closed(
         try:
             fn(db, session_id, user_id, reason)
         except Exception:  # noqa: BLE001
+            db.rollback()
             logger.exception("session_closed hook %r failed", getattr(fn, "__name__", fn))
 
 

@@ -561,3 +561,33 @@ multi-account use will still trigger this until `tokenStore.ts` is changed.
 (`localStorage` scoping and the 401 hard-navigate interceptor) predate
 Module 4 and were introduced in Module 2; they were simply never exercised
 by a multi-account-same-browser test until now.
+
+---
+
+## 8. Session Hook — Poisoned-Transaction Fix (2026-09-10)
+
+Standalone hardening fix applied before starting Module 6.
+
+**File:** `backend/app/services/session/hooks.py` — `emit_session_opened()`
+and `emit_session_closed()`.
+
+**Change:** added `db.rollback()` as the first line inside each
+`except Exception:` block, before the existing `logger.exception(...)`. No
+other code or logic changed.
+
+**Why:** when a registered `session_opened` / `session_closed` hook (Module
+4's ACL wiring, Module 5's trust-score wiring) raises, the exception is
+caught here so the session itself still opens/closes — but the *shared*
+SQLAlchemy `Session` passed into the hook was left with an aborted
+transaction. The next statement on that same `db` (e.g.
+`session_service.set_ws_connected(...)` right after `create_session`
+returns) then raised `InFailedSqlTransaction`, uncaught, killing the
+WebSocket and bypassing the `finally` cleanup — the exact failure mode
+diagnosed in section 6a (which was worked around at the time by applying
+migration `0003`, not by hardening the hook). Rolling back inside the
+`except` clears the poisoned transaction so a single failing hook can no
+longer cascade into an unrelated failure downstream.
+
+**Verification:** full backend suite re-run — **56/56 passing**, unchanged
+(the fix only affects the error path, which no test currently exercises).
+Frontend untouched.
