@@ -21,6 +21,12 @@ import type { MFAChallenge, User } from '../types'
  * first real login ever ran Module 5/6's risk check, seeding trust
  * history that would let that first login skip its MFA challenge. So
  * a successful register just drops the user back on the sign-in form.
+ *
+ * SMTP is now configured (2026-09-10) -- every code is really emailed, so
+ * the dev-mode "current code" readout is no longer shown here. The
+ * backend can still fall back to logging a code server-side if SMTP is
+ * ever unconfigured again (see `MFAChallengeOut.dev_code` /
+ * app/services/mfa/email_otp.py), but the UI no longer surfaces it.
  */
 type Mode = 'login' | 'register'
 type Step = 'credentials' | 'mfa' | 'restart'
@@ -208,12 +214,6 @@ export function Login() {
                 />
               </label>
 
-              {challenge.dev_code && (
-                <p className="text-xs text-[color:var(--color-text-muted)]">
-                  dev environment (no SMTP configured) — current code:{' '}
-                  <span className="font-mono">{challenge.dev_code}</span>
-                </p>
-              )}
               {error && <p className="text-sm text-[color:var(--color-risk-high)]">{error}</p>}
 
               <button type="submit" disabled={submitting || code.length < 6}
