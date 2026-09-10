@@ -16,7 +16,7 @@ Modules 7-10 not started.
 | Module 3 – Session Lifecycle           | Completed                    |
 | Module 4 – Dynamic ACL                 | Completed & independently verified |
 | Module 5 – Trust Score Engine          | Completed                    |
-| Module 6 – Adaptive MFA                | Completed & independently verified |
+| Module 6 – Adaptive MFA                | Completed & independently verified (MFA method revised 2026-09-10 — see section 11) |
 | Module 7 – Continuous Trust Evaluation | Not started                  |
 | Module 8 – Security Dashboard          | Not started                  |
 | Module 9 – Attack Simulation           | Not started                  |
@@ -33,7 +33,7 @@ Modules 7-10 not started.
 - WebSocket: FastAPI/Starlette WebSocket — the session signalling channel (Module 3)
 - Network access control: Redis task queue + L-PEP worker → ipset/iptables on Linux, or a simulated backend elsewhere (Module 4)
 - Trust Score: config-driven weighted-factor engine (Module 5), static score at session creation, Redis failed-login burst counter
-- Adaptive MFA: TOTP (pyotp / RFC 6238), risk-band gated at `POST /auth/login` (Module 6)
+- Adaptive MFA: email one-time codes (Gmail SMTP, `smtplib`), risk-band gated at `POST /auth/login`, sent to every user on every MFA-required login (Module 6, method revised 2026-09-10 — see section 11; TOTP/`pyotp` removed)
 - Other important technologies: Redis 7 (session active-set + events; ACL task queue + ref-counts + receipts + events; failed-login counter; MFA event stream; token-revocation denylist), Docker + Docker Compose
 
 ---
@@ -212,6 +212,18 @@ Implemented against the **finalized Section 6** of `MASTER_PROJECT_CONTEXT.docx`
   produce the same schema as the ORM.
 
 ### Module 6 — Adaptive MFA
+
+> **Superseded 2026-09-10 — see section 11.** Everything below this note
+> describes the TOTP-based implementation as it was originally built and
+> independently verified (section 9). At the developer's explicit request,
+> TOTP was removed outright afterward and replaced with email-delivered
+> one-time codes for every MFA challenge, first login and every one after —
+> not a patch on top of TOTP, a full method swap. The requirements checklist,
+> decision logic (Section 6 risk bands), retry/expiry rules, and endpoint
+> shapes below are still accurate in spirit; every mention of TOTP,
+> `pyotp`, `mfa_credentials`, enrolment/QR codes, and "confirmed credential"
+> below is historical and no longer matches the code. Section 11 is the
+> current, accurate description of Module 6.
 
 Implemented against Master Context Section 6 (risk bands) + Section 7/8
 (Module 6). TOTP (RFC 6238) via `pyotp`.
@@ -940,3 +952,210 @@ verification are now closed, verified by an expanded regression-tested
 suite (72 → 80 passing) and a caught-before-shipping bug in the first draft
 of the fix. Modules 1-6 remain otherwise untouched. Ready to proceed to
 **Module 7 — Continuous Trust Evaluation**.
+
+---
+
+## 11. MFA Method Redesign — TOTP Removed, Email One-Time Codes for Every Login (2026-09-10)
+
+Supersedes the Module 6 subsection in section 3 above (that description is
+kept, annotated, for the historical record). This is a deliberate,
+user-directed method swap decided *after* Module 6's own independent
+verification (section 9) had already confirmed the TOTP implementation was
+internally correct and gap-free against its own design — this change is not
+a bug fix, it is the developer overriding the MFA method itself.
+
+### How this came about
+
+While testing Module 6 live, the developer observed the actual behavior
+(screenshot: a "Verify it's you" MFA screen with `dev environment — current
+code: NNNNNN` shown directly on the page) and raised two concerns: (1) why
+does an already-used, long-established admin account get MFA-challenged
+again just from switching browsers, and (2) the code being visible on the
+dashboard itself looks security-weak — shouldn't a first-time login send a
+code by email, with an authenticator app used only for logins after that?
+
+Investigating this against the project's own source of truth surfaced a
+real discrepancy worth recording precisely: `MASTER_PROJECT_CONTEXT.docx`
+Section 7 ("ADAPTIVE MFA CONCEPT — FINALIZED," status "Finalized and
+approved for implementation") specifies a **two-method hybrid** — TOTP as
+the steady-state method, but a mandatory one-time email-OTP *bootstrap* the
+first time a user is MFA-challenged (before they have a TOTP secret),
+immediately followed by mandatory TOTP enrollment, after which TOTP is used
+for every subsequent challenge. It also specifies a 3-attempt/15-minute
+Redis-backed lockout (separate from Module 5's password-failure counter)
+and TOTP secrets **encrypted at rest**. The developer's expectation matched
+this approved spec almost exactly. The actual Module 6 implementation (as
+verified in section 9) never built the email-bootstrap step, the lockout, or
+secret encryption — it used TOTP from the very first challenge, with
+`dev_code` (a development-only convenience, gated behind
+`ENVIRONMENT=development` / `MFA_DEV_EXPOSE_CODE`) standing in for "how does
+the user get their first code" instead. Section 9's own requirements
+checklist did not catch this because it was checked against Section 6 (risk
+bands) and the general Module 6 deliverable list, not against Section 7's
+more detailed, separately-approved method spec — a real blind spot in that
+verification pass, flagged here for the record.
+
+Separately, confirmed directly from the code that TOTP was applied to
+**every** MEDIUM-risk login, not just first-time ones — `mfa.decide()` looks
+only at the login's own risk band, with no "already enrolled" or "already
+verified before" exemption. This matches Section 7's steady-state behavior
+in isolation, but not the developer's expectation once combined with the
+missing email-bootstrap distinction: a switched browser (different
+User-Agent → unknown-device factor → MEDIUM) on an old, trusted account
+still triggers a full challenge, TOTP included, exactly as implemented.
+
+### The developer's decision
+
+Rather than build out the missing Section 7 pieces (email bootstrap +
+mandatory TOTP enrollment + lockout + secret encryption) to bring Module 6
+into line with the approved spec, the developer chose a simpler, different
+design and asked for it explicitly:
+
+1. Remove the TOTP concept entirely — from login MFA now, and explicitly
+   **not** to be reintroduced for Module 7's continuous session
+   re-verification either (deferred to Module 7, not built now; when Module
+   7 is built, its re-challenges will reuse the same email path below, not
+   TOTP).
+2. Every user, every login that requires MFA, gets a one-time code emailed
+   to their registered address — no authenticator app, no QR enrollment
+   step, no "first login only" special case.
+3. The same email-code mechanism is the intended design for Module 7's
+   future continuous-session re-verification challenges too (not built yet
+   — Module 7 remains "Not started" per section 1's table; this is a design
+   decision recorded now so Module 7 doesn't reintroduce TOTP later).
+
+This is itself a further, explicit deviation from the Master Context Section
+7 draft (which keeps TOTP as the steady-state method) — a conscious,
+developer-directed simplification, not an oversight, and recorded here as
+such. `MASTER_PROJECT_CONTEXT.docx` itself has not been edited to match;
+it still describes the original TOTP-hybrid design and remains the
+project's historical planning document. If a future write-up needs the two
+to agree, that document should be revised too, or the mismatch explained.
+
+### What changed
+
+- **Backend, `app/services/mfa/`**: `totp.py` (the `pyotp` wrapper) deleted
+  outright, replaced by `email_otp.py` — the only place `smtplib` is used.
+  Generates a cryptographically random numeric code (`secrets.choice`, not
+  `pyotp`), hashes it for storage (salted HMAC-SHA256, keyed on
+  `JWT_SECRET_KEY`, a fresh random salt per challenge — the plaintext code
+  is never persisted, only ever held in memory for the one request that
+  generated it), and sends it via Gmail SMTP
+  (`smtp.gmail.com`, `SMTP_USERNAME`/`SMTP_PASSWORD` — a Gmail **App
+  Password**, not the account password — as the sender; the recipient is
+  always the address the user registered with). If SMTP isn't configured
+  (both settings blank, the default — and always true in the test suite),
+  the code is logged server-side instead of emailed and, only in that case,
+  optionally echoed back as `dev_code` for local testing. A real send never
+  echoes the code back, and a configured-but-failing send now returns
+  HTTP 503 rather than silently issuing a challenge nobody can complete.
+- **`app/models/mfa.py`**: `MFACredential` (the one-secret-per-user TOTP
+  table) removed — an emailed code needs nothing durable per user, so there
+  is nothing left to enroll or store between challenges. `MFAMethod` is now
+  `EMAIL` only. `MFAChallenge` gained `code_hash`/`code_salt` (the salted
+  hash described above) and `delivered_via` (`sent` / `dev_logged` /
+  `failed` — visible on the admin MFA feed).
+- **`app/services/mfa/service.py`**: `create_challenge` now generates and
+  emails a code instead of deriving a TOTP value from a stored secret;
+  `verify_challenge` checks the salted hash instead of calling
+  `pyotp`. `build_challenge_out` no longer returns an `enrollment` payload
+  (no more QR code / provisioning URI — there's nothing to enroll).
+- **`app/schemas/mfa.py`**: `MFAEnrollmentOut` removed; `MFAChallengeOut` /
+  `MFAChallengeStatusOut` gained a `delivery` field, dropped `enrollment`.
+- **`app/api/v1/endpoints/mfa.py`**: `/mfa/config`'s response now describes
+  the email/OTP policy (`otp_length`, whether SMTP is configured) instead of
+  TOTP parameters; `/mfa/challenge` (step-up) and `/auth/login` both surface
+  a delivery failure as HTTP 503.
+- **`app/core/config.py`**: `mfa_totp_*` settings replaced with
+  `mfa_otp_length` and Gmail SMTP settings (`smtp_host`, `smtp_port`,
+  `smtp_use_tls`, `smtp_username`, `smtp_password`,
+  `mfa_email_from_name`, `mfa_email_subject`); `.env.example` (both root and
+  `backend/`) updated to match. `mfa_dev_expose_code` is now meaningful only
+  when SMTP is *not* configured — the moment real credentials are set, real
+  email is always sent and the code is never echoed back, regardless of
+  that flag.
+- **Database**: Alembic `0007_mfa_email_otp` — drops `mfa_credentials`
+  entirely; adds `code_hash`/`code_salt`/`delivered_via` (all nullable, since
+  pre-existing challenge rows predate this column and have no meaningful
+  code to backfill) to `mfa_challenges`. Verified with a dry-run `upgrade`
+  and `downgrade` against a throwaway SQLite database — both directions
+  produce the expected schema.
+- **Dependencies**: `pyotp` removed from `backend/requirements.txt`. No new
+  dependency added — email is sent with the Python standard library's
+  `smtplib`/`email.message`.
+- **Frontend**: `Login.tsx`'s MFA step no longer shows an authenticator-key
+  / QR-code enrollment block (removed along with the backend's `enrollment`
+  field); copy changed to "we emailed a verification code to your
+  registered address," and the dev-code hint now reads "dev environment (no
+  SMTP configured)" instead of implying a real deployment would ever show
+  it. `types/index.ts` drops `MFAEnrollment` and the `enrollment` field, and
+  adds `delivery`/`MFADelivery`. `SecurityAlerts.tsx` (the admin MFA feed)
+  needed no changes — it already renders challenges generically.
+- **`docs/architecture.md`**: Module 6 section rewritten to describe the
+  email-OTP design as-implemented, with an explicit note that this departs
+  from the Section 7/8 draft at the developer's instruction.
+- **`backend/tests/test_mfa.py`**: rewritten for the new flow — every
+  assertion on `enrollment`/`provisioning_uri`/`confirmed credential` is
+  gone; added coverage for `delivery` status on both the dev-logged and
+  real-SMTP-configured paths (a real send never exposes `dev_code`, a
+  configured-but-failing send returns 503), and an explicit regression test
+  that a second, later MEDIUM-risk login for the same already-challenged
+  user is challenged again with a brand-new code (documenting the
+  no-exemption behavior called out above, so it can't silently regress into
+  an "already verified" shortcut later).
+
+### Verification
+
+- Full backend suite reinstalled into a clean virtualenv and re-run:
+  **83/83 passing** (80 prior + 3 net new — two TOTP-specific tests removed,
+  five new ones added covering the email flow, delivery-failure 503, and the
+  consecutive-challenge behavior).
+- Migration `0007` dry-run (`upgrade head` then `downgrade -1`) against a
+  throwaway SQLite database in both directions: `mfa_credentials` is
+  dropped/recreated correctly, `mfa_challenges` gains/loses exactly
+  `code_hash`/`code_salt`/`delivered_via`, nothing else moves.
+- Grepped the entire backend and frontend source trees after the change:
+  the only remaining mentions of `TOTP`/`totp`/`pyotp`/`enrollment` are
+  explanatory doc-comments describing the removal, not live code.
+- `app.main:app` imports cleanly (route table unaffected — MFA endpoint
+  paths and method are unchanged, only their internals and schemas).
+- Frontend: `npx tsc -b --noEmit` → 0 errors.
+- Every file was written matching its own file's pre-existing line-ending
+  convention (CRLF for `backend/app/**/*.py` and the frontend files touched;
+  LF for `docs/architecture.md` and the new `0007` migration, matching
+  `0006`'s precedent) — no line-ending churn introduced.
+
+### What the developer still needs to do to see real emails
+
+This ships with SMTP unconfigured (`SMTP_USERNAME`/`SMTP_PASSWORD` blank in
+`.env.example`), so out of the box every MFA challenge is dev-logged with
+`dev_code` shown in the UI — functionally similar to the old TOTP dev
+shortcut, but now honestly labeled and structurally temporary rather than a
+permanent stand-in. To see a real email land in an inbox: generate a Gmail
+**App Password** for a Gmail account (myaccount.google.com/apppasswords —
+requires 2-Step Verification enabled on that Google account), then set
+`SMTP_USERNAME=<that gmail address>` and `SMTP_PASSWORD=<the 16-character
+app password>` in the actual `backend/.env` (not just `.env.example`) and
+restart the backend. The recipient of each code is always the address the
+signing-in user registered with — no separate configuration needed for that
+side.
+
+### Open question carried forward, not yet decided
+
+`MASTER_PROJECT_CONTEXT.docx` (the Projects-tool source-of-truth document)
+still describes the original TOTP-hybrid Section 7 design and has not been
+updated to reflect this change. Whether to revise that document to match, or
+to leave it as the historical planning record with this status doc as the
+authoritative "as implemented" account, is an open decision for the
+developer — not made unilaterally here.
+
+**Conclusion:** Module 6's MFA *method* is now pure email one-time codes for
+every login, per the developer's explicit instruction, with TOTP fully
+removed rather than patched. This is a deliberate design choice that departs
+from the originally-approved Master Context Section 7 draft; it does not
+change Section 6's risk-gating logic (LOW/MEDIUM/HIGH still decide
+allow/challenge/block exactly as before), nor any other module. Modules
+1-5, 6's decision logic, and the section-10 hardening remain intact and
+unaffected — verified by the full regression-tested suite above. Module 7
+is unaffected and still not started; this section records a constraint
+Module 7 should follow (email, not TOTP) rather than any Module 7 work.

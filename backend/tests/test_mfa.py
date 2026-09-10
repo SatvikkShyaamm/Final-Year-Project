@@ -1,9 +1,15 @@
 """
 Module 6 — Adaptive MFA tests.
 
-Covers the Section-6 decision (LOW allow / MEDIUM MFA / HIGH block), the TOTP
-challenge lifecycle (generation, enrollment, verification, expiry, retry /
-exhaustion), the mfa_pending token's narrow scope, and the admin feed.
+Covers the Section-6 decision (LOW allow / MEDIUM MFA / HIGH block), the
+email one-time-code challenge lifecycle (generation, delivery, verification,
+expiry, retry / exhaustion), the mfa_pending token's narrow scope, and the
+admin feed. TOTP was removed 2026-09-10 at the user's explicit request — see
+docs/architecture.md and Project status.md section 11: every MFA challenge,
+first login and every one after, is a code emailed to the user's registered
+address (dev-logged instead of really emailed when SMTP isn't configured,
+which is always true in this test environment — see app/services/mfa/
+email_otp.py).
 """
 from __future__ import annotations
 
@@ -63,11 +69,28 @@ def test_first_login_requires_mfa(client):
 
     mfa = body["mfa"]
     assert mfa["challenge_id"] and mfa["mfa_token"]
-    assert mfa["method"] == "totp"
+    assert mfa["method"] == "email"
     assert mfa["reason"] == "login_risk"
-    assert mfa["enrollment"]["secret"]
-    assert mfa["enrollment"]["provisioning_uri"].startswith("otpauth://totp/")
-    assert mfa["dev_code"]  # development environment
+    assert mfa["delivery"] == "dev_logged"  # no SMTP configured in tests
+    assert mfa["dev_code"]  # development environment, SMTP not configured
+
+
+def test_consecutive_medium_risk_logins_also_require_mfa(client):
+    """No 'already enrolled -> skip it' exemption: every login that lands in
+    MEDIUM is challenged again, by design (see Project status.md section 11)."""
+    _admin_token(client)
+    _user_token(client)
+
+    mfa1 = _login(client)["mfa"]
+    client.post(
+        "/api/v1/mfa/verify", json={"mfa_token": mfa1["mfa_token"], "code": mfa1["dev_code"]}
+    )
+
+    body2 = _login(client)  # still MEDIUM -> still challenged, a brand new code
+    assert body2["mfa_required"] is True
+    mfa2 = body2["mfa"]
+    assert mfa2["challenge_id"] != mfa1["challenge_id"]
+    assert mfa2["dev_code"]
 
 
 def test_mfa_verify_with_dev_code_returns_access_token(client):
@@ -153,7 +176,7 @@ def test_mfa_disabled_lets_medium_through(client, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# TOTP challenge lifecycle
+# email OTP challenge lifecycle
 # --------------------------------------------------------------------------- #
 def test_wrong_code_decrements_then_exhausts(client, monkeypatch):
     monkeypatch.setattr(get_settings(), "mfa_max_attempts", 3)
@@ -200,19 +223,55 @@ def test_expired_challenge_is_rejected(client, db_session):
     assert r.json()["detail"]["code"] == "expired"
 
 
-def test_confirmed_credential_stops_re_enrolling(client):
+def test_a_real_email_send_never_exposes_dev_code(client, monkeypatch):
+    """When SMTP looks configured, the code must actually be emailed and
+    NEVER echoed back in the response — dev_code is strictly a fallback for
+    the case where no real delivery happened."""
+    import app.services.mfa.email_otp as email_otp
+
+    monkeypatch.setattr(get_settings(), "smtp_username", "bot@example.com")
+    monkeypatch.setattr(get_settings(), "smtp_password", "app-password")
+    sent = {}
+
+    def fake_send(*, to_address, code, expires_minutes):
+        sent["to_address"] = to_address
+        sent["code"] = code
+        return "sent"
+
+    monkeypatch.setattr(email_otp, "send_verification_email", fake_send)
+
     _admin_token(client)
     _user_token(client)
+    body = _login(client)
+    mfa = body["mfa"]
 
-    mfa1 = _login(client)["mfa"]
-    client.post(
-        "/api/v1/mfa/verify",
-        json={"mfa_token": mfa1["mfa_token"], "code": mfa1["dev_code"]},
+    assert mfa["delivery"] == "sent"
+    assert mfa["dev_code"] is None
+    assert sent["to_address"] == USER["email"]
+
+    v = client.post(
+        "/api/v1/mfa/verify", json={"mfa_token": mfa["mfa_token"], "code": sent["code"]}
     )
+    assert v.status_code == 200 and v.json()["access_token"]
 
-    mfa2 = _login(client)["mfa"]  # still MEDIUM -> still MFA, but credential is confirmed now
-    assert mfa2["enrollment"] is None
-    assert mfa2["dev_code"]  # dev code still handed out for the demo
+
+def test_email_delivery_failure_blocks_the_login_with_503(client, monkeypatch):
+    import app.services.mfa.email_otp as email_otp
+
+    monkeypatch.setattr(get_settings(), "smtp_username", "bot@example.com")
+    monkeypatch.setattr(get_settings(), "smtp_password", "app-password")
+
+    def fake_send(**kwargs):
+        raise email_otp.EmailDeliveryError("smtp connection refused")
+
+    monkeypatch.setattr(email_otp, "send_verification_email", fake_send)
+
+    _admin_token(client)
+    _user_token(client)
+    resp = client.post(
+        "/api/v1/auth/login", json={"username": "alice", "password": USER["password"]}
+    )
+    assert resp.status_code == 503
 
 
 # --------------------------------------------------------------------------- #
@@ -276,6 +335,7 @@ def test_mfa_challenges_feed_is_admin_only(client):
     body = resp.json()
     assert len(body["challenges"]) >= 1
     assert body["challenges"][0]["reason"] == "login_risk"
+    assert body["challenges"][0]["delivery"] == "dev_logged"
     assert {"pending", "verified", "failed", "expired"} <= set(body["counts"])
 
 
@@ -284,7 +344,9 @@ def test_mfa_config_endpoint(client):
     body = client.get("/api/v1/mfa/config", headers=_bearer(admin)).json()
     assert body["mfa_enabled"] is True
     assert body["max_attempts"] == settings.mfa_max_attempts
-    assert body["totp"]["digits"] == settings.mfa_totp_digits
+    assert body["email"]["method"] == "email"
+    assert body["email"]["otp_length"] == settings.mfa_otp_length
+    assert body["email"]["smtp_configured"] is False
     assert client.get("/api/v1/mfa/config").status_code == 401
 
 
@@ -299,10 +361,22 @@ def test_decide_maps_risk_bands():
     assert decide("HIGH") == Decision.BLOCK
 
 
-def test_totp_verify_roundtrip():
-    from app.services.mfa import totp
+def test_email_otp_hash_roundtrip():
+    from app.services.mfa import email_otp
 
-    secret = totp.new_secret()
-    assert totp.verify(secret, totp.current_code(secret))
-    wrong = f"{(int(totp.current_code(secret)) + 1) % 1_000_000:06d}"
-    assert not totp.verify(secret, wrong)
+    code = email_otp.generate_code()
+    assert len(code) == settings.mfa_otp_length and code.isdigit()
+    salt = email_otp.new_salt()
+    hashed = email_otp.hash_code(code, salt)
+
+    assert email_otp.verify_code(code, salt=salt, expected_hash=hashed)
+    wrong = f"{(int(code) + 1) % (10 ** settings.mfa_otp_length):0{settings.mfa_otp_length}d}"
+    assert not email_otp.verify_code(wrong, salt=salt, expected_hash=hashed)
+    # a different salt for the same code must not verify against this hash
+    assert not email_otp.verify_code(code, salt=email_otp.new_salt(), expected_hash=hashed)
+
+
+def test_email_otp_is_not_smtp_configured_by_default():
+    from app.services.mfa import email_otp
+
+    assert email_otp.is_smtp_configured() is False

@@ -1,16 +1,18 @@
 """
-Module 6 — Adaptive MFA.
+Module 6 -- Adaptive MFA.
 
-    POST /mfa/verify              exchange an mfa_pending token + TOTP code for
-                                  a real access token (login MFA step)
+    POST /mfa/verify              exchange an mfa_pending token + emailed code
+                                  for a real access token (login MFA step)
     POST /mfa/challenge           step-up: an authenticated user asks for a
                                   fresh challenge (also what Module 7 will call)
     GET  /mfa/challenge/{id}      poll one challenge's status (owner or admin)
-    GET  /mfa/challenges          recent challenges feed (admin) — dashboard
-    GET  /mfa/config             the decision policy + TOTP params (admin)
+    GET  /mfa/challenges          recent challenges feed (admin) -- dashboard
+    GET  /mfa/config             the decision policy + email/OTP params (admin)
 
 The login-time decision (allow / MFA / block) lives in /auth/login; this
 module owns challenge generation, verification, expiry and retry handling.
+Method is always email (TOTP was removed 2026-09-10 -- see
+docs/architecture.md and Project status.md section 11).
 """
 from __future__ import annotations
 
@@ -19,9 +21,8 @@ from sqlalchemy.orm import Session as DbSession
 
 from app.api.deps import CurrentAdmin, CurrentUser, get_db
 from app.core.config import get_settings
-from app.core.security import TokenError, create_mfa_token, decode_mfa_token
+from app.core.security import TokenError, create_access_token, create_mfa_token, decode_mfa_token
 from app.models.mfa import MFAChallengeReason
-from app.core.security import create_access_token
 from app.schemas.auth import Token, UserRead
 from app.schemas.mfa import (
     MFAChallengeListResponse,
@@ -50,7 +51,7 @@ def _issue_access_token(user) -> Token:
     "/mfa/verify",
     tags=["mfa"],
     response_model=Token,
-    summary="Verify a TOTP code and exchange the mfa_pending token for access",
+    summary="Verify the emailed code and exchange the mfa_pending token for access",
 )
 def verify_mfa(payload: MFAVerifyRequest, db: DbSession = Depends(get_db)) -> Token:
     try:
@@ -75,7 +76,7 @@ def verify_mfa(payload: MFAVerifyRequest, db: DbSession = Depends(get_db)) -> To
     except mfa_service.ChallengeExhausted:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail={"message": "Too many attempts — restart login", "code": "exhausted"},
+            detail={"message": "Too many attempts -- restart login", "code": "exhausted"},
         )
     except mfa_service.ChallengeNotPending:
         raise HTTPException(
@@ -108,7 +109,6 @@ def verify_mfa(payload: MFAVerifyRequest, db: DbSession = Depends(get_db)) -> To
 def create_step_up_challenge(
     current_user: CurrentUser, db: DbSession = Depends(get_db)
 ) -> MFAChallengeOut:
-    credential = mfa_service.get_or_create_credential(db, current_user)
     # snapshot the caller's current trust context on the challenge, for the feed
     try:
         evaluation = trust_score_service.evaluate_login(
@@ -118,14 +118,20 @@ def create_step_up_challenge(
     except Exception:  # noqa: BLE001 - the challenge must still be creatable
         score, risk = None, None
 
-    challenge = mfa_service.create_challenge(
-        db, user=current_user, reason=MFAChallengeReason.STEP_UP,
-        trust_score=score, risk_level=risk,
-    )
+    try:
+        challenge = mfa_service.create_challenge(
+            db, user=current_user, reason=MFAChallengeReason.STEP_UP,
+            trust_score=score, risk_level=risk,
+        )
+    except mfa_service.DeliveryFailed:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not send the verification email. Try again shortly.",
+        )
     mfa_token = create_mfa_token(
         current_user.id, challenge.id, expires_minutes=settings.mfa_challenge_ttl_minutes
     )
-    return mfa_service.build_challenge_out(challenge, credential, mfa_token=mfa_token)
+    return mfa_service.build_challenge_out(challenge, mfa_token=mfa_token)
 
 
 @router.get(
@@ -149,7 +155,7 @@ def get_challenge_status(
     "/mfa/challenges",
     tags=["mfa"],
     response_model=MFAChallengeListResponse,
-    summary="Recent MFA challenges (admin) — dashboard MFA events feed",
+    summary="Recent MFA challenges (admin) -- dashboard MFA events feed",
 )
 def list_challenges(
     _admin: CurrentAdmin,
@@ -166,7 +172,7 @@ def list_challenges(
 @router.get(
     "/mfa/config",
     tags=["mfa"],
-    summary="The MFA decision policy + TOTP parameters (admin)",
+    summary="The MFA decision policy + email/OTP parameters (admin)",
 )
 def mfa_config(_admin: CurrentAdmin) -> dict:
     return {
@@ -178,10 +184,9 @@ def mfa_config(_admin: CurrentAdmin) -> dict:
         },
         "challenge_ttl_minutes": settings.mfa_challenge_ttl_minutes,
         "max_attempts": settings.mfa_max_attempts,
-        "totp": {
-            "issuer": settings.mfa_totp_issuer,
-            "digits": settings.mfa_totp_digits,
-            "interval_seconds": settings.mfa_totp_interval_seconds,
-            "valid_window": settings.mfa_totp_valid_window,
+        "email": {
+            "method": "email",
+            "otp_length": settings.mfa_otp_length,
+            "smtp_configured": bool(settings.smtp_username and settings.smtp_password),
         },
     }

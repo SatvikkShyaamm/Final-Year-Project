@@ -7,7 +7,8 @@ Authentication endpoints — Module 2, with the Module 6 risk gate on /auth/logi
     POST /auth/login     -> verify credentials, then a trust-score decision:
                             LOW   -> access token
                             MEDIUM -> `mfa_required` + an mfa_pending token to
-                                      complete at POST /mfa/verify
+                                      complete at POST /mfa/verify (a code
+                                      emailed to the user's registered address)
                             HIGH  -> HTTP 403 (blocked by risk policy)
     GET  /auth/me        -> current user (requires a real Bearer access token)
     POST /auth/logout    -> terminate the user's active session(s)
@@ -131,10 +132,15 @@ def login(
         )
 
     # decision == MFA
-    credential = mfa_service.get_or_create_credential(db, user)
-    challenge = mfa_service.create_challenge(
-        db, user=user, trust_score=evaluation.score, risk_level=evaluation.risk_level
-    )
+    try:
+        challenge = mfa_service.create_challenge(
+            db, user=user, trust_score=evaluation.score, risk_level=evaluation.risk_level
+        )
+    except mfa_service.DeliveryFailed:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not send the verification email. Try again shortly.",
+        )
     mfa_token = create_mfa_token(
         user.id, challenge.id, expires_minutes=settings.mfa_challenge_ttl_minutes
     )
@@ -143,7 +149,7 @@ def login(
         decision=decision,
         trust_score=evaluation.score,
         risk_level=evaluation.risk_level,
-        mfa=mfa_service.build_challenge_out(challenge, credential, mfa_token=mfa_token),
+        mfa=mfa_service.build_challenge_out(challenge, mfa_token=mfa_token),
     )
 
 

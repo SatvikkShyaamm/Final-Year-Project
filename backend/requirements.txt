@@ -25,7 +25,6 @@ bcrypt==4.3.0               # password hashing, used directly (no passlib shim)
 email-validator==2.2.0     # backs pydantic's EmailStr in schemas/auth.py
 
 # --- Adaptive MFA (Module 6) ---
-pyotp==2.9.0                # RFC 6238 TOTP generation/verification (pure-Python)
 
 # --- WebSocket support (pulled in by uvicorn[standard] via websockets, listed
 #     explicitly since Module 3 depends on it directly) ---

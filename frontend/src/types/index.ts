@@ -62,16 +62,14 @@ export interface RegisterPayload {
  * Mirrors backend/app/schemas/mfa.py + the LoginResponse in schemas/auth.py.
  * ---------------------------------------------------------------------- */
 
-export interface MFAEnrollment {
-  secret: string
-  provisioning_uri: string
-  digits: number
-  interval_seconds: number
-}
-
 export type MFAChallengeStatus = 'pending' | 'verified' | 'failed' | 'expired'
 
-/** A live challenge to satisfy — from /auth/login or POST /mfa/challenge. */
+/** How the emailed code actually reached (or didn't reach) the user. */
+export type MFADelivery = 'sent' | 'dev_logged' | 'failed'
+
+/** A live challenge to satisfy — from /auth/login or POST /mfa/challenge.
+ * Method is always 'email': a one-time code sent to the user's registered
+ * address (TOTP was removed 2026-09-10 — see Project status.md section 11). */
 export interface MFAChallenge {
   challenge_id: string
   mfa_token: string
@@ -83,7 +81,7 @@ export interface MFAChallenge {
   max_attempts: number
   trust_score: number | null
   risk_level: RiskLevel | null
-  enrollment: MFAEnrollment | null
+  delivery: MFADelivery | null
   dev_code: string | null
 }
 
@@ -108,6 +106,7 @@ export interface MFAChallengeRecord {
   method: string
   reason: string
   status: MFAChallengeStatus
+  delivery: MFADelivery | null
   attempts: number
   max_attempts: number
   trust_score: number | null

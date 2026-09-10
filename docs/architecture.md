@@ -46,7 +46,7 @@ Module 3 stays purely session-lifecycle.
 | FSM S1->S2 (`session_open`) | Module 3 — WebSocket connect creates the `sessions` row; the `session_opened` hook fires Module 4's `request_acl_for_session` **and** Module 5's `evaluate_for_session` (persist the static score). The MEDIUM/HIGH gate is upstream at login, so this code is unconditional |
 | FSM S2->S3 (`session_close`)| Module 3 — `terminate_session` (ws drop / logout / admin / idle+lifetime sweep); the `session_closed` hook fires Module 4's `remove_acl_for_session`. Additionally triggered by Module 7 on unacceptable risk |
 | Trust Score            | `backend/app/services/trust_score/` (Module 5) — `evaluator.py` implements the finalized Section-6 formula `clamp(70 + Σ+ - Σ-, 0, 100)`; config-driven weights; `sessions.trust_score`/`risk_level` + `trust_score_factors` audit rows; Redis `ztsaacm:failed_logins:{user_id}` (15-min TTL) fed from `POST /auth/login` failures. `evaluate_login()` is the login-time (non-persisting) entry point Module 6 calls |
-| Adaptive MFA            | `backend/app/services/mfa/` (Module 6) — `decide(risk_level)` (LOW/MEDIUM/HIGH → allow/mfa/block) + TOTP challenge lifecycle (`mfa_credentials` one secret per user, `mfa_challenges` one row per prompt: create / verify / expiry / retry). `mfa_pending` token type (`app/core/security.create_mfa_token`) is rejected by `decode_access_token`. Redis `ztsaacm:events:mfa` for the dashboard |
+| Adaptive MFA            | `backend/app/services/mfa/` (Module 6) — `decide(risk_level)` (LOW/MEDIUM/HIGH → allow/mfa/block) + email one-time-code challenge lifecycle (`mfa_challenges` one row per prompt: create / verify / expiry / retry — code hashed, never stored plaintext). `mfa_pending` token type (`app/core/security.create_mfa_token`) is rejected by `decode_access_token`. Redis `ztsaacm:events:mfa` for the dashboard |
 | Continuous evaluation   | Composition of trust_score + mfa + acl services (Module 7), no separate service package |
 
 ## Module -> folder map (Module 1 baseline)
@@ -58,7 +58,7 @@ backend/app/core/security.py     password hashing + JWT primitives (Module 2)
 backend/app/services/            one sub-package per module (auth/ session/ acl/ trust_score/ M5, mfa/ M6)
 backend/app/services/session/hooks.py   session_opened/closed callback registry — how M4 (ACL) and M5 (trust score) react without the session layer importing them
 backend/app/services/trust_score/       evaluator (Section-6 algo) + factors + history + store (Redis) + service + wiring
-backend/app/services/mfa/               totp.py (pyotp wrapper) + service.py (decide + challenge lifecycle) — NO session hook (the gate is at login)
+backend/app/services/mfa/               email_otp.py (smtplib/Gmail wrapper) + service.py (decide + challenge lifecycle) — NO session hook (the gate is at login)
 backend/app/models/              one file per module (user session acl trust_score M5, mfa M6)
 backend/app/ws/                  connection_manager.py + handshake auth.py (Module 3)
 backend/app/lpep/                `python -m app.lpep` — standalone L-PEP worker (Module 4)
@@ -70,7 +70,7 @@ infra/l-pep/                     setup-ipset.sh + run notes for the standalone L
 ```
 
 Status: Modules 1-6 implemented. Every login runs a trust-score risk decision;
-MEDIUM logins are TOTP-gated, HIGH refused. The SS-PDP's "JWT verification" is
+MEDIUM logins are email-code-gated, HIGH refused. The SS-PDP's "JWT verification" is
 `app/core/security.decode_access_token` (REST `get_current_user` M2 /
 `app/ws/auth.resolve_ws_user` M3), and it now also rejects the `mfa_pending`
 token. Session, ACL, trust-score and MFA state all live in Postgres
@@ -128,44 +128,69 @@ Concept — FINALIZED"). The code implements it verbatim.
   breakdown, admin or owner), `/trust-score/user/{id}/history` (admin or
   self), `/trust-score/config` (the live weight table, admin).
 
-## Module 6 — Adaptive MFA (as implemented)
+## Module 6 — Adaptive MFA (as implemented, revised 2026-09-10)
 
-Spec: Master Context Section 6 bands + Section 7/8 Module 6. TOTP (RFC 6238)
-via `pyotp`.
+Spec: Master Context Section 6 bands. **Method is email one-time codes, not
+TOTP** — this deliberately departs from the Master Context Section 7/8 draft
+(TOTP-primary + email-bootstrap-only), at the user's explicit instruction.
+See Project status.md section 11 for the full history: TOTP (`pyotp`,
+authenticator-app codes, QR enrolment) was implemented first, matched neither
+the user's expectation nor the Section 7 draft precisely, and was removed
+outright rather than patched — every MFA challenge, the first one and every
+one after, is now a numeric code emailed to the address the user registered
+with. Module 7's continuous re-verification will reuse this same email path
+when it is built, not TOTP.
 
 - **Where**: at `POST /auth/login`, *after* the credential check and *before*
   any session. `trust_score.evaluate_login()` gives a risk band;
   `mfa.decide(risk_level)` maps it:
   - **LOW** (`score >= 80`) → issue a normal access token.
-  - **MEDIUM** (`50-79`) → create an `mfa_challenges` row, return
-    `mfa_required: true` + a short-lived `mfa_pending` token. The client
-    completes it at `POST /mfa/verify` (TOTP code, ±1 step skew) which returns
-    a real `Token`. `mfa_enabled=false` downgrades MEDIUM to allow.
+  - **MEDIUM** (`50-79`) → create an `mfa_challenges` row, email its code to
+    the user's registered address, and return `mfa_required: true` + a
+    short-lived `mfa_pending` token. The client completes it at
+    `POST /mfa/verify` with that code, which returns a real `Token`.
+    `mfa_enabled=false` downgrades MEDIUM to allow.
   - **HIGH** (`< 50`) → HTTP 403, no token.
-  A first-ever login has no history → MEDIUM → every user enrols an
-  authenticator on first sign-in (Section 6 confirmed this consequence).
+  There is **no "already verified before" exemption** — every login that
+  lands in MEDIUM is challenged again with a brand-new code, including for a
+  long-established user on a device they've used for months. A first-ever
+  login has no history and always lands in MEDIUM.
 - **Registration is not gated** — `POST /auth/register` returns a token
   directly. Deliberate: you created and proved the credentials in the same
   request; the risk gate is on *returning*.
-- **Storage** (Alembic `0005`, additive): `mfa_credentials` (one TOTP secret
-  per user, `confirmed` flips true on first successful verify — the enrolment
-  payload is only returned until then); `mfa_challenges` (one row per prompt:
-  `status` pending→verified/failed/expired, `attempts`/`max_attempts`,
-  `expires_at`, plus the `trust_score`/`risk_level` that triggered it and a
-  `reason` — `login_risk` / `step_up` / `risk_retrigger` for Module 7).
+- **Delivery** (`app/services/mfa/email_otp.py`, the only place `smtplib` is
+  touched): Gmail SMTP (`SMTP_HOST=smtp.gmail.com`), sender credentials from
+  `SMTP_USERNAME`/`SMTP_PASSWORD` (a Gmail **App Password**, not the account
+  password). If SMTP isn't configured (both blank — the default, and always
+  true in tests), the code is logged server-side instead
+  (`delivered_via=dev_logged`) and, only in that case, optionally echoed back
+  as `dev_code` (see Dev below) — a real send (`delivered_via=sent`) never
+  echoes the code. A configured-but-failing send raises and the login gets
+  HTTP 503 rather than handing out a challenge nobody can complete.
+- **Storage** (Alembic `0007`, replacing `0005`'s TOTP tables): the
+  `mfa_credentials` table (one TOTP secret per user) is dropped — an emailed
+  code needs nothing durable per user, so there's nothing left to enrol or
+  store between challenges. `mfa_challenges` (one row per prompt): `status`
+  pending→verified/failed/expired, `attempts`/`max_attempts`, `expires_at`,
+  the `trust_score`/`risk_level` that triggered it, a `reason` — `login_risk`
+  / `step_up` / `risk_retrigger` for Module 7 — and now `code_hash`/
+  `code_salt` (salted HMAC-SHA256 of the code, keyed on `JWT_SECRET_KEY`;
+  the plaintext code is never persisted, only ever held in memory for the one
+  request that generated it) plus `delivered_via`.
 - **Token**: `mfa_pending` JWT type (`create_mfa_token`, carries `sub` + `cid`,
   expires with the challenge). `decode_access_token` rejects it, so it cannot
   open a session, hit `/auth/me`, or start a step-up — only `/mfa/verify`.
 - **Retry / expiry**: `MFA_MAX_ATTEMPTS` wrong codes → challenge `failed`
   (403); past `MFA_CHALLENGE_TTL_MINUTES` → `expired` (403); a closed
   challenge → 409. All server-enforced on the `mfa_challenges` row.
-- **Dev**: when `MFA_DEV_EXPOSE_CODE` or `ENVIRONMENT=development`, the
-  challenge response carries `dev_code` (the currently-valid TOTP code) so the
-  demo/tests need no authenticator app. Off in production.
+- **Dev**: only when SMTP isn't configured AND (`MFA_DEV_EXPOSE_CODE` or
+  `ENVIRONMENT=development`), the challenge response also carries `dev_code`
+  (the plaintext code) so the demo/tests need no real mailbox. Off the moment
+  SMTP is configured, and off in a real deployment either way.
 - **Read surface**: `POST /mfa/challenge` (step-up for an authed user; also
   Module 7's re-challenge entry point), `GET /mfa/challenge/{id}` (owner or
-  admin), `GET /mfa/challenges` (admin — dashboard MFA events),
-  `GET /mfa/config` (admin — the live policy).
+  admin), `GET /mfa/challenges` (admin — dashboard MFA events, now shows
+  `delivery` per challenge), `GET /mfa/config` (admin — the live policy).
 - **No session hook** — unlike M4/M5, the MFA gate is upstream of the session,
   so `app/services/mfa/` registers nothing on `session/hooks.py`.
 

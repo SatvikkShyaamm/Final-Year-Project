@@ -10,8 +10,10 @@ import type { MFAChallenge, User } from '../types'
  *
  * Credentials -> POST /auth/login. The backend replies with a trust-score
  * decision: an access token (LOW risk), an MFA challenge (MEDIUM), or 403
- * (HIGH). A first-ever login has no history and always lands in MEDIUM, so
- * new users see the "set up your authenticator" step once.
+ * (HIGH). A first-ever login has no history and always lands in MEDIUM. Every
+ * MFA challenge — the first one and every one after — is a one-time code
+ * emailed to the address the user registered with; there is no authenticator
+ * app (TOTP was removed 2026-09-10 — see Project status.md section 11).
  */
 type Mode = 'login' | 'register'
 type Step = 'credentials' | 'mfa' | 'restart'
@@ -166,22 +168,8 @@ export function Login() {
               <span className="text-[color:var(--color-risk-medium)]">
                 {challenge.risk_level ?? 'elevated risk'}
               </span>{' '}
-              — enter a code from your authenticator app.
+              — we emailed a verification code to your registered address.
             </p>
-
-            {challenge.enrollment && (
-              <div className="mt-4 rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-bg)] p-3 text-xs">
-                <p className="font-medium text-[color:var(--color-text)]">
-                  First time — add this key to your authenticator
-                </p>
-                <p className="mt-1 break-all font-mono text-[color:var(--color-text-muted)]">
-                  {challenge.enrollment.secret}
-                </p>
-                <p className="mt-1 break-all text-[10px] text-[color:var(--color-text-muted)]">
-                  {challenge.enrollment.provisioning_uri}
-                </p>
-              </div>
-            )}
 
             <form onSubmit={handleVerify} className="mt-5 space-y-4">
               <label className="block">
@@ -201,7 +189,8 @@ export function Login() {
 
               {challenge.dev_code && (
                 <p className="text-xs text-[color:var(--color-text-muted)]">
-                  dev environment — current code: <span className="font-mono">{challenge.dev_code}</span>
+                  dev environment (no SMTP configured) — current code:{' '}
+                  <span className="font-mono">{challenge.dev_code}</span>
                 </p>
               )}
               {error && <p className="text-sm text-[color:var(--color-risk-high)]">{error}</p>}

@@ -7,7 +7,7 @@ Sub-packages map one-to-one to the module that owns that business logic:
   services/session/     -> Module 3: session lifecycle FSM, connection manager glue
   services/acl/         -> Module 4: ACL create/remove, ipset integration (L-PEP role)
   services/trust_score/ -> Module 5: weighted trust factor calculation
-  services/mfa/         -> Module 6: TOTP generation/verification
+  services/mfa/         -> Module 6: email one-time-code generation/verification
   services/simulation/  -> Module 9: attack simulation triggers
 
 Module 7 (Continuous Trust Evaluation) does not get its own sub-package: it

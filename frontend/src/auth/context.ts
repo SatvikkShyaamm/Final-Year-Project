@@ -24,7 +24,8 @@ export interface AuthContextValue {
   isAdmin: boolean
   login: (credentials: LoginCredentials) => Promise<LoginOutcome>
   /** Complete the Module 6 MFA step with the mfa_token from a `mfa_required`
-   * outcome and a TOTP code. Resolves to the now-authenticated user. */
+   * outcome and the code emailed to the user's registered address. Resolves
+   * to the now-authenticated user. */
   verifyMfa: (mfaToken: string, code: string) => Promise<User>
   register: (payload: RegisterPayload) => Promise<User>
   logout: () => Promise<void>

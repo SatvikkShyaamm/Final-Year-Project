@@ -24,7 +24,7 @@ from app.models.mfa import (  # noqa: F401  (Module 6)
     MFAChallenge,
     MFAChallengeReason,
     MFAChallengeStatus,
-    MFACredential,
+    MFADeliveryStatus,
     MFAMethod,
 )
 from app.models.session import (  # noqa: F401  (Module 3)
@@ -51,9 +51,9 @@ __all__ = [
     "TrustScoreFactor",
     "FactorKind",
     "RiskLevel",
-    "MFACredential",
     "MFAChallenge",
     "MFAMethod",
+    "MFADeliveryStatus",
     "MFAChallengeStatus",
     "MFAChallengeReason",
 ]

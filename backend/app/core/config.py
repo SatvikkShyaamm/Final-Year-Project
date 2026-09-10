@@ -111,13 +111,36 @@ class Settings(BaseSettings):
     mfa_enabled: bool = True
     mfa_challenge_ttl_minutes: int = 5
     mfa_max_attempts: int = 5
-    mfa_totp_issuer: str = "ZTSAACM"
-    mfa_totp_digits: int = 6
-    mfa_totp_interval_seconds: int = 30
-    mfa_totp_valid_window: int = 1        # +/- this many 30s steps of clock-skew tolerance
-    # When true (or environment == "development"), MFA challenge responses also
-    # carry the currently-valid TOTP code so the demo/tests work without an
-    # authenticator app. MUST be false in a real deployment.
+    # Every MFA challenge (first login and every one after) is a one-time
+    # numeric code emailed to the user's registered address. There is no
+    # authenticator-app / TOTP path in this system (deliberately removed
+    # 2026-09-10 -- see docs/architecture.md and Project status.md section 11;
+    # Module 7's continuous re-verification will reuse this same email path,
+    # not TOTP, when it is built).
+    mfa_otp_length: int = 6
+
+    # ---- Outbound email (Gmail SMTP) for MFA codes ----
+    # smtp_username/smtp_password are the SENDING Gmail account (a Gmail App
+    # Password, not the account password -- generate one at
+    # https://myaccount.google.com/apppasswords). The RECIPIENT is always the
+    # address the user registered with (users.email). Leave smtp_username /
+    # smtp_password blank in dev: send_verification_email() then logs the code
+    # server-side instead of emailing it (see mfa_dev_expose_code below), so
+    # the suite and local dev work without real Gmail credentials.
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_use_tls: bool = True
+    smtp_username: str = ""
+    smtp_password: str = ""
+    mfa_email_from_name: str = "ZTSAACM Security"
+    mfa_email_subject: str = "Your ZTSAACM verification code"
+
+    # When true (or environment == "development") AND SMTP is not configured,
+    # the MFA challenge response also carries the plaintext code (`dev_code`)
+    # so local dev/tests work without a real mailbox. The moment smtp_username
+    # / smtp_password are set, real email is sent and dev_code is never
+    # returned, regardless of this flag -- MUST be false (or SMTP must be
+    # configured) in a real deployment.
     mfa_dev_expose_code: bool = False
 
     # Kept as a raw comma-separated string (not List[str]) because
