@@ -133,9 +133,28 @@ class Settings(BaseSettings):
     # numeric code emailed to the user's registered address. There is no
     # authenticator-app / TOTP path in this system (deliberately removed
     # 2026-09-10 -- see docs/architecture.md and Project status.md section 11;
-    # Module 7's continuous re-verification will reuse this same email path,
-    # not TOTP, when it is built).
+    # Module 7's continuous re-verification reuses this same email path,
+    # not TOTP).
     mfa_otp_length: int = 6
+    # ---- Account-level MFA lockout (Redis-backed, separate from the
+    # per-challenge mfa_max_attempts above) ----
+    # Per MASTER_PROJECT_CONTEXT.docx Section 7's original spec: a wrong-code
+    # streak across ANY challenge for a user (login_risk / step_up /
+    # risk_retrigger alike) -- not just one challenge's own attempt counter --
+    # locks that user out of MFA entirely for a cool-down window. Two
+    # independent knobs even though they default to the same value: how wide
+    # a window the wrong attempts must fall within to count as a "streak"
+    # (mfa_lockout_window_minutes), and how long the resulting lockout lasts
+    # (mfa_lockout_duration_minutes). Redis-backed (`ztsaacm:mfa_failed:{id}` /
+    # `ztsaacm:mfa_lockout:{id}`), best-effort like every other Redis-backed
+    # counter in this codebase (session store, ACL ref-counts, the Module 5
+    # failed-login burst counter, the token-revocation denylist) -- a
+    # Redis outage fails OPEN (lets a real, correct code through rather than
+    # locking every user out over an infrastructure blip), matching this
+    # codebase's established policy for auxiliary Redis-backed protections.
+    mfa_lockout_threshold: int = 3
+    mfa_lockout_window_minutes: int = 15
+    mfa_lockout_duration_minutes: int = 15
 
     # ---- Outbound email (Gmail SMTP) for MFA codes ----
     # smtp_username/smtp_password are the SENDING Gmail account (a Gmail App

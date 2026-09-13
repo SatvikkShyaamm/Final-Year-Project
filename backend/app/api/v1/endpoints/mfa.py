@@ -95,6 +95,27 @@ async def verify_mfa(payload: MFAVerifyRequest, db: DbSession = Depends(get_db))
 
     try:
         mfa_service.verify_challenge(db, challenge=challenge, code=payload.code)
+    except mfa_service.MFALockedOut as exc:
+        # Account-level lockout (mfa_lockout_threshold wrong codes across ANY
+        # challenge within mfa_lockout_window_minutes) -- distinct from, and
+        # checked ahead of, this one challenge's own attempts/max_attempts.
+        # For a risk_retrigger challenge this is exactly as fail-safe as an
+        # expiry/exhaustion: the user can't re-prove identity right now, so
+        # the session it was guarding does not get to keep running.
+        if retrigger_session_id:
+            await _revoke_retrigger_session(db, retrigger_session_id)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "message": (
+                    f"Too many incorrect MFA codes -- locked for "
+                    f"{exc.retry_after_seconds // 60 + 1} more minute(s)"
+                ),
+                "code": "locked",
+                "retry_after_seconds": exc.retry_after_seconds,
+            },
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
     except mfa_service.ChallengeExpired:
         if retrigger_session_id:
             await _revoke_retrigger_session(db, retrigger_session_id)
@@ -225,6 +246,16 @@ def mfa_config(_admin: CurrentAdmin) -> dict:
         },
         "challenge_ttl_minutes": settings.mfa_challenge_ttl_minutes,
         "max_attempts": settings.mfa_max_attempts,
+        "lockout": {
+            "threshold": settings.mfa_lockout_threshold,
+            "window_minutes": settings.mfa_lockout_window_minutes,
+            "duration_minutes": settings.mfa_lockout_duration_minutes,
+            "note": (
+                "account-level, Redis-backed, separate from max_attempts above -- "
+                "counts wrong codes across ANY challenge (login_risk / step_up / "
+                "risk_retrigger) for a user within window_minutes"
+            ),
+        },
         "email": {
             "method": "email",
             "otp_length": settings.mfa_otp_length,

@@ -46,7 +46,7 @@ Module 3 stays purely session-lifecycle.
 | FSM S1->S2 (`session_open`) | Module 3 — WebSocket connect creates the `sessions` row; the `session_opened` hook fires Module 4's `request_acl_for_session` **and** Module 5's `evaluate_for_session` (persist the static score). The MEDIUM/HIGH gate is upstream at login, so this code is unconditional |
 | FSM S2->S3 (`session_close`)| Module 3 — `terminate_session` (ws drop / logout / admin / idle+lifetime sweep); the `session_closed` hook fires Module 4's `remove_acl_for_session`. Additionally triggered by Module 7 on unacceptable risk |
 | Trust Score            | `backend/app/services/trust_score/` (Module 5) — `evaluator.py` implements the finalized Section-6 formula `clamp(70 + Σ+ - Σ-, 0, 100)`; config-driven weights; `sessions.trust_score`/`risk_level` + `trust_score_factors` audit rows; Redis `ztsaacm:failed_logins:{user_id}` (15-min TTL) fed from `POST /auth/login` failures. `evaluate_login()` is the login-time (non-persisting) entry point Module 6 calls |
-| Adaptive MFA            | `backend/app/services/mfa/` (Module 6) — `decide(risk_level)` (LOW/MEDIUM/HIGH → allow/mfa/block) + email one-time-code challenge lifecycle (`mfa_challenges` one row per prompt: create / verify / expiry / retry — code hashed, never stored plaintext). `mfa_pending` token type (`app/core/security.create_mfa_token`) is rejected by `decode_access_token`. Redis `ztsaacm:events:mfa` for the dashboard |
+| Adaptive MFA            | `backend/app/services/mfa/` (Module 6) — `decide(risk_level)` (LOW/MEDIUM/HIGH → allow/mfa/block) + email one-time-code challenge lifecycle (`mfa_challenges` one row per prompt: create / verify / expiry / retry — code hashed, never stored plaintext). `mfa_pending` token type (`app/core/security.create_mfa_token`) is rejected by `decode_access_token`. Redis `ztsaacm:events:mfa` for the dashboard, plus (2026-09-13) `ztsaacm:mfa_failed:{id}`/`ztsaacm:mfa_lockout:{id}` for the account-level lockout |
 | Continuous evaluation   | `backend/app/services/trust_score/continuous.py` (Module 7) -- composition of trust_score + mfa + session services, no separate service package. `record_event()` recomputes the session's CURRENT score (not the static baseline) and carries out none / reverify (email, reusing Module 6) / revoke (`TerminationReason.RISK_REVOKED`, already wired into token revocation) |
 
 ## Module -> folder map (Module 1 baseline)
@@ -184,7 +184,10 @@ when it is built, not TOTP.
   open a session, hit `/auth/me`, or start a step-up — only `/mfa/verify`.
 - **Retry / expiry**: `MFA_MAX_ATTEMPTS` wrong codes → challenge `failed`
   (403); past `MFA_CHALLENGE_TTL_MINUTES` → `expired` (403); a closed
-  challenge → 409. All server-enforced on the `mfa_challenges` row.
+  challenge → 409. All server-enforced on the `mfa_challenges` row. Checked
+  *after* the account-level lockout below, which can short-circuit a verify
+  attempt before it ever reaches this per-challenge logic (see "MFA account
+  lockout hardening" section, 2026-09-13).
 - **Dev**: only when SMTP isn't configured AND (`MFA_DEV_EXPOSE_CODE` or
   `ENVIRONMENT=development`), the challenge response also carries `dev_code`
   (the plaintext code) so the demo/tests need no real mailbox. Off the moment
@@ -195,6 +198,53 @@ when it is built, not TOTP.
   `delivery` per challenge), `GET /mfa/config` (admin — the live policy).
 - **No session hook** — unlike M4/M5, the MFA gate is upstream of the session,
   so `app/services/mfa/` registers nothing on `session/hooks.py`.
+
+## MFA account lockout hardening (Module 6, 2026-09-13)
+
+Closes the gap noted in Project status.md and this file's own "known,
+deliberately out-of-scope" observation from the Module 7 review: Master
+Context Section 7 describes a Redis-backed account-level MFA lockout (3
+wrong codes -> 15-minute lockout) that Module 6 never actually built — it
+only ever enforced `MFA_MAX_ATTEMPTS` on the one challenge row being
+verified. Now built, additively, alongside that existing mechanism rather
+than replacing it.
+
+- **Two independent limits, by design**: `MFA_MAX_ATTEMPTS` (default 5)
+  closes ONE challenge after that many wrong codes on it. The new
+  `MFA_LOCKOUT_THRESHOLD` (default 3) locks the WHOLE ACCOUNT out of MFA —
+  `login_risk`, `step_up`, and Module 7's `risk_retrigger` alike — once that
+  many wrong codes land across ANY of the user's challenges within
+  `MFA_LOCKOUT_WINDOW_MINUTES` (default 15). The lockout, once tripped, lasts
+  `MFA_LOCKOUT_DURATION_MINUTES` (default 15). With the stock defaults the
+  account-level lockout trips first (3 wrong codes) — before a single
+  challenge could ever exhaust its own 5 attempts.
+- **Where the logic lives**: `backend/app/services/mfa/service.py` — two new
+  Redis keys per user, best-effort like every other Redis-backed mechanism in
+  this project (`ztsaacm:mfa_failed:{user_id}`, a counter with
+  `MFA_LOCKOUT_WINDOW_MINUTES` TTL; `ztsaacm:mfa_lockout:{user_id}`, set only
+  once the threshold trips, TTL = the remaining lockout time). `verify_challenge`
+  checks the lockout key first — raising the new `MFALockedOut` exception
+  before even looking at the challenge's own status — clears the failed-count
+  key on a correct code, and increments it on a wrong one.
+- **API**: `POST /mfa/verify` returns HTTP 429 with a `Retry-After` header and
+  `{"code": "locked", "retry_after_seconds": N}` when locked out — same shape
+  as the existing `expired`/`exhausted`/`closed` error codes, so the frontend
+  branches on `code` the same way it already did. `GET /mfa/config` gained a
+  `lockout` block (threshold/window/duration) alongside the existing
+  `max_attempts`.
+- **Module 7 interaction**: exactly like an exhausted or expired
+  `risk_retrigger` re-verification, an account-level lockout during one also
+  revokes the session it was guarding (`_revoke_retrigger_session`,
+  `TerminationReason.RISK_REVOKED`) — the user still can't re-prove identity
+  right now, so zero trust says the session doesn't get to keep running just
+  because the *reason* they can't prove it was an account lock rather than a
+  used-up challenge.
+- **Tests**: `backend/tests/test_mfa.py` — the lockout trips before a single
+  challenge's own `max_attempts` with stock defaults; it counts wrong codes
+  across *different* challenges for the same user; a correct code resets the
+  streak; it's scoped per-user (one user's wrong codes don't lock another
+  user out). `backend/tests/test_continuous_trust.py` — a `risk_retrigger`
+  challenge that trips the account lockout also revokes its session.
 
 ## Token revocation hardening (Module 2/3, 2026-09-10)
 
@@ -341,13 +391,12 @@ Module 6 email mechanism, never TOTP.
   as this project's demo/testing hook for `POST /security/events` until
   Module 9 gives it dedicated buttons; Security Alerts gained a second feed
   table for `GET /security/events` alongside the existing MFA-challenges one.
-- **Known, deliberately out-of-scope observation for the write-up**: Master
-  Context Section 7 also describes a Redis-backed MFA lockout (3 wrong
-  attempts -> 15-minute lockout, `ztsaacm:mfa_lockout:{user_id}`) that was
-  never actually built in Module 6 (it uses only the per-challenge
-  `attempts`/`max_attempts` columns, default 5) — noted during Module 7's
-  review as a pre-existing Module 6 gap, not touched here to keep this
-  module's diff scoped to continuous evaluation.
+- **Follow-up note**: this Module 7 review originally flagged Master Context
+  Section 7's Redis-backed MFA lockout (3 wrong attempts -> 15-minute
+  lockout) as a pre-existing Module 6 gap, deliberately left untouched here
+  to keep this module's diff scoped to continuous evaluation. It has since
+  been built — see "MFA account lockout hardening (Module 6, 2026-09-13)"
+  above, including how it interacts with a `risk_retrigger` re-verification.
 - **Tests**: `backend/tests/test_continuous_trust.py` — event ingestion
   recomputes the score against its current value correctly; a small-impact
   event that stays LOW takes no action; a MEDIUM crossing creates exactly one

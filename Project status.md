@@ -1738,3 +1738,158 @@ SMTP settings leaking into the test environment from a developer's own
 Module 6 spec/implementation gap (the Redis MFA lockout) was confirmed still
 open and deliberately left for a future, explicitly-scoped fix. Ready to
 proceed to **Module 8 — Security Dashboard**.
+
+
+---
+
+## 17. Post-Module-7 Hardening — Shorter Re-Verification Window + Account-Level MFA Lockout (2026-09-13)
+
+Two changes made right after Module 7's implementation/verification (section
+16), at the developer's explicit request, both scoped to Module 6/7's MFA
+mechanism rather than touching Module 7's event/scoring logic itself.
+
+### 17a. Mid-session re-verification window shortened, 5 → 3 minutes
+
+**Change:** a Module 7 `risk_retrigger` re-verification challenge (triggered
+by `record_event()` dropping a session's live score into MEDIUM) now expires
+after `MFA_RETRIGGER_TTL_MINUTES` (new setting, default 3) instead of
+reusing `MFA_CHALLENGE_TTL_MINUTES` (still 5, unchanged, and still what a
+fresh *login's* MFA challenge uses). The developer's stated reasoning: an
+already-active session that just tripped a security event should get a
+*tighter* window to re-prove identity than a brand-new login does — a
+stricter, more zero-trust posture for the in-session case specifically.
+
+- `app/core/config.py` — new `mfa_retrigger_ttl_minutes: int = 3`.
+- `app/services/trust_score/continuous.py` — its `mfa_service.create_challenge(...)`
+  call for a `risk_retrigger` challenge now passes
+  `ttl_minutes=settings.mfa_retrigger_ttl_minutes`; `event_catalogue()`'s
+  admin-facing config dict gained a `reverify_ttl_minutes` field.
+- `app/services/mfa/service.py` — `create_challenge()` gained an optional
+  `ttl_minutes: int | None = None` parameter (falls back to
+  `mfa_challenge_ttl_minutes` when omitted, so every other caller — login,
+  step-up — is byte-for-byte unaffected); used for both the emailed
+  "expires in N minutes" copy and the challenge row's `expires_at`.
+- `.env.example` (root and `backend/`) — new
+  `# ---- Continuous Trust Evaluation (Module 7) ----` block documenting
+  `MFA_RETRIGGER_TTL_MINUTES=3` and why it's deliberately shorter than the
+  login TTL above it.
+- Scoped deliberately narrow: only Module 7's mid-session re-verification
+  changed. Login MFA and step-up MFA still use the original 5-minute
+  `MFA_CHALLENGE_TTL_MINUTES`, unchanged.
+
+**Verification:** full backend suite re-run — **98/98 passing**, unchanged
+(no existing test asserted a specific re-verification TTL value, so none
+needed updating); a direct API check confirmed a fresh `risk_retrigger`
+challenge's `expires_at` is exactly 3.00 minutes out, and the dev-log line
+shows the code annotated `(valid 3 min)`.
+
+### 17b. Account-level MFA lockout (Redis-backed, additive alongside `max_attempts`)
+
+**Problem:** Master Context Section 7 (see section 11's history above)
+describes a Redis-backed *account-level* lockout — 3 wrong codes within 15
+minutes locks the account out of MFA entirely for 15 minutes
+(`ztsaacm:mfa_lockout:{user_id}` / `ztsaacm:mfa_failed:{user_id}`) — separate
+from Module 5's password-failure counter. Section 16 confirmed this was
+never built: Module 6 only ever enforced `MFA_MAX_ATTEMPTS` (default 5) on
+the *one challenge row* being verified, with no cross-challenge, account-wide
+limit. Flagged in section 16 as a known, deliberately-unfixed pre-existing
+gap; the developer asked for it to be built now, explicitly **alongside**
+`max_attempts` rather than replacing it.
+
+**Two independent limits, by design:**
+
+| Mechanism | Scope | Threshold (default) | Window | Effect |
+|---|---|---|---|---|
+| `MFA_MAX_ATTEMPTS` (pre-existing) | one `mfa_challenges` row | 5 wrong codes on it | the challenge's own lifetime | that one challenge closes (`failed`, 403) |
+| `MFA_LOCKOUT_THRESHOLD` (new) | the whole account | 3 wrong codes across ANY of the user's challenges | `MFA_LOCKOUT_WINDOW_MINUTES` (15) | the account is locked out of MFA entirely for `MFA_LOCKOUT_DURATION_MINUTES` (15) |
+
+With the stock defaults, the account-level lockout trips first (3 wrong
+codes) — before a single challenge could ever exhaust its own 5 attempts.
+This is intentional: it's the stricter, account-wide guard the Master
+Context specifies, sitting in front of the pre-existing per-challenge one,
+not instead of it.
+
+**What was built:**
+
+- `app/core/config.py` — `mfa_lockout_threshold: int = 3`,
+  `mfa_lockout_window_minutes: int = 15`, `mfa_lockout_duration_minutes: int
+  = 15`.
+- `app/services/mfa/service.py` — new `MFALockedOut` exception (carries
+  `retry_after_seconds`); two new Redis keys per user, best-effort like
+  every other Redis mechanism in this codebase (fails open on a Redis
+  error): `ztsaacm:mfa_failed:{user_id}` (a counter, TTL =
+  `MFA_LOCKOUT_WINDOW_MINUTES`) and `ztsaacm:mfa_lockout:{user_id}` (set only
+  once the threshold trips, TTL = the remaining lockout time).
+  `verify_challenge()` now checks the lockout key *first* — raising
+  `MFALockedOut` before it even looks at the challenge's own status —
+  clears the failed-count key on a correct code, and increments it on a
+  wrong one.
+- `app/services/mfa/__init__.py` — re-exports `MFALockedOut`.
+- `app/api/v1/endpoints/mfa.py` — `POST /mfa/verify` catches `MFALockedOut`
+  and returns HTTP 429 with a `Retry-After` header and
+  `{"message": ..., "code": "locked", "retry_after_seconds": N}` — same
+  error shape as the existing `expired`/`exhausted`/`closed` codes, so the
+  frontend branches on `code` the same way it already did. Exactly like an
+  exhausted or expired `risk_retrigger` challenge, a lockout that occurs
+  mid-re-verification also revokes the session it was guarding
+  (`_revoke_retrigger_session`, `TerminationReason.RISK_REVOKED`) — the user
+  still can't re-prove identity right now, so zero trust says the session
+  doesn't get to keep running regardless of *why* they can't prove it.
+  `GET /mfa/config` gained a `lockout` block (threshold/window/duration)
+  alongside the pre-existing `max_attempts`.
+- `.env.example` (root and `backend/`) — `MFA_LOCKOUT_THRESHOLD=3`,
+  `MFA_LOCKOUT_WINDOW_MINUTES=15`, `MFA_LOCKOUT_DURATION_MINUTES=15`, in the
+  Module 6 section next to `MFA_MAX_ATTEMPTS`.
+- `docs/architecture.md` — new "MFA account lockout hardening (Module 6,
+  2026-09-13)" section; the stale "known, deliberately out-of-scope"
+  observation from the Module 7 section now points to it instead of
+  describing the lockout as unbuilt.
+- **Frontend**: `ReverifyModal.tsx` and `Login.tsx` both gained a `locked`
+  branch alongside their existing `expired`/`exhausted` handling —
+  `ReverifyModal` explains the session is being ended (matching the actual
+  server-side revocation above); `Login.tsx` shows a "try again in N
+  minute(s)" message (from `retry_after_seconds`) and returns to the
+  sign-in step, same as `expired`/`exhausted` already did. No change to
+  either file's happy-path or invalid-code handling.
+
+**Tests added:**
+
+- `backend/tests/test_mfa.py` — the lockout trips before a single
+  challenge's own `max_attempts` with stock defaults; it counts wrong codes
+  across *different* challenges for the same user (not just retries on one);
+  a correct code resets the streak; it's scoped per-user (one user's wrong
+  codes never lock another user out). `test_mfa_config_endpoint` updated to
+  assert on the new `lockout` block. One pre-existing test
+  (`test_wrong_code_decrements_then_exhausts`) needed one line added
+  (`monkeypatch` the lockout threshold high) to isolate it from the new
+  mechanism, since both it and the new lockout defaulted to the same
+  threshold (3) and would otherwise collide on the same wrong attempt —
+  not a logic bug, a genuine, intended interaction between two now-coexisting
+  mechanisms.
+- `backend/tests/test_continuous_trust.py` — a `risk_retrigger` challenge
+  that trips the account-level lockout also revokes its session, mirroring
+  the existing exhaustion/expiry tests' own assertions (WebSocket
+  `session.terminated`/`risk_revoked` push, subsequent 401 on `/auth/me`).
+
+**Verification:**
+
+- Full backend suite reinstalled into a clean virtualenv and re-run from
+  scratch: **103/103 passing** — the prior 98 (section 16) plus 5 new (4 in
+  `test_mfa.py`, 1 in `test_continuous_trust.py`), with zero prior tests
+  deleted, skipped, or weakened.
+- Frontend: `npx tsc -b --noEmit` → 0 errors; `npm run build` → succeeds.
+- No Module 1-7 model, schema, or endpoint had a field removed or renamed —
+  every change here is additive (a new exception type, three new config
+  settings, two new Redis keys, one new response field, one new error
+  branch on each of two frontend files).
+
+**Conclusion:** the account-level MFA lockout flagged as a known gap at the
+end of Module 7's review (section 16) is now built, exactly as Master
+Context Section 7 specifies, additively alongside the pre-existing
+per-challenge `max_attempts` mechanism rather than replacing it, and
+integrates with Module 7's `risk_retrigger` re-verification the same
+fail-safe way an exhausted or expired challenge already did. Combined with
+17a's shorter re-verification window, Module 6/7's MFA surface is now
+strictly more zero-trust than it was at the end of section 16, with no
+regression to any prior module. Modules 1-7 remain otherwise intact. Ready
+to proceed to **Module 8 — Security Dashboard**.

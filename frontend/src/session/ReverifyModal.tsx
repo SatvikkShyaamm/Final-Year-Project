@@ -44,11 +44,13 @@ export function ReverifyModal({
         detail && typeof detail === 'object' && 'code' in detail
           ? String((detail as { code: unknown }).code)
           : null
-      if (codeErr === 'expired' || codeErr === 'exhausted') {
+      if (codeErr === 'expired' || codeErr === 'exhausted' || codeErr === 'locked') {
         setError(
           codeErr === 'expired'
             ? 'This verification request timed out — the session is being ended.'
-            : 'Too many incorrect codes — the session is being ended.',
+            : codeErr === 'exhausted'
+              ? 'Too many incorrect codes — the session is being ended.'
+              : 'Too many incorrect codes on this account — the session is being ended.',
         )
       } else {
         const left =

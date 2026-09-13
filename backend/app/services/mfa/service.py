@@ -1,7 +1,7 @@
 """
 Adaptive MFA business logic -- Module 6.
 
-Two responsibilities:
+Three responsibilities:
 
   1. DECIDE  map a trust-score risk band to allow / require-MFA / block
              (Section 6: LOW -> allow, MEDIUM -> MFA, HIGH -> block; the
@@ -9,6 +9,11 @@ Two responsibilities:
   2. CHALLENGE  create / verify email one-time-code challenges --
                 generation, delivery, expiry, retry handling,
                 success/failure handling.
+  3. LOCKOUT  an account-level, Redis-backed wrong-code streak across ANY
+              challenge (not just one challenge's own attempts/max_attempts)
+              that locks MFA verification out entirely for a cool-down
+              window -- per MASTER_PROJECT_CONTEXT.docx Section 7's original
+              spec, closed here (was previously flagged as a known gap).
 
 No FastAPI imports. Called from the /auth/login handler (the decision +
 challenge creation) and the /mfa/* endpoints (verify, step-up, admin feed).
@@ -100,6 +105,73 @@ class DeliveryFailed(MFAError):
     email_otp.send_verification_email."""
 
 
+class MFALockedOut(MFAError):
+    """The account-level wrong-code streak (mfa_lockout_threshold within
+    mfa_lockout_window_minutes, across ANY challenge) tripped the Redis
+    lockout. `retry_after_seconds` is how long is left on it."""
+
+    def __init__(self, retry_after_seconds: int) -> None:
+        super().__init__("mfa locked out")
+        self.retry_after_seconds = retry_after_seconds
+
+
+# --------------------------------------------------------------------------- #
+# Account-level lockout (Redis-backed, separate from one challenge's own
+# attempts/max_attempts on the MFAChallenge row above).
+# --------------------------------------------------------------------------- #
+def _failed_key(user_id: int) -> str:
+    return f"ztsaacm:mfa_failed:{user_id}"
+
+
+def _lockout_key(user_id: int) -> str:
+    return f"ztsaacm:mfa_lockout:{user_id}"
+
+
+def _lockout_remaining_seconds(user_id: int) -> int | None:
+    """None if not locked out; otherwise how many seconds are left. Best-effort
+    like every other Redis-backed counter here -- if Redis is unreachable this
+    fails OPEN (reports "not locked") rather than locking every user out over
+    an infrastructure blip."""
+    try:
+        ttl = get_redis().ttl(_lockout_key(user_id))
+    except redis.RedisError:
+        logger.debug("redis mfa lockout check failed for user_id=%s", user_id, exc_info=True)
+        return None
+    return ttl if ttl and ttl > 0 else None
+
+
+def _record_failed_attempt(user_id: int) -> None:
+    """Bump the wrong-code streak for this user (any challenge, any reason)
+    and, once it reaches mfa_lockout_threshold within mfa_lockout_window_minutes,
+    set the lockout key for mfa_lockout_duration_minutes. Best-effort/fail-open,
+    same policy as _lockout_remaining_seconds above."""
+    try:
+        r = get_redis()
+        key = _failed_key(user_id)
+        count = r.incr(key)
+        if count == 1:
+            r.expire(key, max(1, settings.mfa_lockout_window_minutes) * 60)
+        if count >= max(1, settings.mfa_lockout_threshold):
+            r.set(_lockout_key(user_id), "1", ex=max(1, settings.mfa_lockout_duration_minutes) * 60)
+            logger.warning(
+                "mfa account-level lockout tripped user_id=%s (%d wrong codes within %d min)",
+                user_id, count, settings.mfa_lockout_window_minutes,
+            )
+    except redis.RedisError:
+        logger.debug("redis mfa failed-attempt record failed for user_id=%s", user_id, exc_info=True)
+
+
+def _clear_failed_attempts(user_id: int) -> None:
+    """A successful verify resets the wrong-code streak (the lockout itself,
+    once tripped, still runs its full duration -- you can't verify your way
+    out of it early, since a correct code can't even be checked while locked;
+    see the lockout check at the top of verify_challenge)."""
+    try:
+        get_redis().delete(_failed_key(user_id))
+    except redis.RedisError:
+        logger.debug("redis mfa failed-attempt clear failed for user_id=%s", user_id, exc_info=True)
+
+
 # --------------------------------------------------------------------------- #
 # Challenges
 # --------------------------------------------------------------------------- #
@@ -178,7 +250,19 @@ def create_challenge(
 
 
 def verify_challenge(db: DbSession, *, challenge: MFAChallenge, code: str) -> MFAChallenge:
-    """Check one emailed code against the challenge. Raises on any non-success."""
+    """Check one emailed code against the challenge. Raises on any non-success.
+
+    Checks the account-level Redis lockout FIRST, before even looking at this
+    challenge's own status/expiry -- a locked-out user can't burn through a
+    fresh challenge's attempts either. This is deliberately separate from (and
+    checked ahead of) the per-challenge attempts/max_attempts below: the
+    lockout tracks wrong codes across every challenge for this user within a
+    rolling window, so it normally trips before any single challenge's own
+    (looser) max_attempts would."""
+    retry_after = _lockout_remaining_seconds(challenge.user_id)
+    if retry_after is not None:
+        raise MFALockedOut(retry_after_seconds=retry_after)
+
     if challenge.status != MFAChallengeStatus.PENDING:
         raise ChallengeNotPending(challenge.status)
 
@@ -194,9 +278,12 @@ def verify_challenge(db: DbSession, *, challenge: MFAChallenge, code: str) -> MF
         challenge.verified_at = now
         db.commit()
         db.refresh(challenge)
+        _clear_failed_attempts(challenge.user_id)
         logger.info("mfa challenge verified id=%s user_id=%s", challenge.id, challenge.user_id)
         _publish("mfa.challenge.verified", challenge)
         return challenge
+
+    _record_failed_attempt(challenge.user_id)
 
     challenge.attempts += 1
     if challenge.attempts >= challenge.max_attempts:

@@ -114,12 +114,25 @@ export function Login() {
         detail && typeof detail === 'object' && 'code' in detail
           ? String((detail as { code: unknown }).code)
           : null
-      if (codeErr === 'expired' || codeErr === 'exhausted') {
-        setError(
-          codeErr === 'expired'
-            ? 'That verification request timed out. Please sign in again.'
-            : 'Too many incorrect codes. Please sign in again.',
-        )
+      if (codeErr === 'expired' || codeErr === 'exhausted' || codeErr === 'locked') {
+        if (codeErr === 'locked') {
+          const retryAfter =
+            detail && typeof detail === 'object' && 'retry_after_seconds' in detail
+              ? Number((detail as { retry_after_seconds: unknown }).retry_after_seconds)
+              : null
+          const minutes = retryAfter != null ? Math.floor(retryAfter / 60) + 1 : null
+          setError(
+            `Too many incorrect codes on this account. Try again in ${
+              minutes != null ? `${minutes} minute${minutes === 1 ? '' : 's'}` : 'a few minutes'
+            }.`,
+          )
+        } else {
+          setError(
+            codeErr === 'expired'
+              ? 'That verification request timed out. Please sign in again.'
+              : 'Too many incorrect codes. Please sign in again.',
+          )
+        }
         setStep('restart')
       } else {
         const left =

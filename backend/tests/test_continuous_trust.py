@@ -200,6 +200,45 @@ def test_reverify_exhaustion_revokes_the_session(client, admin_token, user_token
     assert client.get("/api/v1/auth/me", headers=_bearer(user_token)).status_code == 401
 
 
+def test_reverify_account_lockout_also_revokes_the_session(
+    client, admin_token, user_token, db_session, monkeypatch
+):
+    """The account-level MFA lockout is a separate mechanism from a single
+    challenge's own attempts/max_attempts (isolated here with a generous
+    max_attempts so exhaustion -- covered above -- can't fire first) -- but
+    for a risk_retrigger challenge it's exactly as fail-safe: tripping it
+    means the user can no longer re-prove identity for that session either."""
+    monkeypatch.setattr(get_settings(), "mfa_max_attempts", 10)
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
+        session_id = ws.receive_json()["session_id"]
+        _force_score(db_session, session_id, 85, "LOW")
+
+        _post_event(client, admin_token, session_id, SecurityEventType.VPN_DETECTED, ip_address="185.220.100.7")
+        challenge = ws.receive_json()["challenge"]
+        wrong = f"{(int(challenge['dev_code']) + 1) % 1_000_000:06d}"
+
+        for _ in range(settings.mfa_lockout_threshold - 1):
+            r = client.post("/api/v1/mfa/verify", json={"mfa_token": challenge["mfa_token"], "code": wrong})
+            assert r.status_code == 401
+
+        r = client.post("/api/v1/mfa/verify", json={"mfa_token": challenge["mfa_token"], "code": wrong})
+        assert r.status_code == 401  # the tripping attempt itself is still just "invalid"
+
+        # Now locked -- even the real code on this still-PENDING challenge is rejected.
+        locked = client.post(
+            "/api/v1/mfa/verify", json={"mfa_token": challenge["mfa_token"], "code": challenge["dev_code"]}
+        )
+        assert locked.status_code == 429
+        assert locked.json()["detail"]["code"] == "locked"
+
+        terminated = ws.receive_json()
+        assert terminated == {"type": "session.terminated", "reason": "risk_revoked"}
+
+    body = _wait_terminated(client, session_id, admin_token)
+    assert body["termination_reason"] == "risk_revoked"
+    assert client.get("/api/v1/auth/me", headers=_bearer(user_token)).status_code == 401
+
+
 def test_reverify_expiry_revokes_the_session_via_the_sweeper(client, admin_token, user_token, db_session):
     from app.models.mfa import MFAChallenge
     from app.models.session import utcnow

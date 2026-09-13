@@ -180,6 +180,10 @@ def test_mfa_disabled_lets_medium_through(client, monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_wrong_code_decrements_then_exhausts(client, monkeypatch):
     monkeypatch.setattr(get_settings(), "mfa_max_attempts", 3)
+    # Isolated from the separate account-level lockout (also 3 by default,
+    # tested on its own below) so this test exercises only the per-challenge
+    # attempts/max_attempts path.
+    monkeypatch.setattr(get_settings(), "mfa_lockout_threshold", 999)
     _admin_token(client)
     _user_token(client)
     mfa = _login(client)["mfa"]
@@ -344,10 +348,127 @@ def test_mfa_config_endpoint(client):
     body = client.get("/api/v1/mfa/config", headers=_bearer(admin)).json()
     assert body["mfa_enabled"] is True
     assert body["max_attempts"] == settings.mfa_max_attempts
+    assert body["lockout"]["threshold"] == settings.mfa_lockout_threshold
+    assert body["lockout"]["window_minutes"] == settings.mfa_lockout_window_minutes
+    assert body["lockout"]["duration_minutes"] == settings.mfa_lockout_duration_minutes
     assert body["email"]["method"] == "email"
     assert body["email"]["otp_length"] == settings.mfa_otp_length
     assert body["email"]["smtp_configured"] is False
     assert client.get("/api/v1/mfa/config").status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# account-level lockout (Redis-backed, separate from one challenge's own
+# attempts/max_attempts above)
+# --------------------------------------------------------------------------- #
+def test_lockout_trips_before_a_single_challenges_max_attempts_by_default(client):
+    """Default config: lockout_threshold=3, max_attempts=5 -- the lockout is
+    meant to be the front-line defense, tripping well before a generous
+    per-challenge allowance runs out."""
+    _admin_token(client)
+    _user_token(client)
+    mfa = _login(client)["mfa"]
+    wrong = f"{(int(mfa['dev_code']) + 1) % 1_000_000:06d}"
+
+    for _ in range(settings.mfa_lockout_threshold - 1):
+        r = client.post("/api/v1/mfa/verify", json={"mfa_token": mfa["mfa_token"], "code": wrong})
+        assert r.status_code == 401  # still just "invalid", not locked yet
+
+    r = client.post("/api/v1/mfa/verify", json={"mfa_token": mfa["mfa_token"], "code": wrong})
+    assert r.status_code == 401  # the tripping attempt itself still reports its own "invalid"
+
+    # Now locked -- even the genuinely correct code is rejected, and the
+    # challenge itself is still PENDING with attempts to spare (3 < 5).
+    r = client.post(
+        "/api/v1/mfa/verify", json={"mfa_token": mfa["mfa_token"], "code": mfa["dev_code"]}
+    )
+    assert r.status_code == 429
+    detail = r.json()["detail"]
+    assert detail["code"] == "locked"
+    assert detail["retry_after_seconds"] > 0
+    assert int(r.headers["retry-after"]) > 0
+
+
+def test_lockout_counts_wrong_codes_across_different_challenges(client):
+    """The lockout is account-level, not per-challenge: three wrong codes on
+    THREE SEPARATE login attempts (three separate challenges) still trips it,
+    exactly like three wrong codes on one challenge would."""
+    _admin_token(client)
+    _user_token(client)
+
+    for _ in range(settings.mfa_lockout_threshold):
+        mfa = _login(client)["mfa"]
+        wrong = f"{(int(mfa['dev_code']) + 1) % 1_000_000:06d}"
+        client.post("/api/v1/mfa/verify", json={"mfa_token": mfa["mfa_token"], "code": wrong})
+
+    # A brand-new fourth challenge -- even its own genuinely correct code is
+    # rejected, because the lockout is keyed on the user, not the challenge.
+    mfa4 = _login(client)["mfa"]
+    r = client.post(
+        "/api/v1/mfa/verify", json={"mfa_token": mfa4["mfa_token"], "code": mfa4["dev_code"]}
+    )
+    assert r.status_code == 429
+    assert r.json()["detail"]["code"] == "locked"
+
+
+def test_successful_verify_resets_the_lockout_streak(client):
+    """A good code in between wrong ones resets the streak -- lockout_threshold
+    consecutive-ish failures with a success in between must not trip it."""
+    _admin_token(client)
+    _user_token(client)
+
+    mfa1 = _login(client)["mfa"]
+    wrong = f"{(int(mfa1['dev_code']) + 1) % 1_000_000:06d}"
+    for _ in range(settings.mfa_lockout_threshold - 1):
+        client.post("/api/v1/mfa/verify", json={"mfa_token": mfa1["mfa_token"], "code": wrong})
+
+    # One good code, one attempt short of tripping -- this must clear the streak.
+    good = client.post(
+        "/api/v1/mfa/verify", json={"mfa_token": mfa1["mfa_token"], "code": mfa1["dev_code"]}
+    )
+    assert good.status_code == 200
+
+    # Fresh wrong codes on a new challenge, fewer than the threshold -- still
+    # not locked, proving the earlier streak didn't carry over.
+    mfa2 = _login(client)["mfa"]
+    wrong2 = f"{(int(mfa2['dev_code']) + 1) % 1_000_000:06d}"
+    for _ in range(settings.mfa_lockout_threshold - 1):
+        r = client.post("/api/v1/mfa/verify", json={"mfa_token": mfa2["mfa_token"], "code": wrong2})
+        assert r.status_code == 401
+
+    r = client.post(
+        "/api/v1/mfa/verify", json={"mfa_token": mfa2["mfa_token"], "code": mfa2["dev_code"]}
+    )
+    assert r.status_code == 200  # not locked -- the earlier streak was cleared
+
+
+def test_lockout_is_scoped_per_user(client):
+    """Locking out one user must not affect another."""
+    _admin_token(client)
+    _user_token(client)
+
+    bob_token = _register(client, {"username": "bob", "email": "bob@example.com", "password": "bobpass123"})[
+        "access_token"
+    ]
+
+    mfa = _login(client)["mfa"]  # alice
+    wrong = f"{(int(mfa['dev_code']) + 1) % 1_000_000:06d}"
+    for _ in range(settings.mfa_lockout_threshold):
+        client.post("/api/v1/mfa/verify", json={"mfa_token": mfa["mfa_token"], "code": wrong})
+
+    # alice is locked...
+    r = client.post("/api/v1/mfa/verify", json={"mfa_token": mfa["mfa_token"], "code": mfa["dev_code"]})
+    assert r.status_code == 429
+
+    # ...but bob, a completely different user, is unaffected.
+    bob_login = client.post(
+        "/api/v1/auth/login", json={"username": "bob", "password": "bobpass123"}
+    ).json()
+    bob_mfa = bob_login["mfa"]
+    r2 = client.post(
+        "/api/v1/mfa/verify", json={"mfa_token": bob_mfa["mfa_token"], "code": bob_mfa["dev_code"]}
+    )
+    assert r2.status_code == 200
 
 
 # --------------------------------------------------------------------------- #
