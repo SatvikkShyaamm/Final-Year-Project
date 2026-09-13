@@ -41,6 +41,29 @@ class ConnectionManager:
     def session_ids(self) -> set[str]:
         return set(self._connections)
 
+    async def send(self, session_id: str, message: dict[str, Any]) -> bool:
+        """
+        Push a live message down a session's socket WITHOUT closing it.
+
+        The additive counterpart to close()'s pre-close send: Module 7 uses
+        this to notify an ACTIVE session's client that continuous
+        re-evaluation now requires a fresh emailed code
+        (`trust.reverify_required`) or that a pending one just succeeded
+        (`trust.reverified`) -- neither of those should end the session by
+        itself. Best-effort, same policy as everywhere else this codebase
+        touches an optional live channel: a momentarily-absent or
+        already-dead socket is not an error, just a no-op.
+        """
+        websocket = self._connections.get(session_id)
+        if websocket is None:
+            return False
+        try:
+            await websocket.send_json(message)
+            return True
+        except Exception:  # noqa: BLE001 - socket may already be gone
+            logger.debug("send() failed for session %s", session_id)
+            return False
+
     async def close(
         self,
         session_id: str,

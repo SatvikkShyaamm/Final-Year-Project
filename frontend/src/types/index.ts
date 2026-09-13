@@ -83,6 +83,8 @@ export interface MFAChallenge {
   risk_level: RiskLevel | null
   delivery: MFADelivery | null
   dev_code: string | null
+  /** Set for a Module 7 risk_retrigger challenge -- the session it's scoped to. */
+  session_id: string | null
 }
 
 /** POST /auth/login response — `mfa_required` is the discriminator. */
@@ -146,6 +148,9 @@ export interface Session {
   trust_score: number | null
   risk_level: RiskLevel | null
   acl_status: string | null
+  /** Module 7: "reverify_required" while a continuous re-evaluation has an
+   * open re-verification challenge pending for this session; null otherwise. */
+  current_action: string | null
 }
 
 export interface SessionListResponse {
@@ -262,4 +267,88 @@ export interface TrustScoreConfigResponse {
   known_vpn_cidrs: string[]
   known_vpn_list_is_static_sample: boolean
   generated_at: string
+}
+
+/* --------------------------------------------------------------------------
+ * Module 7 — Continuous Trust Evaluation
+ * Mirrors backend/app/schemas/security.py. Re-verification reuses the
+ * Module 6 MFAChallenge shape above (method is always email, never TOTP).
+ * ---------------------------------------------------------------------- */
+
+export type SecurityEventType =
+  | 'ip_change'
+  | 'vpn_detected'
+  | 'unknown_device'
+  | 'abnormal_request_rate'
+  | 'large_download'
+  | 'multiple_failed_logins'
+
+export type SecurityEventAction = 'none' | 'reverify' | 'revoke'
+
+/** POST /security/events body (admin today; Module 9's simulation buttons
+ * later). `ip_address` only matters for ip_change / vpn_detected. */
+export interface SecurityEventRequest {
+  session_id: string
+  event_type: SecurityEventType
+  ip_address?: string | null
+}
+
+/** What ingesting one event actually did. */
+export interface SecurityEventResult {
+  security_event_id: string
+  session_id: string
+  event_type: SecurityEventType
+  weight_applied: number
+  reason: string
+  previous_score: number
+  new_score: number
+  previous_risk: RiskLevel
+  new_risk: RiskLevel
+  action: SecurityEventAction
+  mfa_challenge_id: string | null
+}
+
+/** Read-only audit row — GET /security/events (dashboard feed). */
+export interface SecurityEventRecord {
+  id: string
+  session_id: string
+  user_id: number
+  event_type: SecurityEventType
+  weight_applied: number
+  reason: string
+  previous_score: number
+  new_score: number
+  previous_risk: RiskLevel
+  new_risk: RiskLevel
+  action: SecurityEventAction
+  created_at: string
+}
+
+export interface SecurityEventListResponse {
+  events: SecurityEventRecord[]
+  generated_at: string
+}
+
+export interface SecurityEventConfigResponse {
+  event_types: SecurityEventType[]
+  weights: Record<string, number | string>
+  actions: Record<SecurityEventAction, string>
+}
+
+/** WebSocket push (this tab's own signalling socket) when a mid-session
+ * event drops THIS session into MEDIUM risk — completing `challenge` at
+ * POST /mfa/verify is the only way to clear it. */
+export interface TrustReverifyRequiredMessage {
+  type: 'trust.reverify_required'
+  session_id: string
+  risk_level: RiskLevel
+  trust_score: number
+  challenge: MFAChallenge
+}
+
+/** WebSocket push confirming a pending re-verification was completed. Does
+ * NOT mean the trust score was restored — see docs/architecture.md. */
+export interface TrustReverifiedMessage {
+  type: 'trust.reverified'
+  session_id: string
 }

@@ -27,6 +27,11 @@ from app.models.mfa import (  # noqa: F401  (Module 6)
     MFADeliveryStatus,
     MFAMethod,
 )
+from app.models.security_event import (  # noqa: F401  (Module 7)
+    SecurityEvent,
+    SecurityEventAction,
+    SecurityEventType,
+)
 from app.models.session import (  # noqa: F401  (Module 3)
     Session,
     SessionState,
@@ -56,4 +61,7 @@ __all__ = [
     "MFADeliveryStatus",
     "MFAChallengeStatus",
     "MFAChallengeReason",
+    "SecurityEvent",
+    "SecurityEventType",
+    "SecurityEventAction",
 ]

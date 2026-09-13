@@ -23,6 +23,7 @@ from app.api.deps import CurrentAdmin, CurrentUser, get_db
 from app.core.config import get_settings
 from app.core.security import TokenError, create_access_token, create_mfa_token, decode_mfa_token
 from app.models.mfa import MFAChallengeReason
+from app.models.session import TerminationReason
 from app.schemas.auth import Token, UserRead
 from app.schemas.mfa import (
     MFAChallengeListResponse,
@@ -31,11 +32,31 @@ from app.schemas.mfa import (
     MFAVerifyRequest,
 )
 from app.services import mfa as mfa_service
+from app.services import session as session_service
 from app.services import trust_score as trust_score_service
 from app.services.auth import get_user_by_id
+from app.ws.connection_manager import manager
 
 router = APIRouter()
 settings = get_settings()
+
+
+async def _revoke_retrigger_session(db: DbSession, session_id: str) -> None:
+    """A Module 7 risk_retrigger challenge that failed, was exhausted, or
+    expired means the user could not re-prove their identity for a session
+    that had already dropped to MEDIUM risk -- zero trust says revoke, not
+    leave it running. Idempotent: terminate_session() is a no-op if the
+    session already ended for some other reason first."""
+    updated = session_service.terminate_session(
+        db, session_id, reason=TerminationReason.RISK_REVOKED
+    )
+    if updated is not None:
+        await manager.close(
+            session_id,
+            code=status.WS_1000_NORMAL_CLOSURE,
+            reason="risk_revoked",
+            message={"type": "session.terminated", "reason": TerminationReason.RISK_REVOKED},
+        )
 
 
 def _issue_access_token(user) -> Token:
@@ -53,7 +74,7 @@ def _issue_access_token(user) -> Token:
     response_model=Token,
     summary="Verify the emailed code and exchange the mfa_pending token for access",
 )
-def verify_mfa(payload: MFAVerifyRequest, db: DbSession = Depends(get_db)) -> Token:
+async def verify_mfa(payload: MFAVerifyRequest, db: DbSession = Depends(get_db)) -> Token:
     try:
         claims = decode_mfa_token(payload.mfa_token)
     except TokenError:
@@ -66,14 +87,24 @@ def verify_mfa(payload: MFAVerifyRequest, db: DbSession = Depends(get_db)) -> To
     if challenge is None or challenge.user_id != user_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Challenge not found")
 
+    # Module 7: a risk_retrigger challenge is scoped to the session that
+    # triggered it. On failure/expiry that session gets revoked, not just the
+    # challenge (see _revoke_retrigger_session above).
+    is_retrigger = challenge.reason == MFAChallengeReason.RISK_RETRIGGER
+    retrigger_session_id = challenge.session_id if is_retrigger else None
+
     try:
         mfa_service.verify_challenge(db, challenge=challenge, code=payload.code)
     except mfa_service.ChallengeExpired:
+        if retrigger_session_id:
+            await _revoke_retrigger_session(db, retrigger_session_id)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"message": "MFA challenge expired", "code": "expired"},
         )
     except mfa_service.ChallengeExhausted:
+        if retrigger_session_id:
+            await _revoke_retrigger_session(db, retrigger_session_id)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"message": "Too many attempts -- restart login", "code": "exhausted"},
@@ -91,6 +122,16 @@ def verify_mfa(payload: MFAVerifyRequest, db: DbSession = Depends(get_db)) -> To
                 "code": "invalid",
                 "attempts_remaining": exc.attempts_remaining,
             },
+        )
+
+    if retrigger_session_id:
+        # Passing re-verification proves identity again -- it does not
+        # restore the trust score the triggering event already knocked down
+        # (the underlying signal, e.g. still being on an unknown VPN, is
+        # still true). It clears the "reverify_required" banner client-side.
+        await manager.send(
+            retrigger_session_id,
+            {"type": "trust.reverified", "session_id": retrigger_session_id},
         )
 
     user = get_user_by_id(db, user_id)

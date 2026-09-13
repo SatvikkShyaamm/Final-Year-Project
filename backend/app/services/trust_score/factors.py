@@ -24,6 +24,12 @@ class Factor:
     UNKNOWN_VPN = "unknown_vpn"
     FAILED_LOGINS = "failed_login_burst"
     OFF_HOURS = "off_hours"
+    # Module 7 (Continuous Trust Evaluation) -- mid-session-only factors with
+    # no login-time equivalent. The other continuous event types (ip_change,
+    # vpn_detected, unknown_device, multiple_failed_logins) reuse the names
+    # above -- see app/services/trust_score/continuous.py.
+    ABNORMAL_REQUEST_RATE = "abnormal_request_rate"
+    LARGE_DOWNLOAD = "large_download"
 
 
 @dataclass

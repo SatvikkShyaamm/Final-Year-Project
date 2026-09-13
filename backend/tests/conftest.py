@@ -38,6 +38,28 @@ def fake_redis(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_smtp(monkeypatch):
+    """Force SMTP "not configured" for every test, regardless of what a
+    developer's real `backend/.env` has set locally.
+
+    Settings.model_config points at `.env` (see app/core/config.py), and
+    since Project status.md section 14, a real dev machine's `.env` carries a
+    genuine Gmail App Password so MFA codes actually get emailed outside
+    tests. Every MFA/auth test in this suite is written against the
+    documented, load-bearing assumption that SMTP is unconfigured in the test
+    environment (dev_logged delivery, `dev_code` echoed back) -- without this
+    override, running the suite on a machine with real credentials configured
+    makes it try to send real email (and, if those credentials are stale or
+    Google rejects them, fail with a 503 instead of the expected 200/mfa
+    payload) instead of exercising the code path the tests actually mean to
+    cover. Scoped to settings only, not `.env` itself -- no file is touched.
+    """
+    settings = get_settings()
+    monkeypatch.setattr(settings, "smtp_username", "", raising=False)
+    monkeypatch.setattr(settings, "smtp_password", "", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _acl_test_env(monkeypatch):
     """Deterministic ACL layer for tests: no background L-PEP worker (tests
     drain the queue explicitly), and a fresh enforcer selection each test."""

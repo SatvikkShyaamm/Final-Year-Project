@@ -7,11 +7,17 @@ services/trust_score/ -> Module 5: Trust Score Engine.
   evaluator.py  the Section-6 scoring algorithm (static score at session open)
   service.py    session_opened hook target + reads + config catalogue
   wiring.py     registers the session_opened hook at import
+  continuous.py Module 7: mid-session re-evaluation (event -> new score ->
+                risk-based action), composing this package with mfa/ and
+                session/ rather than a separate service package -- see
+                docs/architecture.md and continuous.py's own docstring
 
 Importing this package wires the hook, so a session opening also computes and
 stores its static trust score with no code in the session layer aware of it.
 The score is informational in Module 5 — Module 6 turns it into an
-allow / MFA / block decision.
+allow / MFA / block decision. Module 7's continuous.py is a plain submodule,
+not re-exported here, to avoid this package eagerly importing the mfa/ and
+session/ packages it composes at every import site (see continuous.py).
 """
 from app.services.trust_score.factors import (
     Factor,

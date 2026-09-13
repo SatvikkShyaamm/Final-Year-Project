@@ -110,9 +110,14 @@ def create_challenge(
     reason: str = MFAChallengeReason.LOGIN_RISK,
     trust_score: int | None = None,
     risk_level: str | None = None,
+    session_id: str | None = None,
 ) -> MFAChallenge:
     """Generate a fresh numeric code, store its salted hash, and email it to
-    the user's registered address (or dev-log it -- see email_otp.py)."""
+    the user's registered address (or dev-log it -- see email_otp.py).
+
+    `session_id` scopes a Module 7 ``risk_retrigger`` challenge to the
+    session that triggered it (null for login_risk/step_up, which have no
+    already-open session to scope to)."""
     now = utcnow()
     code = email_otp.generate_code()
     salt = email_otp.new_salt()
@@ -143,6 +148,7 @@ def create_challenge(
         max_attempts=max(1, settings.mfa_max_attempts),
         trust_score=trust_score,
         risk_level=risk_level,
+        session_id=session_id,
         created_at=now,
         expires_at=now + timedelta(minutes=max(1, settings.mfa_challenge_ttl_minutes)),
     )
@@ -230,6 +236,7 @@ def build_challenge_out(challenge: MFAChallenge, *, mfa_token: str) -> MFAChalle
         risk_level=challenge.risk_level,
         delivery=challenge.delivered_via,
         dev_code=dev_code if _dev_exposed(challenge) else None,
+        session_id=challenge.session_id,
     )
 
 
@@ -247,6 +254,30 @@ def list_recent_challenges(
     if status is not None:
         stmt = stmt.where(MFAChallenge.status == status)
     return list(db.scalars(stmt))
+
+
+def expire_overdue_challenges(db: DbSession) -> list[MFAChallenge]:
+    """Proactively flip any still-PENDING challenge past its `expires_at` to
+    EXPIRED. A login_risk/step_up challenge would be caught lazily anyway the
+    next time someone tries to verify it (see `verify_challenge` above) -- but
+    a Module 7 `risk_retrigger` challenge that nobody ever answers needs
+    someone to notice it timed out and revoke the session it was guarding
+    (fail safe, not fail open). Called from the background sweeper in
+    app.main alongside the session idle/lifetime sweep; also safe to call
+    directly (e.g. from a test)."""
+    now = utcnow()
+    stmt = select(MFAChallenge).where(
+        MFAChallenge.status == MFAChallengeStatus.PENDING,
+        MFAChallenge.expires_at < now,
+    )
+    expired = list(db.scalars(stmt))
+    for challenge in expired:
+        challenge.status = MFAChallengeStatus.EXPIRED
+        _publish("mfa.challenge.expired", challenge)
+    if expired:
+        db.commit()
+        logger.info("mfa sweeper expired %d overdue challenge(s)", len(expired))
+    return expired
 
 
 def count_by_status(db: DbSession) -> dict[str, int]:

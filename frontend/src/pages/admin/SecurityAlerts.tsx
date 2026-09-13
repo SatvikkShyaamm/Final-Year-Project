@@ -1,27 +1,38 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { listMfaChallenges } from '../../api/mfa'
+import { listSecurityEvents } from '../../api/security'
 import { RiskBadge } from '../../components/common/RiskBadge'
-import type { MFAChallengeListResponse, MFAChallengeRecord } from '../../types'
+import type {
+  MFAChallengeListResponse,
+  MFAChallengeRecord,
+  SecurityEventListResponse,
+  SecurityEventRecord,
+} from '../../types'
 
 /**
- * Module 6 makes this page real for the first time: the MFA events feed
- * (challenge triggered / verified / failed / expired), from
- * GET /api/v1/mfa/challenges. IP-change / VPN / large-download / session-revoked
- * alerts arrive with Modules 7-9 and will fold into this same feed.
+ * Module 6 made the MFA events feed real (challenge triggered / verified /
+ * failed / expired, from GET /api/v1/mfa/challenges). Module 7 adds a second
+ * feed below it: continuous re-evaluation events (IP change, VPN, unknown
+ * device, abnormal request rate, large download, multiple failed logins)
+ * from GET /api/v1/security/events, each showing the score/risk transition
+ * and the risk-based action (none / reverify / revoke) it produced.
  */
 const POLL_MS = 5000
 
 export function SecurityAlerts() {
   const [data, setData] = useState<MFAChallengeListResponse | null>(null)
+  const [events, setEvents] = useState<SecurityEventListResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     try {
-      setData(await listMfaChallenges())
+      const [mfa, security] = await Promise.all([listMfaChallenges(), listSecurityEvents()])
+      setData(mfa)
+      setEvents(security)
       setError(null)
     } catch {
-      setError('Could not load MFA events from the backend.')
+      setError('Could not load security events from the backend.')
     }
   }, [])
 
@@ -33,14 +44,15 @@ export function SecurityAlerts() {
 
   const rows = data?.challenges ?? []
   const counts = data?.counts ?? {}
+  const eventRows = events?.events ?? []
 
   return (
     <div>
       <h1 className="text-2xl font-semibold">Security Alerts</h1>
       <p className="mt-1 text-sm text-[color:var(--color-text-muted)]">
-        Adaptive MFA events (Module 6). IP change, VPN, unknown device, abnormal
-        requests, large download and session-revoked alerts join this feed with
-        Modules 7-9.
+        Adaptive MFA events (Module 6) and continuous trust-evaluation events
+        (Module 7). Module 9 adds dedicated attack-simulation buttons that feed
+        the same two backends.
       </p>
 
       {error && (
@@ -87,7 +99,82 @@ export function SecurityAlerts() {
           </tbody>
         </table>
       </div>
+
+      <h2 className="mt-8 text-lg font-semibold">Continuous trust evaluation (Module 7)</h2>
+      <p className="mt-1 text-sm text-[color:var(--color-text-muted)]">
+        Mid-session events, the score change they caused, and the resulting
+        risk-based action.
+      </p>
+      <div className="mt-4 overflow-x-auto rounded-xl border border-[color:var(--color-border)]">
+        <table className="w-full min-w-[880px] text-left text-sm">
+          <thead className="bg-[color:var(--color-surface)] text-xs uppercase tracking-wide text-[color:var(--color-text-muted)]">
+            <tr>
+              <Th>Time</Th>
+              <Th>Session</Th>
+              <Th>Event</Th>
+              <Th>Score</Th>
+              <Th>Risk</Th>
+              <Th>Action</Th>
+            </tr>
+          </thead>
+          <tbody>
+            {eventRows.length === 0 && (
+              <tr>
+                <td
+                  colSpan={6}
+                  className="px-4 py-8 text-center text-[color:var(--color-text-muted)]"
+                >
+                  No continuous evaluation events yet — trigger one from Live
+                  Sessions.
+                </td>
+              </tr>
+            )}
+            {eventRows.map((e) => (
+              <EventRow key={e.id} e={e} />
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
+  )
+}
+
+function EventRow({ e }: { e: SecurityEventRecord }) {
+  return (
+    <tr className="border-t border-[color:var(--color-border)] bg-[color:var(--color-bg)]">
+      <Td>{new Date(e.created_at + 'Z').toLocaleTimeString()}</Td>
+      <Td className="font-mono text-xs">{e.session_id.slice(0, 12)}…</Td>
+      <Td className="text-xs">{e.event_type}</Td>
+      <Td className="tabular-nums text-xs">
+        {e.previous_score} → {e.new_score}
+      </Td>
+      <Td>
+        <RiskBadge level={e.previous_risk} /> <span className="text-xs">→</span>{' '}
+        <RiskBadge level={e.new_risk} />
+      </Td>
+      <Td>
+        <ActionBadge action={e.action} />
+      </Td>
+    </tr>
+  )
+}
+
+function ActionBadge({ action }: { action: string }) {
+  const map: Record<string, string> = {
+    none: 'border-[color:var(--color-border)] text-[color:var(--color-text-muted)]',
+    reverify:
+      'border-[color:var(--color-risk-medium)]/30 bg-[color:var(--color-risk-medium)]/15 text-[color:var(--color-risk-medium)]',
+    revoke:
+      'border-[color:var(--color-risk-high)]/30 bg-[color:var(--color-risk-high)]/15 text-[color:var(--color-risk-high)]',
+  }
+  return (
+    <span
+      className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs ${
+        map[action] ?? map.none
+      }`}
+    >
+      {action}
+    </span>
   )
 }
 

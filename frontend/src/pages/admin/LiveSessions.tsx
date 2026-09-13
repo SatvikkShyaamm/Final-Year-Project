@@ -1,15 +1,31 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
+import { ingestSecurityEvent } from '../../api/security'
 import { listSessions, terminateSession } from '../../api/sessions'
 import { AclBadge } from '../../components/common/AclBadge'
 import { RiskBadge } from '../../components/common/RiskBadge'
-import type { Session } from '../../types'
+import type { SecurityEventType, Session } from '../../types'
 
 /**
  * Module 3 — real Live Session Monitoring. Polls GET /api/v1/sessions every
  * few seconds and renders whatever the backend reports. ACL column is real
- * from Module 4; Trust / Risk from Module 5.
+ * from Module 4; Trust / Risk from Module 5. The "Simulate" column is
+ * Module 7's testing/demo hook (POST /security/events) for the continuous
+ * re-evaluation flow in Section 8/14 of MASTER_PROJECT_CONTEXT.docx --
+ * Module 9 gives attackers dedicated buttons of their own later, calling
+ * this exact same endpoint.
  */
+const EVENT_TYPES: { value: SecurityEventType; label: string }[] = [
+  { value: 'ip_change', label: 'IP change' },
+  { value: 'vpn_detected', label: 'VPN detected' },
+  { value: 'unknown_device', label: 'Unknown device' },
+  { value: 'abnormal_request_rate', label: 'Abnormal request rate' },
+  { value: 'large_download', label: 'Large download' },
+  { value: 'multiple_failed_logins', label: 'Multiple failed logins' },
+]
+// A sample unrecognised-VPN/proxy IP from the default TRUST_KNOWN_VPN_CIDRS_RAW
+// sample, so "VPN detected" has a realistic classifiable source out of the box.
+const SAMPLE_UNKNOWN_VPN_IP = '185.220.100.7'
 const POLL_MS = 5000
 
 export function LiveSessions() {
@@ -18,6 +34,7 @@ export function LiveSessions() {
   const [includeTerminated, setIncludeTerminated] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
+  const [simulateEvent, setSimulateEvent] = useState<Record<string, SecurityEventType>>({})
 
   const load = useCallback(async () => {
     try {
@@ -48,6 +65,20 @@ export function LiveSessions() {
     }
   }
 
+  async function handleSimulate(id: string) {
+    const eventType = simulateEvent[id] ?? EVENT_TYPES[0].value
+    setBusyId(id)
+    try {
+      const ipAddress = eventType === 'vpn_detected' ? SAMPLE_UNKNOWN_VPN_IP : undefined
+      await ingestSecurityEvent({ session_id: id, event_type: eventType, ip_address: ipAddress })
+      await load()
+    } catch {
+      setError('Failed to ingest that security event.')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
   return (
     <div>
       <div className="flex items-end justify-between">
@@ -72,7 +103,7 @@ export function LiveSessions() {
       )}
 
       <div className="mt-6 overflow-x-auto rounded-xl border border-[color:var(--color-border)]">
-        <table className="w-full min-w-[900px] text-left text-sm">
+        <table className="w-full min-w-[1180px] text-left text-sm">
           <thead className="bg-[color:var(--color-surface)] text-xs uppercase tracking-wide text-[color:var(--color-text-muted)]">
             <tr>
               <Th>User</Th>
@@ -86,14 +117,16 @@ export function LiveSessions() {
               <Th>Trust</Th>
               <Th>Risk</Th>
               <Th>ACL</Th>
+              <Th>Action</Th>
               <Th> </Th>
+              <Th>Simulate (Module 7)</Th>
             </tr>
           </thead>
           <tbody>
             {sessions.length === 0 && (
               <tr>
                 <td
-                  colSpan={12}
+                  colSpan={14}
                   className="px-4 py-8 text-center text-[color:var(--color-text-muted)]"
                 >
                   No sessions. Log in from the user portal to open one.
@@ -133,6 +166,15 @@ export function LiveSessions() {
                   <AclBadge state={s.acl_status ?? 'none'} />
                 </Td>
                 <Td>
+                  {s.current_action === 'reverify_required' ? (
+                    <span className="rounded-full border border-[color:var(--color-risk-medium)]/30 bg-[color:var(--color-risk-medium)]/15 px-2 py-0.5 text-xs text-[color:var(--color-risk-medium)]">
+                      reverify pending
+                    </span>
+                  ) : (
+                    <span className="text-[color:var(--color-text-muted)]">—</span>
+                  )}
+                </Td>
+                <Td>
                   {s.state === 'active' && (
                     <button
                       onClick={() => handleTerminate(s.id)}
@@ -141,6 +183,35 @@ export function LiveSessions() {
                     >
                       {busyId === s.id ? '…' : 'Terminate'}
                     </button>
+                  )}
+                </Td>
+                <Td>
+                  {s.state === 'active' && (
+                    <div className="flex items-center gap-1.5">
+                      <select
+                        value={simulateEvent[s.id] ?? EVENT_TYPES[0].value}
+                        onChange={(e) =>
+                          setSimulateEvent((cur) => ({
+                            ...cur,
+                            [s.id]: e.target.value as SecurityEventType,
+                          }))
+                        }
+                        className="rounded-md border border-[color:var(--color-border)] bg-[color:var(--color-bg)] px-1.5 py-1 text-xs text-[color:var(--color-text)]"
+                      >
+                        {EVENT_TYPES.map((t) => (
+                          <option key={t.value} value={t.value}>
+                            {t.label}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        onClick={() => handleSimulate(s.id)}
+                        disabled={busyId === s.id}
+                        className="rounded-md border border-[color:var(--color-border)] px-2 py-1 text-xs hover:bg-[color:var(--color-surface-alt)] disabled:opacity-50"
+                      >
+                        {busyId === s.id ? '…' : 'Trigger'}
+                      </button>
+                    </div>
                   )}
                 </Td>
               </tr>

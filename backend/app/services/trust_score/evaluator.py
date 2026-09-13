@@ -49,6 +49,14 @@ def _in_any_cidr(ip: str, cidrs: list[str]) -> bool:
     return False
 
 
+def in_any_cidr(ip: str, cidrs: list[str]) -> bool:
+    """Public alias of ``_in_any_cidr`` -- Module 7's continuous evaluation
+    (app/services/trust_score/continuous.py) reuses this exact CIDR check to
+    classify a ``vpn_detected`` event's IP against the same approved/known-bad
+    VPN ranges Module 5 checks at login, instead of duplicating the logic."""
+    return _in_any_cidr(ip, cidrs)
+
+
 def _local_hour(login_time: datetime) -> int:
     return (login_time + timedelta(hours=settings.trust_local_utc_offset_hours)).hour
 

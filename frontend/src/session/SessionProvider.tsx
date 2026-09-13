@@ -4,8 +4,14 @@ import { getCurrentSession } from '../api/sessions'
 import { useAuth } from '../auth/useAuth'
 import { getToken } from '../auth/tokenStore'
 import { SessionSocket } from '../ws/socket'
-import type { Session, SessionSocketStatus } from '../types'
+import type {
+  MFAChallenge,
+  Session,
+  SessionSocketStatus,
+  TrustReverifyRequiredMessage,
+} from '../types'
 import { SessionContext } from './context'
+import { ReverifyModal } from './ReverifyModal'
 
 /**
  * Opens the signalling WebSocket for the whole app once the user is
@@ -33,6 +39,9 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [session, setSession] = useState<Session | null>(null)
   const [endedReason, setEndedReason] = useState<string | null>(null)
+  // Module 7: a pending continuous re-verification challenge for THIS tab's
+  // own session, pushed down its signalling socket as `trust.reverify_required`.
+  const [reverifyChallenge, setReverifyChallenge] = useState<MFAChallenge | null>(null)
   const socketRef = useRef<SessionSocket | null>(null)
 
   const refresh = useCallback(async () => {
@@ -61,10 +70,25 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         setEndedReason(reason)
         setSession(null)
         setSessionId(null)
-        // The backend already ended this session (admin / sweep / etc.) — an
-        // unexpired JWT must not silently reopen a new one behind it. Drop
-        // it client-side; ProtectedRoute takes it from here.
+        setReverifyChallenge(null)
+        // The backend already ended this session (admin / sweep / a Module 7
+        // risk-based revocation / etc.) — an unexpired JWT must not silently
+        // reopen a new one behind it. Drop it client-side; ProtectedRoute
+        // takes it from here.
         forceLogout()
+      },
+      onMessage: (message) => {
+        // Module 7: a mid-session security event dropped THIS session into
+        // MEDIUM risk (reverify_required) or a pending one just succeeded
+        // (reverified). Neither message ends the session by itself -- a
+        // failed/expired/exhausted re-verification instead arrives as the
+        // ordinary `session.terminated` push handled by onTerminated above.
+        if (message.type === 'trust.reverify_required') {
+          const push = message as unknown as TrustReverifyRequiredMessage
+          setReverifyChallenge(push.challenge)
+        } else if (message.type === 'trust.reverified') {
+          setReverifyChallenge(null)
+        }
       },
     })
     socketRef.current = socket
@@ -76,6 +100,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       setSocketStatus('idle')
       setSessionId(null)
       setSession(null)
+      setReverifyChallenge(null)
     }
   }, [status, refresh, forceLogout])
 
@@ -84,5 +109,15 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     [socketStatus, sessionId, session, endedReason, refresh],
   )
 
-  return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>
+  return (
+    <SessionContext.Provider value={value}>
+      {children}
+      {reverifyChallenge && (
+        <ReverifyModal
+          challenge={reverifyChallenge}
+          onVerified={() => setReverifyChallenge(null)}
+        />
+      )}
+    </SessionContext.Provider>
+  )
 }

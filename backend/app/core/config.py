@@ -88,6 +88,15 @@ class Settings(BaseSettings):
     trust_weight_unknown_vpn: int = 15         # - : source IP in a known public VPN/proxy CIDR
     trust_weight_failed_logins: int = 15       # - : >= threshold failed logins in the window
     trust_weight_off_hours: int = 5            # - : login 00:00-05:00, fallback when no hour history
+    # ---- Continuous Trust Evaluation (Module 7) -- mid-session event weights ----
+    # Applied by app/services/trust_score/continuous.py against the session's
+    # CURRENT score (not the baseline) when a security-relevant event is
+    # ingested via POST /security/events. ip_change / vpn_detected /
+    # unknown_device / multiple_failed_logins reuse the Module 5 weights above
+    # (the same signal, observed mid-session instead of at login); these two
+    # are new, since Module 5 has no login-time equivalent for them.
+    trust_weight_abnormal_request_rate: int = 20  # - : request rate far above the user's norm
+    trust_weight_large_download: int = 20         # - : abnormally large data transfer observed
     trust_failed_login_threshold: int = 3
     trust_failed_login_window_minutes: int = 15
     trust_typical_hour_min_sessions: int = 5   # need this many prior sessions to learn a range

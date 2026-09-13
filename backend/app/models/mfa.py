@@ -21,6 +21,12 @@ see docs/architecture.md and Project status.md section 11. The prior
 Alembic 0007.)
 
 Timestamps are naive UTC, matching sessions.py / acl.py / trust_score.py.
+
+Module 7 (Continuous Trust Evaluation) reuses this same model and lifecycle
+for mid-session re-verification: ``session_id`` (added by Alembic 0008) scopes
+a ``risk_retrigger`` challenge to the session that triggered it, so
+``app.services.trust_score.continuous`` can revoke that specific session if
+the challenge fails, expires, or is exhausted.
 """
 from __future__ import annotations
 
@@ -63,9 +69,9 @@ class MFAChallengeStatus:
 class MFAChallengeReason:
     LOGIN_RISK = "login_risk"        # risk band == MEDIUM at /auth/login
     STEP_UP = "step_up"             # explicit re-verification of an authed user
-    RISK_RETRIGGER = "risk_retrigger"  # reserved for Module 7 (continuous
-                                        # trust evaluation) -- will reuse this
-                                        # same email challenge, not TOTP.
+    RISK_RETRIGGER = "risk_retrigger"  # Module 7 (continuous trust evaluation):
+                                        # mid-session re-verification, reusing
+                                        # this same email challenge, not TOTP.
 
     ALL = (LOGIN_RISK, STEP_UP, RISK_RETRIGGER)
 
@@ -89,6 +95,15 @@ class MFAChallenge(Base):
     code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     code_salt: Mapped[str] = mapped_column(String(32), nullable=False)
     delivered_via: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    # Module 7: which session this re-verification challenge belongs to, so a
+    # failed/expired RISK_RETRIGGER challenge can revoke that specific
+    # session. Null for login_risk/step_up challenges, which aren't tied to
+    # an already-open session (login_risk precedes one; step_up doesn't need
+    # one -- see docs/architecture.md).
+    session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"), nullable=True, index=True
+    )
 
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     max_attempts: Mapped[int] = mapped_column(Integer, nullable=False)

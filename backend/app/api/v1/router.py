@@ -13,6 +13,7 @@ from app.api.v1.endpoints import (
     dashboard,
     health,
     mfa,
+    security,
     sessions,
     simulation,
     trust,
@@ -26,5 +27,6 @@ api_router.include_router(sessions.router)          # Module 3
 api_router.include_router(acl.router)               # Module 4
 api_router.include_router(trust.router)             # Module 5
 api_router.include_router(mfa.router)               # Module 6
+api_router.include_router(security.router)          # Module 7
 api_router.include_router(dashboard.router)         # Module 8
 api_router.include_router(simulation.router)        # Module 9

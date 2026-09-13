@@ -2,12 +2,15 @@
 
 ## 1. Current Status
 
-Current Module: Module 7 – Continuous Trust Evaluation (next)
+Current Module: Module 8 – Security Dashboard (next)
 Overall Project Status: Core base-paper flow complete (Modules 1-4) + static
-Trust Score (Module 5) + risk-gated Adaptive MFA at login (Module 6), plus a
+Trust Score (Module 5) + risk-gated Adaptive MFA at login (Module 6) + a
 post-Module-6 hardening pass closing the server-side token-revocation and
-cross-tab storage gaps found during live testing.
-Modules 7-10 not started.
+cross-tab storage gaps found during live testing, and now Continuous Trust
+Evaluation (Module 7): mid-session security events recompute a session's
+LIVE trust score and can re-trigger the same email MFA or revoke the
+session/ACL/token outright.
+Modules 8-10 not started.
 
 |         Module                         |              Status          |
 |----------------------------------------|------------------------------|
@@ -17,7 +20,7 @@ Modules 7-10 not started.
 | Module 4 – Dynamic ACL                 | Completed & independently verified |
 | Module 5 – Trust Score Engine          | Completed                    |
 | Module 6 – Adaptive MFA                | Completed & independently verified (MFA method revised 2026-09-10 — see section 11) |
-| Module 7 – Continuous Trust Evaluation | Not started                  |
+| Module 7 – Continuous Trust Evaluation | Completed — see section 16   |
 | Module 8 – Security Dashboard          | Not started                  |
 | Module 9 – Attack Simulation           | Not started                  |
 | Module 10 – Testing & Evaluation       | Not started                  |
@@ -34,6 +37,7 @@ Modules 7-10 not started.
 - Network access control: Redis task queue + L-PEP worker → ipset/iptables on Linux, or a simulated backend elsewhere (Module 4)
 - Trust Score: config-driven weighted-factor engine (Module 5), static score at session creation, Redis failed-login burst counter
 - Adaptive MFA: email one-time codes (Gmail SMTP, `smtplib`), risk-band gated at `POST /auth/login`, sent to every user on every MFA-required login (Module 6, method revised 2026-09-10 — see section 11; TOTP/`pyotp` removed)
+- Continuous Trust Evaluation: mid-session security events recompute a session's live trust score (Module 7); MEDIUM re-triggers the same emailed one-time code, HIGH revokes the session/ACL/token immediately
 - Other important technologies: Redis 7 (session active-set + events; ACL task queue + ref-counts + receipts + events; failed-login counter; MFA event stream; token-revocation denylist), Docker + Docker Compose
 
 ---
@@ -289,6 +293,52 @@ Implemented against Master Context Section 6 (risk bands) + Section 7/8
   band mapping, TOTP roundtrip. Migration `0005` verified against the ORM
   schema. Full backend suite: **72 passing**. `frontend` type-checks and
   builds clean.
+
+### Module 7 — Continuous Trust Evaluation (2026-09-13 — see section 16 for the full implementation/verification writeup)
+
+Implemented against Section 8 of `MASTER_PROJECT_CONTEXT.docx` ("converts the
+initial/static Trust Score into a DYNAMIC Trust Score, recalculated during an
+active session in response to security-relevant events... potentially
+re-triggering MFA or revoking the session/ACL") and Section 7's
+REVISED-2026-09-10 constraint (re-verification reuses Module 6's email
+one-time code, never TOTP).
+
+- **Composition, not a new service package** — `app/services/trust_score/continuous.py`
+  composes the existing trust_score + mfa + session services, per this
+  project's own architectural note (`docs/architecture.md`).
+- **Six event types** (`app.models.security_event.SecurityEventType`):
+  `ip_change`, `vpn_detected` (classified against Module 5's own approved/
+  known-bad VPN CIDR config), `unknown_device`, `abnormal_request_rate`,
+  `large_download` (two new config weights), `multiple_failed_logins`.
+- **Recomputes the session's CURRENT score** (not the static baseline) and
+  writes a `trust_score_factors` row (audit trail) plus a new,
+  Module-7-owned `security_events` row (the event + before/after score-risk +
+  action taken).
+- **Risk-based action**: LOW → none; MEDIUM → an emailed `risk_retrigger`
+  re-verification challenge (Module 6's mechanism, reused unchanged, scoped
+  to the session via a new `mfa_challenges.session_id` column), pushed live
+  down that session's own WebSocket; HIGH → immediate revocation
+  (`TerminationReason.RISK_REVOKED`, which was already wired into ACL removal
+  and token revocation since the Module 6 hardening pass). A failed
+  re-verification email send, an exhausted or expired re-verification, all
+  also revoke the session — fail safe, not fail open.
+- **New endpoints**: `POST /security/events` (admin; Module 9's future
+  simulation buttons will call this same endpoint), `GET /security/events`,
+  `GET /security/config` — all admin, all in `app/api/v1/endpoints/security.py`.
+- **New `ConnectionManager.send()`**: pushes a live WebSocket message
+  (`trust.reverify_required` / `trust.reverified`) without closing the
+  socket — additive alongside the existing `close()`.
+- **Frontend**: `SessionProvider` now handles those two message types and
+  renders a `ReverifyModal` (mirrors the Login MFA step) over whichever page
+  the user is on; Live Sessions gained a "Current Action" column and a
+  per-row event-simulation control; Security Alerts gained a second feed
+  table for the new `security_events`.
+- **Tests**: `backend/tests/test_continuous_trust.py` (15 tests) — full
+  none/reverify/revoke matrix, no-spam reuse of a pending challenge,
+  success/exhaustion/expiry/delivery-failure re-verification outcomes, direct
+  HIGH-crossing revocation, validation, RBAC, unit tests. Full backend suite:
+  **98 passing** (83 prior, per section 11, + 15 new). `frontend` type-checks
+  and builds clean.
 
 ---
 
@@ -1478,3 +1528,213 @@ every MFA-required login gets a genuinely emailed one-time code, with no
 visible dev/test fallback in the UI, while the backend keeps its
 dev-logging safety net for any future environment where SMTP isn't
 configured (local dev machines, CI, etc.).
+
+---
+
+## 16. Module 7 — Continuous Trust Evaluation: Implementation + Verification (2026-09-13)
+
+Before starting, re-read `MASTER_PROJECT_CONTEXT.docx` in full (Section 6
+Trust Score — unchanged; Section 7 "ADAPTIVE MFA CONCEPT — REVISED
+2026-09-10" — email-only, TOTP never reintroduced, explicitly including
+Module 7's re-verification; Section 8 — Module 7's definition; Sections 4/14
+— the end-to-end demo scenario: session established → VPN/download events
+lower the score → re-evaluation triggers an emailed code → a failed
+re-verification revokes the session, removes the ACL, and generates a
+security alert), this `Project status.md` in full, `docs/architecture.md` in
+full, and every backend file in the Module 1-6 path this module needed to
+integrate with (session hooks, the trust-score evaluator/service, the MFA
+service/model/schema/endpoint, token revocation wiring, the WebSocket
+connection manager, the session sweeper) — confirmed against the actual code,
+not just this document's prior claims.
+
+### What was built
+
+- **`app/models/security_event.py`** (new) — `SecurityEvent` (Module 7's own
+  audit table) + `SecurityEventType` (the six-event catalogue: `ip_change`,
+  `vpn_detected`, `unknown_device`, `abnormal_request_rate`,
+  `large_download`, `multiple_failed_logins`) + `SecurityEventAction`
+  (`none` / `reverify` / `revoke`).
+- **Alembic `0008_continuous_trust_evaluation`** (additive; `down_revision =
+  0007_mfa_email_otp`, the actual migration head) — creates `security_events`;
+  adds a nullable `mfa_challenges.session_id` (FK to `sessions.id`), added via
+  `op.batch_alter_table(...)` rather than a bare `create_foreign_key`, because
+  SQLite (used for this project's dry-run migration verification and its
+  whole test suite) cannot ALTER a table to add a foreign key constraint
+  in place — Postgres runs the same batch as one native ALTER, so this is
+  portable both ways without weakening the constraint on the real target
+  database.
+- **`app/services/trust_score/continuous.py`** (new) — the core of the
+  module. `classify_event()` maps an event type to a signed weight (config
+  values in `app/core/config.py`: two brand-new weights,
+  `trust_weight_abnormal_request_rate` / `trust_weight_large_download`,
+  default 20 each; the other four reuse Module 5's existing weights).
+  `record_event()` loads the session, recomputes its score against its
+  **current** value (not the static baseline — the actual "dynamic" part of
+  Section 8), persists a `trust_score_factors` row (so a session's full
+  factor history — login time + every mid-session adjustment — stays
+  queryable in one place) and a `security_events` row, decides the
+  none/reverify/revoke action from the *new* risk band, and (for reverify)
+  calls `mfa_service.create_challenge(reason=risk_retrigger, session_id=...)`
+  or (for revoke) `session_service.terminate_session(reason=RISK_REVOKED)`.
+  Deliberately a **submodule of the existing `trust_score` package**, not a
+  new service package — per this project's own architectural note in
+  `docs/architecture.md` — composing `trust_score` + `mfa` + `session`
+  instead. Stays fully sync, like every other service in this codebase; the
+  async WebSocket push/close its result calls for is left to the caller.
+- **Reused, not rebuilt, for revocation**: `TerminationReason.RISK_REVOKED`
+  and `MFAChallengeReason.RISK_RETRIGGER` were both already reserved
+  constants (`app/models/session.py`, `app/models/mfa.py`), and
+  `RISK_REVOKED` was already included in `app.services.auth.wiring`'s
+  revoke-on-reasons set since the Module 6 hardening pass (section 10) — so
+  calling `terminate_session(reason=RISK_REVOKED)` gets ACL removal (Module
+  4's `session_closed` hook) and access-token revocation (Module 2/3's hook)
+  "for free." Module 7 only added the trust-score recompute itself.
+  `app/services/mfa/service.create_challenge` gained one new optional
+  `session_id` parameter (nothing else in it changed) to scope a
+  `risk_retrigger` challenge to the session that triggered it.
+- **Re-verification failure/expiry revokes the specific session it guarded**,
+  not just the challenge: `POST /mfa/verify` now checks
+  `challenge.reason == risk_retrigger` and, on `ChallengeExhausted` or
+  `ChallengeExpired`, terminates `challenge.session_id` with `RISK_REVOKED`
+  and closes its socket, before re-raising the exact same 401/403 the login
+  MFA flow already returns (the client-facing error contract for
+  `/mfa/verify` is unchanged). On success it pushes a `trust.reverified`
+  message down that session's socket but does **not** restore the trust
+  score — re-proving identity doesn't undo the security signal that
+  triggered the challenge. This required converting `verify_mfa` from a sync
+  to an async endpoint function (it now `await`s `ConnectionManager`
+  send/close); no other behavior of that endpoint changed.
+- **An unanswered re-verification is a failed one**: `app/services/mfa/service.py`
+  gained `expire_overdue_challenges()` (flips any PENDING challenge past its
+  `expires_at` to `EXPIRED`), called every tick from the *existing* session
+  sweeper in `app/main.py` (extended, not duplicated) — for any expired
+  `risk_retrigger` challenge whose session is still active, that session is
+  revoked the same way a live failure/exhaustion would be.
+- **`ConnectionManager.send(session_id, message)`** (new, additive) — pushes
+  a live JSON message to an ACTIVE session's socket *without* closing it, the
+  counterpart to the existing `close(..., message=...)`. Used for
+  `trust.reverify_required` / `trust.reverified`.
+- **New endpoints** (`app/api/v1/endpoints/security.py`, registered in
+  `router.py` as Module 7): `POST /security/events` (admin — ingest one
+  event for a session; this is also the exact entry point Module 9's future
+  simulation buttons will call), `GET /security/events` (admin, optional
+  `session_id` filter — dashboard feed), `GET /security/config` (admin — the
+  live event/weight/action reference table, mirroring `/trust-score/config`
+  and `/mfa/config`).
+- **`SessionRead` gained a computed `current_action` field**
+  (`"reverify_required"` while a session has an open `risk_retrigger`
+  challenge, else `null`) — populated at the endpoint layer via a new batched
+  `continuous.pending_reverify_map()`, the same pattern `acl_status` used in
+  Module 4, on all three session read endpoints and the Live Sessions list.
+- **Frontend**: `frontend/src/session/ReverifyModal.tsx` (new) — mirrors
+  `Login.tsx`'s MFA step (code entry, retry/expiry handling, a dev-code
+  hint), shown as an overlay whenever `SessionProvider` receives a
+  `trust.reverify_required` push on this tab's own signalling socket
+  (previously-unused `onMessage` handler now wired up); completing it calls
+  the unchanged `POST /mfa/verify`. A `trust.reverified` push, or the session
+  ending for any reason, clears it. `frontend/src/api/security.ts` (new)
+  wraps the three endpoints above. `LiveSessions.tsx` gained a "Current
+  Action" column and a per-row event-type picker + "Trigger" button (this
+  project's demo/testing hook for `POST /security/events`, clearly labelled
+  as such, until Module 9 gives attackers dedicated buttons of their own
+  calling the same endpoint). `SecurityAlerts.tsx` gained a second feed table
+  for `GET /security/events` alongside the existing MFA-challenges one.
+  `types/index.ts` mirrors every new backend schema.
+
+### Standalone fix applied while verifying (not a Module 7 code defect)
+
+**File:** `backend/tests/conftest.py` — added an autouse `_no_real_smtp`
+fixture that force-blanks `settings.smtp_username` / `smtp_password` for
+every test.
+
+**Why:** `backend/.env` on this developer's machine has carried a real Gmail
+App Password since section 14, so real email delivery is genuinely live for
+local dev runs — correct and intended for that purpose. But `Settings`
+reads `.env` unconditionally (`app/core/config.py`), and every MFA/auth test
+in this suite (`test_mfa.py`, `test_auth.py`, and this module's new
+`test_continuous_trust.py`) is written against the documented, load-bearing
+assumption that SMTP is *unconfigured* in the test environment — dev-logged
+delivery, `dev_code` echoed back, no real network call. Running the suite
+with those real credentials loaded silently violated that assumption: 18
+tests failed on the first full run, either because a real send attempt hit a
+now-broken/expired Gmail App Password (534 `Please log in with your web
+browser`, surfaced as an unexpected HTTP 503) or, for this module's own new
+tests, because a *successful* real send meant `create_challenge` never threw
+`DeliveryFailed`, so the MEDIUM-risk assertions in `test_continuous_trust.py`
+correctly observed `action=reverify` turning into the email-failure
+`action=revoke` path once the credentials happened to be stale that day — a
+misleading, environment-dependent failure, not a Module 7 logic bug. Fixed
+by blanking those two settings for every test, restoring the suite's own
+documented hermeticity regardless of what a given developer's `.env` has
+configured for real use. No test assertion was weakened; no non-test file
+was touched; `backend/.env` itself was not touched.
+
+### Known, deliberately unfixed observation carried forward from the Module
+6 review (not a Module 7 gap)
+
+`MASTER_PROJECT_CONTEXT.docx` Section 7 also describes a Redis-backed MFA
+lockout — 3 wrong attempts within 15 minutes locks the account for 15
+minutes (`ztsaacm:mfa_lockout:{user_id}` / `ztsaacm:mfa_failed:{user_id}`),
+separate from Module 5's password-failure counter. Grepping the codebase
+(`grep -rn "mfa_lockout\|mfa_failed\b\|ztsaacm:mfa" backend/app/`) confirms
+this was never built in Module 6 — the real implementation only tracks
+`attempts`/`max_attempts` (default 5, not 3) directly on the `MFAChallenge`
+row, no separate Redis lockout layer. Flagged here for the record, per
+"report outcomes faithfully" — deliberately **not** fixed as part of Module
+7, since it is a pre-existing Module 6 gap outside this module's explicit
+scope, and touching Module 6 further would only add regression risk to a
+module that is otherwise independently verified and stable.
+
+### Verification
+
+- **Requirements checklist against Section 8 + the Section 4/14 demo
+  scenario**: continuous re-evaluation during an active session (yes —
+  `record_event` against the current score, not the baseline); the named
+  example events VPN change / IP change / abnormal download / abnormal
+  request rate (yes — all six catalogue types); re-triggering MFA (yes —
+  `reverify`, reusing Module 6's email mechanism per Section 7's REVISED
+  constraint, no TOTP anywhere in the diff); revoking the session/ACL (yes —
+  `revoke` → `RISK_REVOKED` → the existing ACL-removal and token-revocation
+  hooks); a security alert being generated (yes — the new `security_events`
+  row + its `GET /security/events` feed on the Security Alerts page);
+  dashboard updating live (yes — `current_action` on the polled session
+  list, plus the live WebSocket push for the affected user's own tab).
+- **Regression check against Modules 1-6**: every file this module touched
+  was an *addition* to an existing file (new column, new optional parameter,
+  new method, new route registration, new field with a default) except
+  `verify_mfa`'s sync→async conversion (behavior-preserving — confirmed by
+  the full pre-existing `test_mfa.py` suite still passing unmodified) and the
+  session sweeper gaining one more per-tick step (the pre-existing idle/
+  lifetime sweep logic and its own tests are untouched). No Module 1-6 model,
+  schema, or endpoint had a field removed or renamed. `git diff --stat`
+  reviewed file-by-file before considering this complete.
+- **Full backend suite**, reinstalled from the project's throwaway
+  Python-3.14-compatible virtualenv (see the `dev-env-backend-build` note),
+  re-run from scratch: **98/98 passing** — the prior 83 (section 11) plus 15
+  new in `backend/tests/test_continuous_trust.py`, with zero prior tests
+  deleted, skipped, or weakened.
+- **Migration `0008` dry-run** (`upgrade head` from a fresh DB, `downgrade
+  -1`, `upgrade head` again) against a throwaway SQLite database (Settings'
+  `database_url` property patched for the duration of the check only — no
+  file this project ships was changed to do this): both directions succeed;
+  `mfa_challenges` gains/loses exactly `session_id` (+ its index + FK);
+  `security_events` is created/dropped cleanly with all three of its
+  indexes.
+- **Frontend**: `npx tsc -b --noEmit` → 0 errors. `npm run build` → succeeds
+  (the `@rolldown/binding-linux-x64-gnu` issue flagged in the Module 4/6
+  verifications no longer reproduces on this machine — not a Module 7
+  change, noted for the record since this is the first time a from-scratch
+  build was re-attempted since then).
+
+**Conclusion:** Module 7 — Continuous Trust Evaluation is implemented per
+Section 8 and the Section 4/14 demo scenario, integrates with Modules 1-6
+through composition and existing hooks rather than new coupling, introduces
+no TOTP anywhere (per Section 7's REVISED constraint), and does not regress
+any prior module — verified by a from-scratch reinstall and full test run
+(98/98), a bidirectional migration dry-run, and a clean frontend
+type-check + production build. One pre-existing test-hermeticity gap (real
+SMTP settings leaking into the test environment from a developer's own
+`.env`) was found and fixed while verifying this module, and one pre-existing
+Module 6 spec/implementation gap (the Redis MFA lockout) was confirmed still
+open and deliberately left for a future, explicitly-scoped fix. Ready to
+proceed to **Module 8 — Security Dashboard**.

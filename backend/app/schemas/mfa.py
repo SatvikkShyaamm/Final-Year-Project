@@ -29,6 +29,7 @@ class MFAChallengeOut(BaseModel):
     risk_level: str | None = None
     delivery: str | None = None    # "sent" | "dev_logged" | "failed"
     dev_code: str | None = None    # dev/test only -- see email_otp.py
+    session_id: str | None = None  # set for Module 7 risk_retrigger challenges
 
 
 class MFAVerifyRequest(BaseModel):
@@ -52,6 +53,7 @@ class MFAChallengeStatusOut(BaseModel):
     max_attempts: int
     trust_score: int | None = None
     risk_level: str | None = None
+    session_id: str | None = None  # set for Module 7 risk_retrigger challenges
     created_at: datetime
     expires_at: datetime
     verified_at: datetime | None = None

@@ -39,6 +39,7 @@ from app.schemas.session import (
 )
 from app.services import acl as acl_service
 from app.services import session as session_service
+from app.services.trust_score import continuous as continuous_service
 from app.ws.auth import WsAuthError, resolve_ws_user
 from app.ws.connection_manager import manager
 
@@ -54,6 +55,12 @@ def _now_iso() -> str:
 def _with_acl(session_read: SessionRead, acl_state: str | None) -> SessionRead:
     """Populate the reserved acl_status field (Module 4) on a session view."""
     session_read.acl_status = acl_state or "none"
+    return session_read
+
+
+def _with_current_action(session_read: SessionRead, action: str | None) -> SessionRead:
+    """Populate the reserved current_action field (Module 7) on a session view."""
+    session_read.current_action = action
     return session_read
 
 
@@ -74,10 +81,15 @@ def list_sessions(
     ),
 ) -> SessionListResponse:
     rows = session_service.list_sessions(db, include_terminated=include_terminated)
-    acl_map = acl_service.acl_status_map(db, [row.id for row in rows])
+    session_ids = [row.id for row in rows]
+    acl_map = acl_service.acl_status_map(db, session_ids)
+    action_map = continuous_service.pending_reverify_map(db, session_ids)
     return SessionListResponse(
         sessions=[
-            _with_acl(SessionRead.model_validate(row), acl_map.get(row.id))
+            _with_current_action(
+                _with_acl(SessionRead.model_validate(row), acl_map.get(row.id)),
+                action_map.get(row.id),
+            )
             for row in rows
         ],
         active_count=session_service.count_active(db),
@@ -97,7 +109,10 @@ def get_current_session(
     if row is None:
         return None
     rule = acl_service.get_rule_for_session(db, row.id)
-    return _with_acl(SessionRead.model_validate(row), rule.state if rule else None)
+    action = continuous_service.pending_reverify_map(db, [row.id]).get(row.id)
+    return _with_current_action(
+        _with_acl(SessionRead.model_validate(row), rule.state if rule else None), action
+    )
 
 
 @router.get(
@@ -115,7 +130,10 @@ def get_session(
     if not current_user.is_admin and row.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your session")
     rule = acl_service.get_rule_for_session(db, row.id)
-    return _with_acl(SessionRead.model_validate(row), rule.state if rule else None)
+    action = continuous_service.pending_reverify_map(db, [row.id]).get(row.id)
+    return _with_current_action(
+        _with_acl(SessionRead.model_validate(row), rule.state if rule else None), action
+    )
 
 
 @router.delete(

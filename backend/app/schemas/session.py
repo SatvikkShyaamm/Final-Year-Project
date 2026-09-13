@@ -34,6 +34,11 @@ class SessionRead(BaseModel):
     trust_score: int | None = None
     risk_level: str | None = None
     acl_status: str | None = None
+    # Module 7: "reverify_required" while a continuous re-evaluation has an
+    # open (pending) risk_retrigger MFA challenge outstanding for this
+    # session; null otherwise. Computed at the endpoint layer (not a DB
+    # column), same pattern as acl_status.
+    current_action: str | None = None
 
 
 class SessionListResponse(BaseModel):

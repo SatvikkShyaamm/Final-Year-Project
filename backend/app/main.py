@@ -14,7 +14,10 @@ from app.api.v1.router import api_router
 from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.core.logging import configure_logging, get_logger
+from app.models.mfa import MFAChallengeReason
 from app.models.session import Session as SessionModel
+from app.models.session import SessionState, TerminationReason
+from app.services import mfa as mfa_service
 from app.services import session as session_service
 from app.services.acl.worker import run_worker as run_acl_worker
 from app.ws.connection_manager import manager
@@ -30,6 +33,12 @@ async def _session_sweeper() -> None:
     idle timeout, or that have exceeded the max lifetime (Module 3). The normal
     close path is the WebSocket dropping; this only catches half-open/zombie
     sockets and enforces the hard lifetime cap.
+
+    Also (Module 7): expires any still-PENDING MFA challenge past its
+    `expires_at`, and for a `risk_retrigger` one that's scoped to a still-ACTIVE
+    session, revokes that session too -- an unanswered re-verification request
+    is a failed one (fail safe, not fail open), and nothing else would ever
+    notice if the user simply never responds.
     """
     interval = max(5, settings.session_sweep_interval_seconds)
     while True:
@@ -50,6 +59,21 @@ async def _session_sweeper() -> None:
                         SessionModel.id.in_(closed)
                     )
                 } if closed else {}
+
+                expired_challenges = mfa_service.expire_overdue_challenges(db)
+                revoked: list[str] = []
+                for challenge in expired_challenges:
+                    if challenge.reason != MFAChallengeReason.RISK_RETRIGGER:
+                        continue
+                    if not challenge.session_id:
+                        continue
+                    session_row = session_service.get_session(db, challenge.session_id)
+                    if session_row is None or session_row.state != SessionState.ACTIVE:
+                        continue
+                    session_service.terminate_session(
+                        db, challenge.session_id, reason=TerminationReason.RISK_REVOKED
+                    )
+                    revoked.append(challenge.session_id)
             finally:
                 db.close()
             for session_id in closed:
@@ -59,6 +83,13 @@ async def _session_sweeper() -> None:
                     code=1000,
                     reason="session timeout",
                     message={"type": "session.terminated", "reason": reason},
+                )
+            for session_id in revoked:
+                await manager.close(
+                    session_id,
+                    code=1000,
+                    reason="risk_revoked",
+                    message={"type": "session.terminated", "reason": TerminationReason.RISK_REVOKED},
                 )
         except asyncio.CancelledError:
             raise
