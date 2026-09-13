@@ -97,6 +97,15 @@ class Settings(BaseSettings):
     # are new, since Module 5 has no login-time equivalent for them.
     trust_weight_abnormal_request_rate: int = 20  # - : request rate far above the user's norm
     trust_weight_large_download: int = 20         # - : abnormally large data transfer observed
+    # How long a mid-session re-verification challenge (reason=risk_retrigger)
+    # stays open before the sweeper treats an unanswered one as a failure and
+    # revokes the session it guards (see app.main._session_sweeper and
+    # app.services.mfa.expire_overdue_challenges). Deliberately SHORTER than
+    # mfa_challenge_ttl_minutes (the login-time window, still 5 minutes) --
+    # once a session is already active and a security event has knocked its
+    # live trust score down, zero trust puts the burden of re-proving identity
+    # on the user on a tighter clock than the initial login challenge gets.
+    mfa_retrigger_ttl_minutes: int = 3
     trust_failed_login_threshold: int = 3
     trust_failed_login_window_minutes: int = 15
     trust_typical_hour_min_sessions: int = 5   # need this many prior sessions to learn a range

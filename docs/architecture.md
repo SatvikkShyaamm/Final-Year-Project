@@ -271,8 +271,14 @@ Module 6 email mechanism, never TOTP.
 - **Risk-based action**, decided purely by the *new* risk band:
   - **LOW** → `none` — nothing beyond recording the event.
   - **MEDIUM** → `reverify` — `mfa_service.create_challenge(reason=risk_retrigger,
-    session_id=...)` (Module 6's exact email one-time-code path; TOTP is never
-    reintroduced), pushed down that session's own live WebSocket as
+    session_id=..., ttl_minutes=settings.mfa_retrigger_ttl_minutes)` (Module
+    6's exact email one-time-code path; TOTP is never reintroduced). The
+    re-verification window (`MFA_RETRIGGER_TTL_MINUTES`, default 3 minutes)
+    is deliberately shorter than the login-time window
+    (`MFA_CHALLENGE_TTL_MINUTES`, still 5) — a session that's already active
+    and just had its live trust score knocked down by a security event gets a
+    tighter clock to re-prove identity than a fresh login does. Pushed down
+    that session's own live WebSocket as
     `trust.reverify_required` (a full `MFAChallengeOut`, including a freshly
     minted `mfa_pending` token, so the client can complete it at the existing
     `POST /mfa/verify` unchanged). A re-verification already pending for that

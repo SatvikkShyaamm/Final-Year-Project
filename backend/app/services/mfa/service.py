@@ -111,22 +111,30 @@ def create_challenge(
     trust_score: int | None = None,
     risk_level: str | None = None,
     session_id: str | None = None,
+    ttl_minutes: int | None = None,
 ) -> MFAChallenge:
     """Generate a fresh numeric code, store its salted hash, and email it to
     the user's registered address (or dev-log it -- see email_otp.py).
 
     `session_id` scopes a Module 7 ``risk_retrigger`` challenge to the
     session that triggered it (null for login_risk/step_up, which have no
-    already-open session to scope to)."""
+    already-open session to scope to).
+
+    `ttl_minutes` overrides the default login-time window
+    (`settings.mfa_challenge_ttl_minutes`) -- Module 7 passes its own,
+    shorter `settings.mfa_retrigger_ttl_minutes` here for a `risk_retrigger`
+    challenge. Defaults to the login TTL when omitted, so every existing
+    caller (login, step-up) is unaffected."""
     now = utcnow()
     code = email_otp.generate_code()
     salt = email_otp.new_salt()
+    ttl = max(1, ttl_minutes if ttl_minutes is not None else settings.mfa_challenge_ttl_minutes)
 
     try:
         delivered_via = email_otp.send_verification_email(
             to_address=user.email,
             code=code,
-            expires_minutes=max(1, settings.mfa_challenge_ttl_minutes),
+            expires_minutes=ttl,
         )
     except email_otp.EmailDeliveryError as exc:
         logger.warning(
@@ -150,7 +158,7 @@ def create_challenge(
         risk_level=risk_level,
         session_id=session_id,
         created_at=now,
-        expires_at=now + timedelta(minutes=max(1, settings.mfa_challenge_ttl_minutes)),
+        expires_at=now + timedelta(minutes=ttl),
     )
     db.add(challenge)
     db.commit()

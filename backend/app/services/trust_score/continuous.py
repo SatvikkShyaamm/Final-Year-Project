@@ -273,6 +273,7 @@ def record_event(
             mfa_challenge = mfa_service.create_challenge(
                 db, user=session.user, reason=MFAChallengeReason.RISK_RETRIGGER,
                 trust_score=new_score, risk_level=new_risk, session_id=session.id,
+                ttl_minutes=settings.mfa_retrigger_ttl_minutes,
             )
         except mfa_service.DeliveryFailed:
             # Fail safe, not fail open: if the user can't be reached to
@@ -345,4 +346,5 @@ def event_catalogue() -> dict:
                 "sent) -- the session is terminated immediately (ACL removed, token revoked)"
             ),
         },
+        "reverify_ttl_minutes": s.mfa_retrigger_ttl_minutes,
     }
