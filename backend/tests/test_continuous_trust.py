@@ -6,7 +6,10 @@ trust score recomputed against its CURRENT value -> risk-based action (none /
 reverify / revoke) -> the resulting WebSocket push/close and session/ACL/
 token state. Re-verification reuses Module 6's email one-time-code mechanism
 unchanged (no TOTP -- see docs/architecture.md and Project status.md
-section 11).
+section 11). Every action pushes something down the session's own socket,
+including "none" (`trust.updated`, added 2026-09-14 -- see Project status.md
+section 20) so a client tracking the live score sees every event, not only
+the one that finally crosses a risk-band boundary.
 """
 from __future__ import annotations
 
@@ -85,9 +88,47 @@ def test_event_with_small_impact_keeps_low_risk_and_takes_no_action(client, admi
         assert body["new_risk"] == "LOW"
         assert body["mfa_challenge_id"] is None
 
+        # 2026-09-14 fix: even an in-band ("none") event still pushes a live
+        # update to the session's own socket, so a client tracking the score
+        # (User Portal) sees every step, not just the one that eventually
+        # crosses into MEDIUM/HIGH.
+        push = ws.receive_json()
+        assert push == {
+            "type": "trust.updated",
+            "session_id": session_id,
+            "risk_level": "LOW",
+            "trust_score": 85,
+        }
+
         row = client.get(f"/api/v1/sessions/{session_id}", headers=_bearer(admin_token)).json()
         assert row["trust_score"] == 85
         assert row["current_action"] is None
+
+
+def test_consecutive_in_band_events_each_push_their_own_trust_updated(
+    client, admin_token, user_token, db_session
+):
+    """The scenario that surfaced this gap: several events in a row that each
+    stay within the same risk band (100 -> 90 -> 80, all still LOW) must each
+    push their own live update -- not just the one that eventually crosses a
+    boundary."""
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
+        session_id = ws.receive_json()["session_id"]
+        _force_score(db_session, session_id, 100, "LOW")
+
+        _post_event(client, admin_token, session_id, SecurityEventType.IP_CHANGE, ip_address="9.9.9.9")
+        first = ws.receive_json()
+        assert first == {
+            "type": "trust.updated", "session_id": session_id,
+            "risk_level": "LOW", "trust_score": 90,
+        }
+
+        _post_event(client, admin_token, session_id, SecurityEventType.IP_CHANGE, ip_address="9.9.9.9")
+        second = ws.receive_json()
+        assert second == {
+            "type": "trust.updated", "session_id": session_id,
+            "risk_level": "LOW", "trust_score": 80,
+        }
 
 
 # --------------------------------------------------------------------------- #

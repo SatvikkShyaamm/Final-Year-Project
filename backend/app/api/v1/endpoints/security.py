@@ -7,7 +7,10 @@ Module 7 -- Continuous Trust Evaluation.
                               call) -- recomputes the session's trust score
                               against its CURRENT value and carries out the
                               resulting risk-based action (none / reverify /
-                              revoke).
+                              revoke). The session's own live WebSocket
+                              always gets a push either way: `trust.updated`
+                              for `none` (2026-09-14), `trust.reverify_required`
+                              for `reverify`, `session.terminated` for `revoke`.
     GET  /security/events    recent continuous-evaluation events (admin) --
                               dashboard feed, optionally filtered to one
                               session.
@@ -101,6 +104,28 @@ async def ingest_security_event(
             code=status.WS_1000_NORMAL_CLOSURE,
             reason="risk_revoked",
             message={"type": "session.terminated", "reason": "risk_revoked"},
+        )
+    else:
+        # action == NONE -- the event was recorded and the session's score
+        # WAS updated in the DB (continuous_service.record_event always
+        # persists it), it just didn't cross a risk-band boundary that
+        # warrants a challenge or a revoke. Still push it (2026-09-14 fix):
+        # without this, a session's own tab (User Portal) only ever learns
+        # its score changed on the event that finally crosses into MEDIUM/
+        # HIGH, so several quiet in-band drops (e.g. 100 -> 90 -> 80, still
+        # LOW) would be invisible there even though the admin's Live
+        # Sessions table -- which polls the DB directly -- shows every one
+        # of them immediately. This message never ends the session and
+        # never opens the reverify modal; it only keeps a live numeric
+        # display in sync.
+        await manager.send(
+            result.session_id,
+            {
+                "type": "trust.updated",
+                "session_id": result.session_id,
+                "risk_level": result.new_risk,
+                "trust_score": result.new_score,
+            },
         )
 
     return SecurityEventResultOut(

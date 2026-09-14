@@ -360,6 +360,18 @@ Module 6 email mechanism, never TOTP.
   client's prompt) but does **not** restore the trust score — the underlying
   signal (e.g. still being on an unrecognised VPN) is still true; passing MFA
   re-proves identity, it doesn't undo the event.
+- **Every action pushes something to the session's own socket, `none`
+  included (2026-09-14 fix; see `Project status.md` section 20)**: an event
+  that recomputes the score but stays inside the same risk band now pushes
+  `trust.updated` (`session_id`, `risk_level`, the new `trust_score`).
+  Before this, `record_event()` always persisted the new score to the DB —
+  which is why the admin's polling Live Sessions table always showed it
+  correctly — but the endpoint only pushed a WS message for
+  `reverify`/`revoke`, so a session's own tab (User Portal) never learned
+  about an event that stayed in-band (e.g. several small drops that never
+  cross out of LOW). This message never ends the session or opens the
+  reverify modal; it only keeps a client's own live number in sync with the
+  admin view.
 - **An unanswered re-verification is a failed one**: the existing session
   sweeper (`app.main._session_sweeper`) now also calls a new
   `mfa_service.expire_overdue_challenges()` every tick, and for any expired

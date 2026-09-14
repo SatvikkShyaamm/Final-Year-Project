@@ -2116,3 +2116,82 @@ existed to change anything mid-session; it was never revisited once Module
 Module 7's mid-session re-evaluation, matching what the admin dashboard has
 always shown. Modules 1-7 (backend) and every other frontend page are
 untouched.
+
+---
+
+## 20. Bug Fix — In-Band Score Changes Never Reached the User Portal Live (2026-09-14)
+
+Found immediately after section 19's fix, by the developer testing the
+corrected flow: triggering three IP-change events in a row (100 -> 90 -> 80
+-> 70) made the User Portal jump straight from 100 to 70 the moment the OTP
+was verified — the 90 and 80 steps were never shown, even though the admin's
+Live Sessions table showed all three correctly as they happened.
+
+### Root cause
+
+`app/services/trust_score/continuous.py`'s `record_event()` always recomputes
+*and persists* the new score/risk to the session row, on every single event,
+regardless of what action results. But `app/api/v1/endpoints/security.py`
+only pushed a WebSocket message down the affected session's own socket for
+two of the three possible outcomes:
+
+- crosses into **MEDIUM** -> `trust.reverify_required` (carries the new score)
+- crosses into **HIGH** -> `session.terminated` (closes the socket)
+- **stays in the same band** (`action == none`) -> **nothing was pushed**
+
+So 100 -> 90 and 90 -> 80 both stayed inside the LOW band (80-100): the DB
+was updated each time (which is exactly why the admin's Live Sessions table,
+which polls the DB on an interval, showed 90 then 80 as they happened), but
+neither event ever reached the user's own tab. The third event, 80 -> 70,
+was the first to cross a boundary (into MEDIUM) and was therefore the first
+(and only) WS push that tab ever received — hence the single jump straight
+from 100 to 70.
+
+This was a genuine design gap, not the same bug as section 19 (that one was
+the frontend discarding data it already had over the wire; this one is the
+backend simply never sending it for the `none` case).
+
+### Fix
+
+- **`backend/app/api/v1/endpoints/security.py`** — added an `else` branch
+  (action `== none`) that now also pushes a WebSocket message,
+  `trust.updated` (`session_id`, `risk_level`, `trust_score`), down the
+  affected session's own socket. This never ends the session and never
+  opens the reverify modal — it exists purely to keep a live numeric display
+  in sync with what the DB (and therefore the admin dashboard) already has.
+- **`frontend/src/types/index.ts`** — added `TrustUpdatedMessage`, mirroring
+  the existing `TrustReverifyRequiredMessage`/`TrustReverifiedMessage`
+  pattern.
+- **`frontend/src/session/SessionProvider.tsx`** — handles `trust.updated`
+  by merging `trust_score`/`risk_level` into the local `session` state, the
+  same way `trust.reverify_required` already does (from section 19's fix).
+- No change to `continuous.py`'s scoring logic itself, no schema/migration
+  change, no change to the `reverify`/`revoke` push paths.
+
+### Tests
+
+- `backend/tests/test_continuous_trust.py` — extended
+  `test_event_with_small_impact_keeps_low_risk_and_takes_no_action` to also
+  assert the new `trust.updated` push's exact shape; added a new test,
+  `test_consecutive_in_band_events_each_push_their_own_trust_updated`,
+  reproducing the exact reported scenario (100 -> 90 -> 80, two consecutive
+  in-band events on the same socket, each asserted to push its own
+  `trust.updated` message with the correct running score).
+
+### Verification
+
+- Full backend suite reinstalled into a clean virtualenv and re-run from
+  scratch: **113/113 passing** — the prior 112 (section 18) plus 1 new test
+  (the extended test added an assertion to an existing test rather than a
+  new test function), with zero prior tests deleted, skipped, or weakened.
+- `npx tsc -b --noEmit` → 0 errors; `npm run build` → succeeds (only the
+  pre-existing, unrelated chunk-size warning).
+- No Module 1-7 model, schema, or endpoint had a field removed or renamed —
+  this is additive: one new `else` branch in one existing endpoint, one new
+  message type, one new branch in one existing frontend handler.
+
+**Conclusion:** the User Portal's Trust score/Risk now update live for
+*every* Module 7 event, not only the one that happens to cross a risk-band
+boundary — matching the granularity the admin's Live Sessions table has
+always had. Modules 1-7 (backend) and every other frontend page are
+untouched.

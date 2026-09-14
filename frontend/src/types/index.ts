@@ -352,3 +352,15 @@ export interface TrustReverifiedMessage {
   type: 'trust.reverified'
   session_id: string
 }
+
+/** WebSocket push (this tab's own signalling socket) for a mid-session event
+ * that recomputed the score but stayed within the same risk band (action =
+ * none — no challenge, no revoke). Added 2026-09-14 so the portal's live
+ * number tracks every event the admin's Live Sessions table sees, not just
+ * the one that eventually crosses into MEDIUM/HIGH. */
+export interface TrustUpdatedMessage {
+  type: 'trust.updated'
+  session_id: string
+  risk_level: RiskLevel
+  trust_score: number
+}

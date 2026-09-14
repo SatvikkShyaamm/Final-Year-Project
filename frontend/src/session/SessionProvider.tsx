@@ -9,6 +9,7 @@ import type {
   Session,
   SessionSocketStatus,
   TrustReverifyRequiredMessage,
+  TrustUpdatedMessage,
 } from '../types'
 import { SessionContext } from './context'
 import { ReverifyModal } from './ReverifyModal'
@@ -109,6 +110,18 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         } else if (message.type === 'trust.reverified') {
           setReverifyChallenge(null)
           void refresh()
+        } else if (message.type === 'trust.updated') {
+          // 2026-09-14: a mid-session event recomputed the score but stayed
+          // within the same risk band (no challenge, no revoke) -- apply it
+          // so the portal's number tracks every step live, the same
+          // granularity the admin's Live Sessions table already has by
+          // polling the DB directly.
+          const push = message as unknown as TrustUpdatedMessage
+          setSession((prev) =>
+            prev
+              ? { ...prev, trust_score: push.trust_score, risk_level: push.risk_level }
+              : prev,
+          )
         }
       },
     })
