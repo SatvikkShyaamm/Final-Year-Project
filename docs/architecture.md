@@ -394,6 +394,16 @@ Module 6 email mechanism, never TOTP.
   as this project's demo/testing hook for `POST /security/events` until
   Module 9 gives it dedicated buttons; Security Alerts gained a second feed
   table for `GET /security/events` alongside the existing MFA-challenges one.
+  **Bug fixed 2026-09-14** (see `Project status.md` section 19): `SessionProvider`
+  originally only fetched `trust_score`/`risk_level` once, at
+  `onEstablished` — it received the live values on `trust.reverify_required`
+  but discarded everything except the `challenge` field, so User Portal's
+  own Trust/Risk display went stale the instant a Module 7 event actually
+  fired, while the admin's Live Sessions table (which polls fresh) showed
+  the correct current value. Fixed by applying `trust_score`/`risk_level`/
+  `current_action` from that push directly, and re-fetching the session on
+  `trust.reverified` (which carries no score of its own, since reverifying
+  doesn't restore it) so it and the admin view agree from then on.
 - **Follow-up note**: this Module 7 review originally flagged Master Context
   Section 7's Redis-backed MFA lockout (3 wrong attempts -> 15-minute
   lockout) as a pre-existing Module 6 gap, deliberately left untouched here

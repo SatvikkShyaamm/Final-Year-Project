@@ -83,11 +83,32 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         // (reverified). Neither message ends the session by itself -- a
         // failed/expired/exhausted re-verification instead arrives as the
         // ordinary `session.terminated` push handled by onTerminated above.
+        //
+        // Bug fix (2026-09-14): `session` state was only ever populated once,
+        // from GET /sessions/current at onEstablished -- so the portal's
+        // Trust/Risk display went stale the moment a live event recomputed
+        // the score server-side, even though this very push already carries
+        // the new value. Apply it here instead of discarding it, and
+        // re-fetch on `trust.reverified` (which carries no score of its own,
+        // since reverifying doesn't restore it -- see docs/architecture.md)
+        // so `current_action` and everything else falls back in sync with
+        // the server's authoritative row.
         if (message.type === 'trust.reverify_required') {
           const push = message as unknown as TrustReverifyRequiredMessage
           setReverifyChallenge(push.challenge)
+          setSession((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  trust_score: push.trust_score,
+                  risk_level: push.risk_level,
+                  current_action: 'reverify_required',
+                }
+              : prev,
+          )
         } else if (message.type === 'trust.reverified') {
           setReverifyChallenge(null)
+          void refresh()
         }
       },
     })

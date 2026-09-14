@@ -2038,3 +2038,81 @@ enumeration-safe check ordering, and the deliberate decision to defer an
 admin-unlock UI): additively, with no regression to any prior module or to
 Module 7's own existing behaviour. Modules 1-7 remain otherwise intact.
 Ready to proceed to **Module 8 — Security Dashboard**.
+
+---
+
+## 19. Bug Fix — User Portal's Trust Score/Risk Went Stale After a Module 7 Event (2026-09-14)
+
+Found by the developer via a direct side-by-side comparison: the admin's
+Live Sessions table showed a user's live score correctly dropped to 70
+(MEDIUM) after a mid-session event, but that same user's own User Portal
+still showed 100 (LOW) even after they completed the resulting re-verify
+challenge.
+
+### Root cause
+
+`frontend/src/session/SessionProvider.tsx` fetched `trust_score`/`risk_level`
+(via `GET /sessions/current`) exactly once, in the WebSocket's `onEstablished`
+handler right after login — and never again for the life of the tab.
+
+When Module 7 fires a mid-session event, the backend correctly recomputes
+the score and pushes `trust.reverify_required` down that session's own
+socket, and that push already carries the new `trust_score`/`risk_level`
+(`app/api/v1/endpoints/security.py`). But `SessionProvider`'s handler for
+that message only read the `challenge` field out of it to open the reverify
+modal — `trust_score`/`risk_level` were received and silently discarded, so
+the portal's copy was already stale the moment the event fired, before the
+user even reverified.
+
+Completing the reverify then pushes `trust.reverified` — which intentionally
+carries **no** score at all (`{"type": "trust.reverified", "session_id":
+...}`), since reverifying proves identity again but does not restore the
+score (the underlying signal, e.g. still being on an unrecognised network,
+is still true — this was correct, documented behaviour from Module 7 itself,
+see section 16). `SessionProvider`'s handler for that message only closed
+the modal, never re-fetching the session either.
+
+Net effect: once any Module 7 event fired, the User Portal's Trust/Risk
+display was permanently frozen at its session-creation value for that tab's
+entire lifetime, regardless of any later event or reverify — while the
+admin's Live Sessions table, which polls `GET /sessions` fresh on an
+interval, always showed the true, current value. Two independent read
+paths against the same underlying data, one of them just never updated.
+
+This was a genuine implementation gap, not a documented design decision —
+the caption under the score ("the static score from session creation") was
+accurate when it was written, right after Module 5 and before Module 7
+existed to change anything mid-session; it was never revisited once Module
+7 added live push updates the frontend should have been consuming.
+
+### Fix (frontend-only, additive, no backend/Module 1-7 logic touched)
+
+- `frontend/src/session/SessionProvider.tsx` — on `trust.reverify_required`,
+  now also merges `trust_score`, `risk_level`, and `current_action:
+  "reverify_required"` from the push into the local `session` state
+  (previously only `challenge` was read). On `trust.reverified`, now calls
+  the existing `refresh()` (re-fetches `GET /sessions/current`) instead of
+  only clearing the modal — since that push carries no score of its own,
+  re-fetching is what picks up the authoritative server row (in particular
+  `current_action` clearing back to `null`).
+- `frontend/src/pages/UserPortal.tsx` — updated the now-inaccurate caption
+  ("the static score from session creation") to describe the corrected,
+  actually-live behaviour.
+- No backend file, model, schema, or endpoint changed. No new tests needed
+  at the backend level — the backend was already computing and pushing the
+  correct values (confirmed by `test_continuous_trust.py`, unchanged, still
+  passing); this closes a client-side gap in consuming them.
+
+### Verification
+
+- `npx tsc -b --noEmit` → 0 errors.
+- `npm run build` → succeeds (only the pre-existing, unrelated chunk-size
+  warning).
+- Backend untouched by this fix — the existing 112/112 backend suite
+  (section 18) is unaffected and was not re-run for this change since no
+  backend file was modified.
+
+**Conclusion:** User Portal's Trust score/Risk now update live in step with
+Module 7's mid-session re-evaluation, matching what the admin dashboard has
+always shown. Modules 1-7 (backend) and every other frontend page are
+untouched.
