@@ -29,7 +29,13 @@ the resulting risk-based action:
                                 as revoke (fail safe, not fail open: if the
                                 user can't be reached to re-verify, a
                                 MEDIUM-risk session must not be left running
-                                unchallenged).
+                                unchallenged). A DIRECT HIGH crossing (only
+                                that -- not the reassigned email-failure
+                                case just described) additionally trips the
+                                account-level risk lockout added 2026-09-14
+                                (see app.services.trust_score.risk_lockout),
+                                blocking that account's next login(s) for an
+                                escalating cool-down.
 
 No separate service package -- per this project's own architectural note in
 docs/architecture.md ("Continuous evaluation | Composition of trust_score +
@@ -63,6 +69,7 @@ from app.models.session import SessionState, TerminationReason
 from app.models.trust_score import FactorKind, RiskLevel, TrustScoreFactor
 from app.services import mfa as mfa_service
 from app.services import session as session_service
+from app.services.trust_score import risk_lockout
 from app.services.trust_score.evaluator import in_any_cidr
 from app.services.trust_score.factors import Factor, classify_risk
 
@@ -241,6 +248,13 @@ def record_event(
     mfa_challenge: MFAChallenge | None = None
     if new_risk == RiskLevel.HIGH:
         action = SecurityEventAction.REVOKE
+        # Account-level risk lockout (2026-09-14 hardening): a direct HIGH
+        # crossing -- not a MEDIUM reverify later reassigned to revoke, see
+        # the DeliveryFailed branch below, which must NOT count -- is
+        # exactly the "offense" the lockout escalates on. Recorded here,
+        # before the DeliveryFailed reassignment further down even has a
+        # chance to run, so that path can never be mistaken for this one.
+        risk_lockout.record_risk_offense(session.user_id)
     elif new_risk == RiskLevel.MEDIUM:
         action = SecurityEventAction.REVERIFY
         mfa_challenge = has_open_retrigger_challenge(db, session.id)

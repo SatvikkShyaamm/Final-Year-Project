@@ -88,14 +88,38 @@ export function Login() {
         setStep('mfa')
       }
     } catch (err) {
-      setError(
-        authErrorMessage(
-          err,
-          mode === 'login'
-            ? 'Login failed. Check your username and password.'
-            : 'Registration failed. Try a different username or email.',
-        ),
-      )
+      const detail = axiosErrorDetail(err)
+      const codeErr =
+        detail && typeof detail === 'object' && 'code' in detail
+          ? String((detail as { code: unknown }).code)
+          : null
+      if (codeErr === 'risk_locked') {
+        // Account-level risk lockout (2026-09-14): a prior session on this
+        // account was terminated for a direct HIGH-risk crossing, and the
+        // account is now blocked from logging in at all -- on any device --
+        // for an escalating cool-down. Distinct from ordinary bad
+        // credentials, so it gets its own message rather than the generic
+        // fallback below.
+        const retryAfter =
+          detail && typeof detail === 'object' && 'retry_after_seconds' in detail
+            ? Number((detail as { retry_after_seconds: unknown }).retry_after_seconds)
+            : null
+        const hours = retryAfter != null ? Math.floor(retryAfter / 3600) + 1 : null
+        setError(
+          `This account was locked after a session was ended for high security risk. Try again in ${
+            hours != null ? `${hours} hour${hours === 1 ? '' : 's'}` : 'a few hours'
+          }.`,
+        )
+      } else {
+        setError(
+          authErrorMessage(
+            err,
+            mode === 'login'
+              ? 'Login failed. Check your username and password.'
+              : 'Registration failed. Try a different username or email.',
+          ),
+        )
+      }
     } finally {
       setSubmitting(false)
     }

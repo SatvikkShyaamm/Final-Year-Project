@@ -4,12 +4,17 @@ Authentication endpoints — Module 2, with the Module 6 risk gate on /auth/logi
     POST /auth/register  -> create account, return JWT + user (no MFA gate:
                             you just created + proved these credentials in this
                             same request; the risk gate is on *returning*)
-    POST /auth/login     -> verify credentials, then a trust-score decision:
+    POST /auth/login     -> verify credentials, then (2026-09-14) an
+                            account-level risk-lockout check, then a
+                            trust-score decision:
                             LOW   -> access token
                             MEDIUM -> `mfa_required` + an mfa_pending token to
                                       complete at POST /mfa/verify (a code
                                       emailed to the user's registered address)
                             HIGH  -> HTTP 403 (blocked by risk policy)
+                            A locked-out account gets HTTP 423 instead, once
+                            its password has already been verified -- see
+                            app.services.trust_score.risk_lockout.
     GET  /auth/me        -> current user (requires a real Bearer access token)
     POST /auth/logout    -> terminate the user's active session(s)
 """
@@ -26,6 +31,7 @@ from app.schemas.auth import LoginRequest, LoginResponse, Token, UserCreate, Use
 from app.services import mfa as mfa_service
 from app.services import session as session_service
 from app.services import trust_score as trust_score_service
+from app.services.trust_score import risk_lockout
 from app.services.auth import (
     DuplicateUserError,
     InvalidCredentialsError,
@@ -96,6 +102,30 @@ def login(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(exc),
             headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # ---- Account-level RISK lockout (2026-09-14 hardening) ----
+    # Checked ONLY here, after the password has already been verified above
+    # -- never before it -- so a wrong-password probe against a locked
+    # account still gets the ordinary generic 401 above and can't be used to
+    # learn that the account exists and is currently locked out
+    # (enumeration-safety; same principle the MFA lockout already follows).
+    # Account-wide: this blocks the login regardless of which device/
+    # User-Agent this particular attempt is coming from.
+    retry_after = risk_lockout.lockout_remaining_seconds(user.id)
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=status.HTTP_423_LOCKED,
+            detail={
+                "message": (
+                    "This account was locked after a session was terminated "
+                    f"for high security risk -- try again in "
+                    f"{retry_after // 3600 + 1} more hour(s)"
+                ),
+                "code": "risk_locked",
+                "retry_after_seconds": retry_after,
+            },
+            headers={"Retry-After": str(retry_after)},
         )
 
     # ---- Module 6: trust-score risk decision (Section 6 bands) ----

@@ -156,6 +156,38 @@ class Settings(BaseSettings):
     mfa_lockout_window_minutes: int = 15
     mfa_lockout_duration_minutes: int = 15
 
+    # ---- Account-level RISK lockout (Redis-backed, Module 7 hardening,
+    # 2026-09-14) ----
+    # Distinct from the MFA lockout above: this tracks a session getting
+    # forcibly revoked because continuous evaluation (Module 7) pushed its
+    # LIVE score straight into HIGH -- a direct HIGH crossing, i.e.
+    # TerminationReason.RISK_REVOKED with no reverify chance ever offered.
+    # Deliberately does NOT count: a HIGH-risk *login* attempt (already
+    # blocked per-attempt by its own 403), or a MEDIUM-risk reverify
+    # challenge that was failed/exhausted/MFA-locked/left to expire (that's
+    # a recoverable check the user didn't clear, not the same signal as an
+    # outright HIGH crossing) -- see app.services.trust_score.risk_lockout's
+    # module docstring for the full reasoning.
+    #
+    # Each qualifying offense blocks the ACCOUNT -- every device/User-Agent,
+    # not just the one that misbehaved -- from logging in at all, for an
+    # escalating cool-down: 1st offense -> risk_lockout_tier1_hours, 2nd ->
+    # risk_lockout_tier2_hours, 3rd and every one after that (within the
+    # same window) -> risk_lockout_tier3_hours (the cap -- it repeats, it
+    # never stops enforcing). The whole streak resets to zero once
+    # risk_lockout_window_hours have passed since the FIRST offense in it,
+    # regardless of how many escalations happened inside that window.
+    # Checked in POST /auth/login AFTER the password is verified, never
+    # before (enumeration-safety, same principle as the MFA lockout).
+    # Redis-backed (`ztsaacm:risk_offense:{id}` / `ztsaacm:risk_lockout:{id}`),
+    # best-effort/fail-open like every other auxiliary Redis mechanism here.
+    # No admin "unlock" UI yet (deliberately deferred) -- the documented
+    # fallback is clearing the Redis key by hand.
+    risk_lockout_tier1_hours: int = 1
+    risk_lockout_tier2_hours: int = 4
+    risk_lockout_tier3_hours: int = 7  # the cap -- every offense after the 2nd also gets this
+    risk_lockout_window_hours: int = 24
+
     # ---- Outbound email (Gmail SMTP) for MFA codes ----
     # smtp_username/smtp_password are the SENDING Gmail account (a Gmail App
     # Password, not the account password -- generate one at

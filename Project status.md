@@ -1893,3 +1893,148 @@ fail-safe way an exhausted or expired challenge already did. Combined with
 strictly more zero-trust than it was at the end of section 16, with no
 regression to any prior module. Modules 1-7 remain otherwise intact. Ready
 to proceed to **Module 8 — Security Dashboard**.
+
+
+---
+
+## 18. Post-Module-7 Hardening — Account-Level Risk Lockout (2026-09-14)
+
+### Gap found
+
+While independently testing Module 7 via the admin panel's "Simulate"
+control (section 16/17's own verification work), the developer intentionally
+changed IP several times in a row against their own active (admin) session,
+driving its live trust score below 50 (HIGH) and correctly getting it
+revoked (`TerminationReason.RISK_REVOKED` — Module 7 working exactly as
+designed). The developer then immediately logged back in as the same
+account with no restriction at all.
+
+Root cause: `POST /auth/login`'s risk decision (`evaluate_login()`) is
+computed fresh from that attempt's own signals every time — it has no
+memory of a prior session having been forcibly revoked for risk. The
+`security_events` table (Module 7) is a pure audit log; nothing read it back
+at login time. So a `RISK_REVOKED` termination had zero effect on the
+account's ability to log back in right after. This is distinct from, and
+has no interaction with, the account-level MFA lockout (section 17b) — that
+one counts wrong MFA codes, not risk-based session revocations.
+
+The design was worked out over an extended discussion before any code was
+written, deliberately scoping what does and doesn't count as an offense,
+the escalation shape, the reset window, and the enumeration-safety ordering
+— see the full back-and-forth (including rejected/refined readings of each
+point) preserved in this project's `claude/module-7-account-risk-lockout-plan.md`
+doc. This section is the as-implemented, verified record; that doc is now
+superseded by it.
+
+### What was built
+
+- **Trigger, deliberately narrow**: only a session revoked because
+  continuous evaluation pushed its *live* score straight into HIGH (a direct
+  crossing, no reverify chance ever offered). Explicitly excludes a
+  HIGH-risk *login* attempt's own 403 (already blocked per-attempt) and a
+  MEDIUM-risk reverify challenge that was failed, exhausted, MFA-locked, or
+  left to expire, or that failed to even send — all of those also end in
+  the same `RISK_REVOKED` reason, but the underlying risk was only MEDIUM
+  and the session only ended because a recoverable follow-up check wasn't
+  cleared, which is not the same signal as an outright HIGH crossing.
+- **`backend/app/services/trust_score/risk_lockout.py`** (new) — two Redis
+  keys per user, best-effort/fail-open like every other auxiliary Redis
+  mechanism in this codebase: `ztsaacm:risk_offense:{user_id}` (a counter,
+  TTL = `RISK_LOCKOUT_WINDOW_HOURS`, set once at the first offense and never
+  renewed by later increments — so the 24h window stays anchored to that
+  first offense, not the most recent one, exactly as agreed) and
+  `ztsaacm:risk_lockout:{user_id}` (the active lockout, TTL = the current
+  tier's duration).
+- **Escalating, capped, account-wide**: 1st qualifying offense →
+  `RISK_LOCKOUT_TIER1_HOURS` (default 1h), 2nd → `TIER2_HOURS` (4h), 3rd and
+  every one after that within the same window → `TIER3_HOURS` (7h — the
+  cap; it repeats, it never stops enforcing past the 3rd). Account-wide,
+  keyed on `user_id` only — not device/IP/User-Agent — so a risky session
+  on one device locks the account out everywhere, per the developer's
+  explicit decision.
+- **`app/services/trust_score/continuous.py`** — `record_event()` calls
+  `risk_lockout.record_risk_offense(session.user_id)` from *inside* the
+  `new_risk == RiskLevel.HIGH` branch only, before the later
+  `DeliveryFailed`-reassigns-a-MEDIUM-reverify-to-revoke branch even runs —
+  structurally guaranteeing the two cases can never be confused, rather than
+  trying to filter one out after the fact.
+- **`app/api/v1/endpoints/auth.py`** — `POST /auth/login` checks
+  `risk_lockout.lockout_remaining_seconds(user.id)` immediately after
+  `authenticate_user` succeeds, deliberately *after* the password is
+  verified and before any trust-score evaluation or MFA challenge creation.
+  Ordering matters: a wrong password against a locked account still gets
+  the ordinary generic 401 and never reveals the account exists and is
+  locked (enumeration-safety — the same principle the Module 6 MFA lockout
+  already follows). Returns HTTP 423 with a `Retry-After` header and
+  `{"message": ..., "code": "risk_locked", "retry_after_seconds": N}` when
+  locked — a distinct status code from the MFA lockout's 429 so the two are
+  never confused in logs or on the client.
+- **`app/core/config.py`** — `risk_lockout_tier1_hours` / `_tier2_hours` /
+  `_tier3_hours` / `_window_hours`, all env-overridable.
+- **`.env.example`** (root and `backend/`) — `RISK_LOCKOUT_TIER1_HOURS=1`,
+  `RISK_LOCKOUT_TIER2_HOURS=4`, `RISK_LOCKOUT_TIER3_HOURS=7`,
+  `RISK_LOCKOUT_WINDOW_HOURS=24`, in the Module 7 section.
+- **`docs/architecture.md`** — new "Account-level risk lockout hardening
+  (Module 7, 2026-09-14)" section; the Module 7 HIGH→revoke bullet now
+  cross-references it.
+- **Frontend**: `Login.tsx`'s credentials-step catch branches on
+  `code === "risk_locked"` and shows a dedicated "locked... try again in N
+  hour(s)" message, alongside its existing generic-failure handling. No
+  other frontend file needed a change (this never reaches the MFA step —
+  it's rejected at the credentials step itself).
+- **No migration** — purely Redis-backed like the MFA lockout, no new
+  column or table, no Alembic revision needed.
+- **Admin recovery — deliberately deferred, by explicit developer decision**:
+  no "locked accounts" UI in this pass. The documented fallback if an
+  account (including the only admin account, which is exactly the scenario
+  that surfaced this whole gap) gets stuck is clearing the Redis keys by
+  hand: `redis-cli DEL ztsaacm:risk_lockout:<user_id>
+  ztsaacm:risk_offense:<user_id>`. Flagged as a natural fit for Module 8
+  (Security Dashboard) once it exists, not forgotten.
+
+### Tests
+
+- `backend/tests/test_risk_lockout.py` (new, unit-level, against the fake
+  Redis client directly — no HTTP/DB needed): tier escalation
+  1st→2nd→3rd; the cap-and-repeat behaviour on a 4th+ offense (never stops
+  enforcing, never grows past tier 3); the window resetting once it elapses
+  (simulated by directly expiring the underlying counter key, the same
+  technique used elsewhere in this suite for time-based Redis behaviour,
+  rather than waiting a real 24 hours); scoped per-user; fails open on a
+  simulated Redis outage without raising.
+- `backend/tests/test_continuous_trust.py` (integration, extended) — a
+  direct HIGH crossing both revokes the session *and* returns 423 with the
+  correct `Retry-After`/`retry_after_seconds`/`code` shape on the very next
+  login attempt; a MEDIUM-risk reverify that was exhausted, or that failed
+  to even send (`DeliveryFailed`), does **not** trip it — confirmed by a
+  fresh login succeeding (or at least never coming back 423) right after
+  each; a wrong password against a locked account still gets a plain 401,
+  never a hint the account is locked; the lockout blocks a login attempt
+  carrying a completely different `User-Agent` (account-wide, not
+  device-scoped); a second, unrelated account is unaffected.
+
+### Verification
+
+- Full backend suite reinstalled into a clean virtualenv and re-run from
+  scratch: **112/112 passing** — the prior 103 (section 17) plus 9 new (5 in
+  `test_risk_lockout.py`, 4 in `test_continuous_trust.py`), with zero prior
+  tests deleted, skipped, or weakened; every extended pre-existing test
+  (the direct-HIGH-crossing test, the reverify-exhaustion test, the
+  reverify-email-failure test) still passes its original assertions
+  unchanged, with only new assertions appended.
+- No Module 1-7 model, schema, or endpoint had a field removed or renamed —
+  every change here is additive (a new module, three new config settings +
+  one existing pattern reused for a fourth, one new call site inside an
+  existing branch, one new error branch in one existing endpoint, one new
+  error branch in one existing frontend catch block).
+- Frontend: `npx tsc -b --noEmit` → 0 errors; `npm run build` → succeeds.
+
+**Conclusion:** the gap surfaced by testing Module 7 live — a session
+correctly revoked for a direct HIGH-risk crossing had zero effect on the
+account's ability to log straight back in — is now closed, exactly to the
+scope the developer specified after working through the edge cases (which
+revocations count, the escalation shape, the reset window anchor, the
+enumeration-safe check ordering, and the deliberate decision to defer an
+admin-unlock UI): additively, with no regression to any prior module or to
+Module 7's own existing behaviour. Modules 1-7 remain otherwise intact.
+Ready to proceed to **Module 8 — Security Dashboard**.

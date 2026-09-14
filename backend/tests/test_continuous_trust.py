@@ -199,6 +199,14 @@ def test_reverify_exhaustion_revokes_the_session(client, admin_token, user_token
     # server-side token revocation follows for free via app.services.auth.wiring
     assert client.get("/api/v1/auth/me", headers=_bearer(user_token)).status_code == 401
 
+    # 2026-09-14 hardening: a MEDIUM-risk reverify that was exhausted is NOT
+    # a direct HIGH crossing, so it must NOT trip the account-level risk
+    # lockout -- the user can still log back in normally afterward.
+    fresh = client.post(
+        "/api/v1/auth/login", json={"username": USER["username"], "password": USER["password"]}
+    )
+    assert fresh.status_code == 200
+
 
 def test_reverify_account_lockout_also_revokes_the_session(
     client, admin_token, user_token, db_session, monkeypatch
@@ -303,6 +311,18 @@ def test_reverify_email_failure_revokes_instead_of_leaving_it_unchallenged(
         terminated = ws.receive_json()
         assert terminated == {"type": "session.terminated", "reason": "risk_revoked"}
 
+    # 2026-09-14 hardening: this revoke was a MEDIUM-risk reverify that
+    # failed to even SEND (DeliveryFailed), reassigned to "revoke" -- NOT a
+    # direct HIGH crossing. It must not trip the account-level risk lockout
+    # either. (Not asserting == 200 here: SMTP is still monkeypatched
+    # broken for the rest of this test, so a fresh MEDIUM-risk decision
+    # would itself hit the same fake delivery failure and 503 -- the point
+    # of this assertion is only that it is never 423/"risk_locked".)
+    fresh = client.post(
+        "/api/v1/auth/login", json={"username": USER["username"], "password": USER["password"]}
+    )
+    assert fresh.status_code != 423
+
 
 # --------------------------------------------------------------------------- #
 # action: revoke (direct HIGH crossing)
@@ -327,6 +347,83 @@ def test_event_crossing_into_high_revokes_session_immediately(client, admin_toke
     assert row["termination_reason"] == "risk_revoked"
     assert row["acl_status"] in ("removed", "removing")
     assert client.get("/api/v1/auth/me", headers=_bearer(user_token)).status_code == 401
+
+    # 2026-09-14 hardening: a direct HIGH crossing also trips the
+    # account-level risk lockout -- the account can't log back in at all
+    # right after this, on any device. Full coverage of this mechanism
+    # (retry-after shape, enumeration-safety, cross-device scope, per-user
+    # scope) lives in the dedicated tests just below.
+    locked = client.post(
+        "/api/v1/auth/login", json={"username": USER["username"], "password": USER["password"]}
+    )
+    assert locked.status_code == 423
+    assert locked.json()["detail"]["code"] == "risk_locked"
+
+
+# --------------------------------------------------------------------------- #
+# account-level risk lockout (2026-09-14 hardening)
+# --------------------------------------------------------------------------- #
+def _drive_session_into_high(client, admin_token, user_token, db_session) -> str:
+    """Open a session and push it straight into HIGH via one event -- the
+    shared setup for the risk-lockout tests below."""
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
+        session_id = ws.receive_json()["session_id"]
+        _force_score(db_session, session_id, 60, "MEDIUM")
+        _post_event(client, admin_token, session_id, SecurityEventType.ABNORMAL_REQUEST_RATE)
+        ws.receive_json()  # session.terminated
+    return session_id
+
+
+def test_risk_locked_login_returns_423_with_retry_after(client, admin_token, user_token, db_session):
+    _drive_session_into_high(client, admin_token, user_token, db_session)
+
+    resp = client.post(
+        "/api/v1/auth/login", json={"username": USER["username"], "password": USER["password"]}
+    )
+    assert resp.status_code == 423
+    body = resp.json()["detail"]
+    assert body["code"] == "risk_locked"
+    assert body["retry_after_seconds"] > 0
+    assert int(resp.headers["Retry-After"]) == body["retry_after_seconds"]
+
+
+def test_risk_lockout_does_not_leak_through_a_wrong_password(client, admin_token, user_token, db_session):
+    """Enumeration-safety: the lockout must only ever be revealed AFTER the
+    password has already been verified. A wrong password against a locked
+    account gets the same generic 401 as any other wrong password -- never
+    a hint that the account exists and is locked."""
+    _drive_session_into_high(client, admin_token, user_token, db_session)
+
+    resp = client.post(
+        "/api/v1/auth/login", json={"username": USER["username"], "password": "definitely-wrong"}
+    )
+    assert resp.status_code == 401
+    assert resp.json()["detail"] != "risk_locked"
+
+
+def test_risk_lockout_blocks_every_device_not_just_the_one_that_misbehaved(
+    client, admin_token, user_token, db_session
+):
+    """Account-wide, per the 2026-09-14 design decision -- a risky session on
+    one device locks the account out everywhere, keyed on user_id, not on
+    User-Agent."""
+    _drive_session_into_high(client, admin_token, user_token, db_session)
+
+    resp = client.post(
+        "/api/v1/auth/login",
+        json={"username": USER["username"], "password": USER["password"]},
+        headers={"User-Agent": "SomeCompletelyDifferentBrowser/9.0"},
+    )
+    assert resp.status_code == 423
+
+
+def test_risk_lockout_is_scoped_per_user(client, admin_token, user_token, db_session):
+    """Locking one account must never lock a different one out."""
+    _drive_session_into_high(client, admin_token, user_token, db_session)
+
+    _register(client, {"username": "bob", "email": "bob@example.com", "password": "bobpass123"})
+    resp = client.post("/api/v1/auth/login", json={"username": "bob", "password": "bobpass123"})
+    assert resp.status_code == 200
 
 
 # --------------------------------------------------------------------------- #
