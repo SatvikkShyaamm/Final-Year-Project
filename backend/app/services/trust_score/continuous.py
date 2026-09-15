@@ -52,6 +52,16 @@ Re-verification reuses Module 6's email one-time-code mechanism
 unchanged (``app.services.mfa.create_challenge``) -- per
 MASTER_PROJECT_CONTEXT.docx Section 7 ("REVISED 2026-09-10") and
 Project status.md section 11, TOTP is not reintroduced here or anywhere else.
+
+Section 18 hardening (2026-09-15, "Real Passive Network Detection"): until
+now the only thing that ever called ``record_event`` was an admin manually
+posting to /security/events. ``app.services.trust_score.heartbeat`` is a new,
+second caller -- a periodic authenticated heartbeat from the session's own
+owner -- that calls this exact same function, unchanged, when it observes a
+genuine mid-session IP/User-Agent change or an abnormal request rate. The
+only new thing either caller must supply is ``source`` (audit-trail only,
+see ``record_event``'s docstring) -- nothing about scoring, MFA
+re-triggering, or revocation logic changed for this hardening pass.
 """
 from __future__ import annotations
 
@@ -64,7 +74,12 @@ from sqlalchemy.orm import Session as DbSession
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.models.mfa import MFAChallenge, MFAChallengeReason, MFAChallengeStatus
-from app.models.security_event import SecurityEvent, SecurityEventAction, SecurityEventType
+from app.models.security_event import (
+    SecurityEvent,
+    SecurityEventAction,
+    SecurityEventSource,
+    SecurityEventType,
+)
 from app.models.session import SessionState, TerminationReason
 from app.models.trust_score import FactorKind, RiskLevel, TrustScoreFactor
 from app.services import mfa as mfa_service
@@ -102,6 +117,7 @@ class ContinuousEvalResult:
     new_risk: str
     action: str
     security_event_id: str
+    source: str  # "auto" (heartbeat detector) or "admin" (POST /security/events)
     mfa_challenge: MFAChallenge | None = None  # set when action == "reverify"
 
     @property
@@ -196,13 +212,26 @@ def pending_reverify_map(db: DbSession, session_ids: list[str]) -> dict[str, str
 
 
 def record_event(
-    db: DbSession, *, session_id: str, event_type: str, ip_address: str | None = None
+    db: DbSession,
+    *,
+    session_id: str,
+    event_type: str,
+    ip_address: str | None = None,
+    source: str = SecurityEventSource.ADMIN,
 ) -> ContinuousEvalResult:
     """
     Ingest one security-relevant event for an ACTIVE session: recompute its
     trust score against its CURRENT value (not the static baseline -- this is
     the dynamic score Section 8 describes), persist the audit trail, and
     carry out the resulting risk-based action.
+
+    `source` is purely an audit-trail tag (Section 18, 2026-09-15) --
+    SecurityEventSource.ADMIN for the manual POST /security/events path
+    (the default, matching this function's pre-2026-09-15 behaviour),
+    SecurityEventSource.AUTO for the automatic heartbeat detector
+    (app.services.trust_score.heartbeat). It changes nothing about the
+    scoring, MFA re-triggering, or revocation logic below -- both paths call
+    this exact function, unchanged, per Section 18's own design.
 
     Raises SessionNotFound / SessionNotActive if there is nothing left to
     re-evaluate (an unknown, or already-terminated, session).
@@ -271,6 +300,7 @@ def record_event(
         previous_risk=previous_risk,
         new_risk=new_risk,
         action=action,
+        source=source,
     )
     db.add(event)
     db.commit()
@@ -316,6 +346,7 @@ def record_event(
         new_risk=new_risk,
         action=action,
         security_event_id=event.id,
+        source=source,
         mfa_challenge=mfa_challenge,
     )
 
@@ -324,11 +355,20 @@ def record_event(
 # Reads (dashboard feed)
 # --------------------------------------------------------------------------- #
 def list_recent_events(
-    db: DbSession, *, session_id: str | None = None, limit: int = 100
+    db: DbSession,
+    *,
+    session_id: str | None = None,
+    source: str | None = None,
+    limit: int = 100,
 ) -> list[SecurityEvent]:
     stmt = select(SecurityEvent).order_by(SecurityEvent.created_at.desc()).limit(limit)
     if session_id is not None:
         stmt = stmt.where(SecurityEvent.session_id == session_id)
+    if source is not None:
+        # Section 18 (2026-09-15): auto | admin -- filtered in SQL, before the
+        # limit is applied, so this returns up to `limit` MATCHING rows
+        # rather than filtering a limited, unfiltered page down further.
+        stmt = stmt.where(SecurityEvent.source == source)
     return list(db.scalars(stmt))
 
 
@@ -361,4 +401,20 @@ def event_catalogue() -> dict:
             ),
         },
         "reverify_ttl_minutes": s.mfa_retrigger_ttl_minutes,
+        # Section 18 (2026-09-15): the automatic heartbeat detector's own
+        # timing, for the dashboard's reference view -- mirrors this
+        # function's existing "live config, not hardcoded docs" purpose.
+        "heartbeat": {
+            "interval_seconds": s.heartbeat_interval_seconds,
+        },
+        # abnormal_request_rate counting (redesigned 2026-09-15, same day as
+        # the initial implementation): split out of "heartbeat" above
+        # because it is no longer heartbeat-specific -- every non-GET
+        # authenticated call anywhere in the app counts now, not just calls
+        # to the heartbeat endpoint. See app.services.trust_score.
+        # request_rate for the mechanism.
+        "request_rate": {
+            "window_seconds": s.request_rate_window_seconds,
+            "threshold": s.request_rate_threshold,
+        },
     }

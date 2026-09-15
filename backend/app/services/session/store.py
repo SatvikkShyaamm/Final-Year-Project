@@ -94,6 +94,33 @@ def active_session_ids() -> set[str]:
         return set()
 
 
+def active_session_ids_for_user(user_id: int) -> set[str]:
+    """The subset of active_session_ids() belonging to one user -- reads the
+    same per-user index register_active/deregister_active already maintain
+    (_user_key), so this adds no new Redis state. Added 2026-09-15 for the
+    Module 7 Section 18 request-rate redesign (app.services.trust_score.
+    request_rate), which needs a cheap "which session does this
+    authenticated call belong to" lookup from inside a dependency used by
+    nearly every endpoint -- reusing this existing index instead of a new
+    cache."""
+    try:
+        return set(get_redis().smembers(_user_key(user_id)))
+    except redis.RedisError:
+        logger.warning("redis active_session_ids_for_user failed for user %s", user_id, exc_info=True)
+        return set()
+
+
+def active_session_id_for_user(user_id: int) -> str | None:
+    """One of the user's active session ids, or None if they have none on
+    record. The common case is exactly one; on the rare multi-session case
+    (multi-tab/multi-device) this picks an arbitrary member, which is
+    acceptable for its one caller's purpose (best-effort passive request-
+    rate attribution, not an authorization decision -- see
+    app.services.trust_score.request_rate)."""
+    ids = active_session_ids_for_user(user_id)
+    return next(iter(ids), None)
+
+
 def publish_event(event_type: str, payload: dict[str, Any]) -> None:
     """Fire-and-forget session event for the Module 8 dashboard to subscribe to."""
     message = {

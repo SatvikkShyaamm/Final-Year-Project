@@ -188,6 +188,57 @@ class Settings(BaseSettings):
     risk_lockout_tier3_hours: int = 7  # the cap -- every offense after the 2nd also gets this
     risk_lockout_window_hours: int = 24
 
+    # ---- Real Passive Network Detection (Module 7 hardening -- Section 18 of
+    # MASTER_PROJECT_CONTEXT.docx, FINALIZED 2026-09-14, implemented
+    # 2026-09-15) ----
+    # Everything above this point in Module 7 only ever *reacts* to an event
+    # that already exists -- until now the only thing that ever created one
+    # was an admin manually calling POST /security/events. This section is
+    # what actually detects real mid-session network/device change from a
+    # genuine user's own traffic and feeds it into that same, unchanged
+    # pipeline. See app.services.trust_score.heartbeat for the mechanism.
+    #
+    # Deliberately a SECOND, INDEPENDENT channel from the WebSocket's own
+    # ping (session_ws_heartbeat_seconds above): the session IS the WS
+    # connection (Module 3) -- its real IP/User-Agent are read exactly once,
+    # at that socket's handshake, and cannot change again on that same
+    # connection without the connection itself dropping. A plain HTTP
+    # request, by contrast, carries the browser's real, current IP/UA every
+    # single time it's made -- so the frontend polls a small authenticated
+    # endpoint on its own timer while a session is open. Env-configurable,
+    # not hardcoded, per this project's standing convention for every timing
+    # value (matches session_ws_heartbeat_seconds's own default of 20s).
+    heartbeat_interval_seconds: int = 20
+    # Pure safety-net TTL on the per-session "last observed" IP/UA state
+    # (Redis-backed -- see app.services.trust_score.heartbeat). The
+    # AUTHORITATIVE clear happens the instant the session actually ends,
+    # via the same session_closed hook Module 4's ACL layer already uses
+    # (app.services.acl.wiring) -- this TTL only guards against that hook
+    # somehow not firing (a crash, a missed close). The request-rate
+    # counter below (app.services.trust_score.request_rate) is a separate,
+    # fixed-window key with its own TTL (request_rate_window_seconds) --
+    # not governed by this setting -- but is cleared by that same
+    # session_closed hook too.
+    heartbeat_state_ttl_seconds: int = 3600
+    # abnormal_request_rate (redesigned 2026-09-15, same day as the initial
+    # heartbeat-only implementation): a rolling, fixed-window Redis counter
+    # (same INCR + EXPIRE-if-new pattern as the Module 5 failed-login burst
+    # counter -- app.services.trust_score.store), incremented once per
+    # non-GET/HEAD/OPTIONS authenticated REST call anywhere in the app --
+    # via app.api.deps.get_current_user -- and attributed to the caller's
+    # own current session (app.services.trust_score.request_rate). Crossing
+    # request_rate_threshold such calls within request_rate_window_seconds
+    # fires the event exactly once per crossing (not on every call past
+    # it). This is Option A of the two options Section 18 left open
+    # (instrument every authenticated call, not just the heartbeat
+    # endpoint) with reads excluded, so an admin's own dashboard polling
+    # never counts against their own session -- see request_rate.py's own
+    # docstring for the full reasoning. Default threshold is well above the
+    # steady-state rate normal use of the dashboard would ever produce, so
+    # normal use never trips it.
+    request_rate_window_seconds: int = 60
+    request_rate_threshold: int = 20
+
     # ---- Outbound email (Gmail SMTP) for MFA codes ----
     # smtp_username/smtp_password are the SENDING Gmail account (a Gmail App
     # Password, not the account password -- generate one at

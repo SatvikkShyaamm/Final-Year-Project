@@ -512,3 +512,133 @@ prior session having been forcibly revoked for risk.
   carrying a completely different `User-Agent`; and a second, unrelated
   account is unaffected. Full suite: **112 passing** (103 prior, per
   section 17, + 9 new). `frontend` type-checks and builds clean.
+
+## Real Passive Network Detection (Module 7 hardening, Section 18, 2026-09-15)
+
+Closes the one gap the rest of Module 7 above leaves open: through section
+20, the *only* thing that ever created a mid-session security event was an
+admin manually calling `POST /security/events` (the Live Sessions "Trigger"
+control). Nothing passively watched a real user's own session and noticed,
+on its own, a genuine IP/device change, a VPN, or an abnormal request rate.
+See `Project status.md` section 21 for the full implementation write-up;
+this is the architectural summary. **`abnormal_request_rate`'s counting
+mechanism was redesigned the same day — see the dedicated bullet below and
+`Project status.md` section 22 for the full write-up.**
+
+- **Second, independent HTTP channel, not the WebSocket**: the session *is*
+  the WS connection (Module 3) — its real IP/User-Agent are read exactly
+  once, at handshake, and cannot change again on that connection without
+  dropping it. So the frontend (`SessionProvider.tsx`) runs a small periodic
+  authenticated call, `POST /security/heartbeat` (any authenticated user, no
+  body — resolves the caller's own current session server-side), separate
+  from the WS's own ping (`session_ws_heartbeat_seconds`). Every such HTTP
+  request naturally carries the browser's real, current IP/UA.
+- **Where the logic lives**: `backend/app/services/trust_score/heartbeat.py`
+  (new) — compares each heartbeat's real IP/UA against a per-session
+  **"last observed"** value in Redis (`heartbeat:last:{id}`, same
+  fail-open convention as `store.py`/`risk_lockout.py`), **never** the
+  immutable login-time baseline. The session's first heartbeat silently
+  seeds this state and fires nothing; every later one fires the matching
+  event on a genuine difference — `vpn_detected` (reusing Module 5's
+  `evaluator.in_any_cidr` unchanged) instead of a plain `ip_change` when
+  the new IP lands in either VPN CIDR list, `unknown_device` on a UA
+  change, both if both changed (stopping early if one of them revokes the
+  session first).
+- **`abnormal_request_rate` counting (redesigned 2026-09-15, same day as
+  the rest of this section)**: lives in its own module,
+  `backend/app/services/trust_score/request_rate.py`, not in
+  `heartbeat.py`. Section 18 left the counting *strategy* an explicit open
+  choice between two options — **Option A**, a dependency incrementing a
+  Redis counter on every authenticated call anywhere in the app, versus
+  **Option B**, counting only heartbeat calls specifically (what this
+  section originally shipped with). The design was switched to **Option A
+  plus a read-exclusion refinement**: every `POST`/`PUT`/`PATCH`/`DELETE`
+  authenticated call, from *any* endpoint, counts — via a single call to
+  `request_rate.record_authenticated_call()` added to
+  `app.api.deps.get_current_user`, the one dependency nearly every
+  protected endpoint already uses — while `GET`/`HEAD`/`OPTIONS` calls
+  never count at all, so an admin's own dashboard polling can never ding
+  their own session. Each call is attributed to the caller's own current
+  session by reusing `app.services.session.store`'s existing per-user
+  Redis index (`ztsaacm:user:{user_id}:sessions`, already populated by
+  `register_active`/`deregister_active`) via two new read accessors —
+  **no new Redis state, no session-layer change**. The counter itself
+  (`ztsaacm:reqrate:{id}`) is the same fixed-window `INCR`+`EXPIRE`-if-new
+  pattern as before; a second flag key (`ztsaacm:reqrate:fired:{id}`)
+  makes "fire exactly once per window" work now that counting happens from
+  many call sites instead of one atomic check. `heartbeat.py`'s own role
+  shrank to asking `request_rate.check_and_mark_fired(session_id)` at the
+  end of each heartbeat and firing the event through the unchanged
+  `continuous.record_event()` pipeline on `True` — numerically identical
+  behavior to before for a pure heartbeat-only workload, since a heartbeat
+  call is itself a qualifying `POST`. See `Project status.md` section 22
+  for the full before/after reasoning.
+- **Calls the identical, unmodified `continuous.record_event()`** every
+  manual Trigger already used — Section 18's central constraint. The only
+  addition either caller now passes is `source` (`SecurityEventSource.AUTO`
+  from the heartbeat, `.ADMIN` from `POST /security/events`) — a new
+  `security_events.source` column (Alembic `0009`, `server_default='admin'`,
+  historically correct backfill), surfaced via a new `GET
+  /security/events?source=auto|admin` filter and a `heartbeat` block on
+  `GET /security/config`, so the audit trail can show which alerts were
+  real detections versus manual demo clicks.
+- **Push behavior is shared, not duplicated**: the WebSocket push/close
+  logic that used to live inline in `ingest_security_event` was extracted
+  into `_push_result()` and is now called by both the manual and the
+  automatic path, so a real detection looks, live, identical to a manual
+  admin Trigger from the affected session's own tab.
+- **Redis state lifetime mirrors the ACL ref-count pattern**: `trust_score/
+  wiring.py` (already registering Module 5's `session_opened` hook) now also
+  registers an `on_session_closed` hook — imported lazily inside the hook
+  closure to avoid pulling `continuous.py`'s `mfa`/`session` imports into
+  `trust_score`'s own package `__init__` execution — that clears the
+  heartbeat "last observed" key AND (via `heartbeat.clear_session_state`
+  delegating to `request_rate.clear_session_state`) the request-rate
+  counter and its fired-flag, the instant a session actually ends, for
+  every termination path. A generous TTL remains only as a safety net.
+- **Config**: `heartbeat_interval_seconds` (default 20, mirrors
+  `session_ws_heartbeat_seconds`), `heartbeat_state_ttl_seconds`,
+  `request_rate_window_seconds`, `request_rate_threshold` (renamed from
+  `heartbeat_rate_window_seconds`/`heartbeat_rate_threshold` in the
+  2026-09-15 redesign, since this is no longer heartbeat-specific) — all
+  env-configurable, plus the frontend's own `VITE_HEARTBEAT_INTERVAL_SECONDS`.
+- **Frontend**: `api/security.ts` gained `sendHeartbeat()`; `SessionProvider`
+  gained a second effect that starts/stops a `setInterval` on
+  `sessionId`, swallowing failures (a missed heartbeat is not itself
+  suspicious — the existing WS ping / idle sweep already cover a genuinely
+  dead connection). Any resulting push arrives on the session's existing
+  socket via the handlers already built for the manual path.
+- **Known, accepted limitations** (stated plainly, not hidden): a
+  client-supplied IP is only trustworthy behind a trusted reverse proxy
+  (pre-existing, shared with the section-16 login-time check); real IP
+  changes aren't always malicious (mobile handoffs, NAT); a backgrounded tab
+  throttles JS timers, so detection latency can exceed ~20s; VPN detection
+  is bounded by the same static CIDR sample Section 6 already documents; a
+  single-machine dev setup has no real second network to observe end to
+  end (needs a live deployment or forged `X-Forwarded-For`, per Section 18).
+- **Tests**: `backend/tests/test_heartbeat_detection.py` (20 tests as of
+  the 2026-09-15 request-rate redesign, 17 from the original
+  implementation) — silent first-heartbeat seeding; a repeated unchanged
+  heartbeat firing nothing; `ip_change` with `source=auto`; VPN-CIDR
+  priority over a plain `ip_change` (both known-bad and approved);
+  `unknown_device`; an IP+UA change together firing both events in order;
+  a revoke stopping further events in the same heartbeat; the request-rate
+  counter tripping via a tight loop at exactly the threshold and not
+  re-firing past it; **a non-heartbeat endpoint (repeated `DELETE`s
+  against a nonexistent session) also counting toward the caller's own
+  session, proving cross-endpoint attribution**; **`GET` calls never
+  counting at all, even in a burst that would otherwise cross the
+  threshold**; **the per-user active-session Redis index actually
+  containing the session id, independent of request-rate behavior**; a
+  no-active-session heartbeat as a harmless no-op; RBAC/auth; a heartbeat
+  only ever touching the caller's own session; the Redis state's
+  session-scoped lifetime (now `ztsaacm:reqrate:{id}` /
+  `ztsaacm:reqrate:fired:{id}` in place of the old
+  `ztsaacm:heartbeat:rate:{id}`); the `GET /security/events` source
+  filter; the `GET /security/config` heartbeat/request_rate reference
+  blocks. Full suite: **133 passing** (130 prior, per this section's
+  original 17-test delivery, + 3 new for the redesign). Migration `0009`
+  dry-run (upgrade/downgrade/round-trip against throwaway SQLite) clean in
+  both directions — the redesign itself needs no migration (Redis/config
+  only, no schema change). `frontend` type-checks (`tsc -b --noEmit`) and
+  lints clean.

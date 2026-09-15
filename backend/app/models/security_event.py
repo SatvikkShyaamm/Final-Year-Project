@@ -69,6 +69,18 @@ class SecurityEventAction:
     ALL = (NONE, REVERIFY, REVOKE)
 
 
+class SecurityEventSource:
+    """Who/what raised this event -- Module 7 hardening, Section 18
+    (2026-09-15). Surfaced on the audit trail (GET /security/events) so the
+    feed can demonstrate, honestly, which events were real passive
+    detections versus manual admin demo/test clicks."""
+
+    AUTO = "auto"    # raised automatically by the heartbeat detector (Section 18)
+    ADMIN = "admin"  # raised manually via POST /security/events (the "Trigger" control)
+
+    ALL = (AUTO, ADMIN)
+
+
 class SecurityEvent(Base):
     __tablename__ = "security_events"
 
@@ -91,6 +103,14 @@ class SecurityEvent(Base):
     previous_risk: Mapped[str] = mapped_column(String(16), nullable=False)
     new_risk: Mapped[str] = mapped_column(String(16), nullable=False)
     action: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Section 18 (2026-09-15): "auto" (the heartbeat detector) or "admin"
+    # (POST /security/events). Every event ingested before this column
+    # existed was, by construction, admin-raised -- see the migration's
+    # server_default.
+    source: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=SecurityEventSource.ADMIN,
+        server_default=SecurityEventSource.ADMIN,
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), nullable=False, default=utcnow,
@@ -102,5 +122,6 @@ class SecurityEvent(Base):
     def __repr__(self) -> str:  # pragma: no cover
         return (
             f"<SecurityEvent session={self.session_id} type={self.event_type} "
-            f"{self.previous_score}->{self.new_score} action={self.action}>"
+            f"{self.previous_score}->{self.new_score} action={self.action} "
+            f"source={self.source}>"
         )

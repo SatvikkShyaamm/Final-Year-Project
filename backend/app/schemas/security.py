@@ -34,6 +34,7 @@ class SecurityEventResultOut(BaseModel):
     previous_risk: str
     new_risk: str
     action: str                          # none | reverify | revoke
+    source: str                          # auto | admin -- Section 18 (2026-09-15)
     mfa_challenge_id: str | None = None  # set when action == reverify
 
 
@@ -53,9 +54,24 @@ class SecurityEventReadOut(BaseModel):
     previous_risk: str
     new_risk: str
     action: str
+    source: str  # auto | admin -- Section 18 (2026-09-15)
     created_at: datetime
 
 
 class SecurityEventListResponse(BaseModel):
     events: list[SecurityEventReadOut]
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class HeartbeatResultOut(BaseModel):
+    """POST /security/heartbeat response -- Module 7 hardening, Section 18
+    (2026-09-15). Best-effort/informational: the frontend fires this on a
+    timer and doesn't need to act on the response itself (any resulting
+    trust.updated / trust.reverify_required / session.terminated push
+    arrives on the session's own signalling WebSocket, exactly as it would
+    for a manual admin Trigger)."""
+
+    session_id: str | None  # null if the caller has no active session right now
+    seeded: bool            # True on this session's first-ever heartbeat (nothing fired)
+    events: list[str] = []  # event_type(s) fired by this one heartbeat, in order
+    session_terminated: bool = False

@@ -9,9 +9,10 @@ and never re-implements token parsing.
 """
 from __future__ import annotations
 
+from contextlib import suppress
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
@@ -20,6 +21,7 @@ from app.core.security import TokenError, decode_access_token
 from app.models.user import User
 from app.services.auth import get_user_by_id
 from app.services.auth.revocation import is_token_revoked
+from app.services.trust_score import request_rate
 
 # tokenUrl is the login endpoint's path relative to the server root; it only
 # affects Swagger's "Authorize" dialog, not runtime behaviour.
@@ -33,6 +35,7 @@ _CREDENTIALS_EXC = HTTPException(
 
 
 def get_current_user(
+    request: Request,
     token: Annotated[str | None, Depends(oauth2_scheme)],
     db: Annotated[Session, Depends(get_db)],
 ) -> User:
@@ -45,6 +48,16 @@ def get_current_user(
     revoked (its owning session was terminated — see
     app.services.auth.revocation), so a copy of a dead session's token can't
     keep authenticating REST calls after that session has ended.
+
+    2026-09-15 (Module 7 Section 18 request-rate redesign): also feeds the
+    request-rate detector (app.services.trust_score.request_rate) — every
+    non-GET/HEAD/OPTIONS authenticated call, from ANY endpoint, counts
+    towards the caller's own session's abnormal_request_rate window. This
+    is deliberately the single choke point nearly every protected endpoint
+    already passes through, so no per-endpoint instrumentation is needed.
+    Wrapped in `suppress(Exception)` on top of that module's own fail-open
+    guarantees, as an extra safety net: this dependency runs on almost
+    every request in the app and must never be the reason a request fails.
     """
     if not token:
         raise _CREDENTIALS_EXC
@@ -61,6 +74,10 @@ def get_current_user(
     user = get_user_by_id(db, user_id)
     if user is None or not user.is_active:
         raise _CREDENTIALS_EXC
+
+    with suppress(Exception):
+        request_rate.record_authenticated_call(user.id, request.method)
+
     return user
 
 

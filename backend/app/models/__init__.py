@@ -30,6 +30,7 @@ from app.models.mfa import (  # noqa: F401  (Module 6)
 from app.models.security_event import (  # noqa: F401  (Module 7)
     SecurityEvent,
     SecurityEventAction,
+    SecurityEventSource,
     SecurityEventType,
 )
 from app.models.session import (  # noqa: F401  (Module 3)
@@ -64,4 +65,5 @@ __all__ = [
     "SecurityEvent",
     "SecurityEventType",
     "SecurityEventAction",
+    "SecurityEventSource",
 ]

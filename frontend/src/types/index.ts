@@ -285,6 +285,10 @@ export type SecurityEventType =
 
 export type SecurityEventAction = 'none' | 'reverify' | 'revoke'
 
+/** Who/what raised an event — Module 7 hardening, Section 18 (2026-09-15).
+ * `auto` = the passive heartbeat detector; `admin` = a manual Trigger. */
+export type SecurityEventSource = 'auto' | 'admin'
+
 /** POST /security/events body (admin today; Module 9's simulation buttons
  * later). `ip_address` only matters for ip_change / vpn_detected. */
 export interface SecurityEventRequest {
@@ -305,6 +309,7 @@ export interface SecurityEventResult {
   previous_risk: RiskLevel
   new_risk: RiskLevel
   action: SecurityEventAction
+  source: SecurityEventSource
   mfa_challenge_id: string | null
 }
 
@@ -321,6 +326,7 @@ export interface SecurityEventRecord {
   previous_risk: RiskLevel
   new_risk: RiskLevel
   action: SecurityEventAction
+  source: SecurityEventSource
   created_at: string
 }
 
@@ -333,6 +339,35 @@ export interface SecurityEventConfigResponse {
   event_types: SecurityEventType[]
   weights: Record<string, number | string>
   actions: Record<SecurityEventAction, string>
+  /** Section 18 (2026-09-15) — the automatic heartbeat detector's own live
+   * timing, for the dashboard's reference view. */
+  heartbeat?: {
+    interval_seconds: number
+  }
+  /** abnormal_request_rate counting (redesigned 2026-09-15, same day as the
+   * initial implementation) — split out of `heartbeat` above because it is
+   * no longer heartbeat-specific: every non-GET authenticated call anywhere
+   * in the app counts now, not just calls to the heartbeat endpoint. */
+  request_rate?: {
+    window_seconds: number
+    threshold: number
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * Module 7 hardening — Section 18: Real Passive Network Detection
+ * (2026-09-15). Mirrors backend/app/schemas/security.py's HeartbeatResultOut.
+ * ---------------------------------------------------------------------- */
+
+/** POST /security/heartbeat response. Best-effort/informational — any
+ * resulting trust.updated / trust.reverify_required / session.terminated
+ * push arrives separately on the session's own signalling WebSocket, so the
+ * frontend fires this on a timer and doesn't need to act on the response. */
+export interface HeartbeatResult {
+  session_id: string | null
+  seeded: boolean
+  events: SecurityEventType[]
+  session_terminated: boolean
 }
 
 /** WebSocket push (this tab's own signalling socket) when a mid-session

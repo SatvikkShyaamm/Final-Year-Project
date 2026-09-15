@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { getCurrentSession } from '../api/sessions'
+import { sendHeartbeat } from '../api/security'
 import { useAuth } from '../auth/useAuth'
 import { getToken } from '../auth/tokenStore'
 import { SessionSocket } from '../ws/socket'
@@ -32,6 +33,16 @@ import { ReverifyModal } from './ReverifyModal'
  * unaffected: the tab is torn down by the browser before any message can
  * arrive, so the valid JWT correctly opens a fresh session on reload, per
  * docs/architecture.md.
+ *
+ * Also runs the Module 7 Section 18 heartbeat (2026-09-15): a small
+ * periodic authenticated HTTP call, separate from the WebSocket's own ping,
+ * while a session is open — see app/services/trust_score/heartbeat.py for
+ * why this can't just be done over the WS connection itself (its real IP/
+ * User-Agent are fixed at handshake). Any resulting trust.updated /
+ * trust.reverify_required / session.terminated arrives back on the existing
+ * socket via the onMessage/onTerminated handlers below, exactly as it would
+ * for a manual admin Trigger — the heartbeat call's own response is
+ * best-effort and otherwise ignored here.
  */
 export function SessionProvider({ children }: { children: ReactNode }) {
   const { status, forceLogout } = useAuth()
@@ -137,6 +148,31 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       setReverifyChallenge(null)
     }
   }, [status, refresh, forceLogout])
+
+  // Module 7 Section 18 (2026-09-15) — the passive-detection heartbeat.
+  // Only runs once a session is actually established, and stops the moment
+  // it ends (sessionId -> null re-runs this effect's cleanup). A missed or
+  // failed heartbeat is not itself suspicious (Section 18's own documented
+  // assumption) — the existing WS ping / idle-timeout sweep already cover a
+  // genuinely dead connection, so failures here are swallowed, not retried
+  // or surfaced to the user.
+  useEffect(() => {
+    if (!sessionId) return
+
+    const configuredSeconds = Number(import.meta.env.VITE_HEARTBEAT_INTERVAL_SECONDS)
+    const intervalMs =
+      Number.isFinite(configuredSeconds) && configuredSeconds > 0
+        ? configuredSeconds * 1000
+        : 20_000
+
+    const id = window.setInterval(() => {
+      void sendHeartbeat().catch(() => {
+        // best-effort — see the effect comment above
+      })
+    }, intervalMs)
+
+    return () => window.clearInterval(id)
+  }, [sessionId])
 
   const value = useMemo(
     () => ({ socketStatus, sessionId, session, endedReason, refresh }),
