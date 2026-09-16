@@ -35,7 +35,15 @@ the resulting risk-based action:
                                 account-level risk lockout added 2026-09-14
                                 (see app.services.trust_score.risk_lockout),
                                 blocking that account's next login(s) for an
-                                escalating cool-down.
+                                escalating cool-down, AND (2026-09-16
+                                hardening) cascades: every OTHER currently
+                                active session on that same account is also
+                                terminated immediately (TerminationReason.
+                                ACCOUNT_LOCKED), not just the one that
+                                crossed into HIGH -- an account the system
+                                has just locked out of logging back in
+                                shouldn't still have a live window open
+                                somewhere else.
 
 No separate service package -- per this project's own architectural note in
 docs/architecture.md ("Continuous evaluation | Composition of trust_score +
@@ -275,6 +283,7 @@ def record_event(
 
     action = SecurityEventAction.NONE
     mfa_challenge: MFAChallenge | None = None
+    direct_high_crossing = False
     if new_risk == RiskLevel.HIGH:
         action = SecurityEventAction.REVOKE
         # Account-level risk lockout (2026-09-14 hardening): a direct HIGH
@@ -284,6 +293,7 @@ def record_event(
         # before the DeliveryFailed reassignment further down even has a
         # chance to run, so that path can never be mistaken for this one.
         risk_lockout.record_risk_offense(session.user_id)
+        direct_high_crossing = True
     elif new_risk == RiskLevel.MEDIUM:
         action = SecurityEventAction.REVERIFY
         mfa_challenge = has_open_retrigger_challenge(db, session.id)
@@ -333,6 +343,26 @@ def record_event(
 
     if action == SecurityEventAction.REVOKE:
         session_service.terminate_session(db, session.id, reason=TerminationReason.RISK_REVOKED)
+        # 2026-09-16 hardening: a direct HIGH crossing doesn't just end THIS
+        # session -- it also just locked the whole account out of logging
+        # back in (risk_lockout.record_risk_offense above). Leaving that
+        # account's OTHER already-open sessions running would defeat the
+        # point: an account the system has decided is too risky to let back
+        # in shouldn't still have a live window open somewhere else. Called
+        # AFTER this session's own terminate_session (not before): by the
+        # time terminate_user_sessions below runs its own "still ACTIVE"
+        # query, this session already flipped to TERMINATED with reason
+        # RISK_REVOKED, so it's naturally excluded and keeps that reason --
+        # terminate_session is idempotent and would otherwise have kept
+        # whichever reason got there first. The DeliveryFailed-reassigned
+        # revoke below (a MEDIUM reverify that couldn't even be emailed) is
+        # NOT a direct crossing and correctly never sets
+        # direct_high_crossing, so it never cascades either -- same scoping
+        # risk_lockout.record_risk_offense already uses.
+        if direct_high_crossing:
+            session_service.terminate_user_sessions(
+                db, session.user_id, reason=TerminationReason.ACCOUNT_LOCKED
+            )
 
     return ContinuousEvalResult(
         session_id=session.id,
@@ -397,7 +427,10 @@ def event_catalogue() -> dict:
             ),
             "revoke": (
                 "risk crosses into HIGH (or the re-verification email could not be "
-                "sent) -- the session is terminated immediately (ACL removed, token revoked)"
+                "sent) -- the session is terminated immediately (ACL removed, token "
+                "revoked); a DIRECT HIGH crossing also locks the account out of "
+                "future logins and immediately terminates every other active "
+                "session on that same account"
             ),
         },
         "reverify_ttl_minutes": s.mfa_retrigger_ttl_minutes,

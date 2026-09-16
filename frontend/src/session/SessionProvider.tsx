@@ -22,7 +22,9 @@ import { ReverifyModal } from './ReverifyModal'
  * details. No-ops while unauthenticated.
  *
  * A server-driven end (session.terminated — admin terminate, idle/lifetime
- * sweep, and later a Module 7 risk-based revocation) means "this session's
+ * sweep, a Module 7 risk-based revocation, or — 2026-09-16 — this account
+ * being cascade-locked-out because a DIFFERENT one of its own sessions had
+ * a direct HIGH crossing) means "this session's
  * network access is over," but the JWT is still technically valid: without
  * this, the client would sit on the same page with a dead socket, and a
  * refresh would silently open a brand-new session with the same token. That

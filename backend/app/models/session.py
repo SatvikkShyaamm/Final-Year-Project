@@ -46,6 +46,12 @@ class TerminationReason:
     IDLE_TIMEOUT = "idle_timeout"
     MAX_LIFETIME = "max_lifetime"
     RISK_REVOKED = "risk_revoked"  # reserved for Module 7
+    # 2026-09-16: a DIFFERENT session on this same account had a direct HIGH
+    # crossing (RISK_REVOKED) and tripped the account-level risk lockout --
+    # every OTHER still-active session for that account is cascaded closed
+    # for the same reason a locked-out account shouldn't still have other
+    # windows open. See app.services.trust_score.continuous's revoke branch.
+    ACCOUNT_LOCKED = "account_locked"
 
     ALL = (
         LOGOUT,
@@ -54,6 +60,7 @@ class TerminationReason:
         IDLE_TIMEOUT,
         MAX_LIFETIME,
         RISK_REVOKED,
+        ACCOUNT_LOCKED,
     )
 
 

@@ -191,7 +191,12 @@ def terminate_session(
 def terminate_user_sessions(
     db: DbSession, user_id: int, *, reason: str
 ) -> list[str]:
-    """Terminate every active session for a user (used by /auth/logout)."""
+    """Terminate every active session for a user. Used by /auth/logout, and
+    (2026-09-16) by app.services.trust_score.continuous's revoke branch to
+    cascade-close an account's OTHER sessions the instant a direct HIGH
+    crossing on any one of them trips the account-level risk lockout --
+    each call site passes its own `reason` (TerminationReason.LOGOUT vs
+    ACCOUNT_LOCKED) so the audit trail still shows which case caused it."""
     ids = list(
         db.scalars(
             select(Session.id).where(

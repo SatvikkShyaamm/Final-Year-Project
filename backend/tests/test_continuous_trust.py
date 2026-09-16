@@ -402,6 +402,143 @@ def test_event_crossing_into_high_revokes_session_immediately(client, admin_toke
 
 
 # --------------------------------------------------------------------------- #
+# cascading account-lockout termination (2026-09-16 hardening)
+# --------------------------------------------------------------------------- #
+def _second_token_for(client, existing_token: str) -> str:
+    """A second, independently-issued token for the same account (its own
+    jti, per app.core.security.create_access_token) -- simulates a second
+    real browser/device login. Minted directly rather than via a real
+    POST /auth/login: that endpoint runs its own Adaptive MFA risk
+    evaluation on every call and can require a step-up challenge instead
+    of returning a token outright, which would make this test flaky --
+    test_token_revocation.py already uses this same direct-mint technique
+    for the same reason. Reusing one fixture token for two WebSocket
+    connections instead would share one jti and make a later 401 on the
+    first session ambiguous: caused by the cascade, or just by revoking a
+    jti both session rows happen to reference."""
+    from app.core.security import create_access_token
+
+    user_id = client.get("/api/v1/auth/me", headers=_bearer(existing_token)).json()["id"]
+    return create_access_token(user_id)
+
+
+def test_direct_high_crossing_cascade_terminates_the_accounts_other_active_sessions(
+    client, admin_token, user_token, db_session
+):
+    """A direct HIGH crossing on ONE session must also end every OTHER
+    currently active session on that same account -- an account the system
+    has just locked out of logging back in (see the lockout tests below)
+    shouldn't still have a live window open somewhere else. session_a here
+    stands in for "the other browser" -- untouched by the event itself, its
+    own score stays exactly where it was."""
+    user_token_b = _second_token_for(client, user_token)
+
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws_a:
+        session_a = ws_a.receive_json()["session_id"]
+        _force_score(db_session, session_a, 90, "LOW")
+
+        with client.websocket_connect(f"{WS_PATH}?token={user_token_b}") as ws_b:
+            session_b = ws_b.receive_json()["session_id"]
+            _force_score(db_session, session_b, 60, "MEDIUM")
+
+            resp = _post_event(client, admin_token, session_b, SecurityEventType.ABNORMAL_REQUEST_RATE)
+            assert resp.status_code == 200
+            assert resp.json()["action"] == "revoke"
+
+            # session_b's own push is unchanged from the single-session case.
+            terminated_b = ws_b.receive_json()
+            assert terminated_b == {"type": "session.terminated", "reason": "risk_revoked"}
+
+            # NEW: session_a's own socket also gets closed, with a DIFFERENT
+            # reason -- it never crossed anything itself, it's collateral of
+            # the account-wide lockout the other session's crossing tripped.
+            terminated_a = ws_a.receive_json()
+            assert terminated_a == {"type": "session.terminated", "reason": "account_locked"}
+
+    row_a = client.get(f"/api/v1/sessions/{session_a}", headers=_bearer(admin_token)).json()
+    assert row_a["state"] == "terminated"
+    assert row_a["termination_reason"] == "account_locked"
+    assert row_a["acl_status"] in ("removed", "removing")
+
+    row_b = client.get(f"/api/v1/sessions/{session_b}", headers=_bearer(admin_token)).json()
+    assert row_b["termination_reason"] == "risk_revoked"  # never overwritten by the cascade
+
+    # session_a's own token (its own distinct jti -- see _login above) is
+    # now dead too: the cascade closed it through the exact same
+    # terminate_session() path as any other termination reason, so the
+    # existing auth-revocation hook ran for it same as always.
+    assert client.get("/api/v1/auth/me", headers=_bearer(user_token)).status_code == 401
+
+
+def test_cascade_termination_does_not_touch_a_different_users_sessions(
+    client, admin_token, user_token, db_session
+):
+    """Scoped strictly to the offending account -- a bystander's own,
+    unrelated session must never be touched by someone else's lockout."""
+    bob_token = _register(
+        client, {"username": "bob", "email": "bob@example.com", "password": "bobpass123"}
+    )["access_token"]
+
+    with client.websocket_connect(f"{WS_PATH}?token={bob_token}") as bob_ws:
+        bob_session = bob_ws.receive_json()["session_id"]
+        _force_score(db_session, bob_session, 90, "LOW")
+
+        with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
+            session_id = ws.receive_json()["session_id"]
+            _force_score(db_session, session_id, 60, "MEDIUM")
+            _post_event(client, admin_token, session_id, SecurityEventType.ABNORMAL_REQUEST_RATE)
+            ws.receive_json()  # session.terminated (risk_revoked)
+
+        # bob's session is untouched -- no push arrived, and it's still active.
+        row = client.get(f"/api/v1/sessions/{bob_session}", headers=_bearer(admin_token)).json()
+        assert row["state"] == "active"
+
+
+def test_delivery_failure_revoke_does_not_cascade_terminate_other_sessions(
+    client, admin_token, user_token, db_session, monkeypatch
+):
+    """The DeliveryFailed-reassigned revoke (a MEDIUM reverify whose email
+    couldn't even be sent) is explicitly NOT a direct HIGH crossing -- it
+    must not trip the account-level lockout (already covered above) AND,
+    just as importantly, must not cascade-terminate this account's other
+    sessions either. Same scoping as risk_lockout.record_risk_offense."""
+    import app.services.mfa.email_otp as email_otp
+
+    monkeypatch.setattr(get_settings(), "smtp_username", "bot@example.com")
+    monkeypatch.setattr(get_settings(), "smtp_password", "app-password")
+
+    def fake_send(**kwargs):
+        raise email_otp.EmailDeliveryError("smtp connection refused")
+
+    monkeypatch.setattr(email_otp, "send_verification_email", fake_send)
+
+    user_token_b = _second_token_for(client, user_token)
+
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws_a:
+        session_a = ws_a.receive_json()["session_id"]
+        _force_score(db_session, session_a, 90, "LOW")
+
+        with client.websocket_connect(f"{WS_PATH}?token={user_token_b}") as ws_b:
+            session_b = ws_b.receive_json()["session_id"]
+            _force_score(db_session, session_b, 85, "LOW")
+
+            resp = _post_event(
+                client, admin_token, session_b, SecurityEventType.VPN_DETECTED,
+                ip_address="185.220.100.7",
+            )
+            assert resp.status_code == 200
+            assert resp.json()["action"] == "revoke"
+            assert resp.json()["new_risk"] == "MEDIUM"
+
+            terminated_b = ws_b.receive_json()
+            assert terminated_b == {"type": "session.terminated", "reason": "risk_revoked"}
+
+        # session_a never got a push and is still active -- no cascade.
+        row_a = client.get(f"/api/v1/sessions/{session_a}", headers=_bearer(admin_token)).json()
+        assert row_a["state"] == "active"
+
+
+# --------------------------------------------------------------------------- #
 # account-level risk lockout (2026-09-14 hardening)
 # --------------------------------------------------------------------------- #
 def _drive_session_into_high(client, admin_token, user_token, db_session) -> str:

@@ -2634,3 +2634,186 @@ the gap where an unscoped Option A would have falsely penalized an admin's
 own dashboard polling. Every other part of Section 18, and every prior
 module, is unchanged and still fully passing. Still ready to proceed to
 **Module 8 — Security Dashboard**.
+
+---
+
+## 23. Post-Module-7 Hardening — Cascading Account-Lockout Termination (2026-09-16)
+
+### Gap found
+
+Found live, testing section 21's real passive detection with the same admin
+account open in two browsers at once: Firefox (session A, live score 75,
+the developer's primary window) and Chrome (session B). Chrome's score was
+driven down by repeated heartbeats and crossed into HIGH, correctly getting
+terminated (`RISK_REVOKED`) and, per section 18, tripping the account-level
+risk lockout (tier 1, 1 hour). Firefox's session A kept running completely
+untouched — same account, still-active WebSocket, still-valid ACL — for the
+full lockout window. Only after the developer separately closed Firefox and
+tried to log back in did the section-18 lockout correctly show up, as a 423
+on the login attempt.
+
+Root cause: section 18's lockout is a **login gate only** — it has exactly
+two touch points in the whole codebase, `continuous.py`'s revoke branch
+(which only *records* an offense) and `auth.py`'s `POST /auth/login` (the
+only place that ever *checks* for one). Nothing between those two points
+ever looked at an account's *other already-open* sessions. That scope was
+an intentional, reasonable decision when section 18 shipped — a login gate
+is what closes "revoked, then logs straight back in," which was the gap
+being fixed at the time — but it left a second, narrower gap: an account
+the system has just decided is too risky to let back in can still have a
+live window open somewhere else for up to the full lockout duration,
+which sits awkwardly against this project's own account-wide (not
+device-scoped) framing of the lockout everywhere else it's documented.
+
+The developer asked for a professional recommendation before committing to
+the change. Given: (1) Zero Trust's own continuous/account-aware
+philosophy — an account decided untrustworthy shouldn't get to keep a
+side-door session alive just because the crossing happened on a different
+device; (2) the fix is a small, low-risk extension of code that already
+exists (`terminate_user_sessions`, built for `/auth/logout`) rather than new
+mechanism; and (3) the trade-off that this makes the system behave more
+aggressively — instantly killing every other open tab/device the instant
+one of them crosses HIGH, worth calling out explicitly in a demo — the
+recommendation was to build it. Approved; this section is the as-built,
+verified record.
+
+### What was built
+
+- **Trigger, identically scoped to the existing lockout offense**: a new
+  local `direct_high_crossing` flag is set in
+  `continuous.py`'s `record_event()` at the exact same place, and under the
+  exact same condition (`new_risk == RiskLevel.HIGH`, evaluated before any
+  later `DeliveryFailed`-reassigns-a-MEDIUM-reverify-to-revoke branch runs),
+  as the pre-existing `risk_lockout.record_risk_offense()` call section 18
+  already added there. This is deliberate, not incidental: reusing the
+  identical scoping means the already-tested "a failed/expired/undeliverable
+  MEDIUM reverify must not trip the account lockout" distinction
+  automatically also governs "must not cascade-terminate other sessions" —
+  one condition, two consequences, impossible for them to drift apart.
+- **`backend/app/services/session/service.py`** — no new function needed.
+  The revoke branch, immediately after the triggering session's own
+  `terminate_session(..., reason=RISK_REVOKED)`, now also calls the
+  pre-existing `terminate_user_sessions(db, session.user_id,
+  reason=TerminationReason.ACCOUNT_LOCKED)` (previously used only by
+  `/auth/logout`) to end every *other* still-active session on that account.
+  Ordering is what makes this safe: `terminate_session` flips the triggering
+  session to `TERMINATED` synchronously, before `terminate_user_sessions`
+  runs its own "still ACTIVE" query — so the triggering session is naturally
+  excluded from its own cascade and keeps its original `RISK_REVOKED`
+  reason (confirmed by `terminate_session`'s existing idempotency: calling
+  it again on an already-terminated session is a no-op that returns the row
+  unchanged).
+- **`backend/app/models/session.py`** — new
+  `TerminationReason.ACCOUNT_LOCKED = "account_locked"` constant, added to
+  the `ALL` tuple. `termination_reason` is a free-form `String(32)` column
+  with no DB-level enum — **no migration needed**.
+- **Bug caught while writing the integration test, fixed before this
+  shipped**: cascading the *session* alone was not enough.
+  `backend/app/services/auth/wiring.py`'s existing token-revocation hook
+  only revokes the access token for an explicit allow-list of termination
+  reasons (`_REVOKE_ON_REASONS`), and the new `ACCOUNT_LOCKED` reason was
+  not in it. Left unfixed, the cascade would close session A's row and
+  remove its ACL, but session A's own JWT would stay valid — Firefox could
+  have silently reopened a brand-new session on the same token a moment
+  later, defeating the entire point of the fix. Added `ACCOUNT_LOCKED` to
+  `_REVOKE_ON_REASONS` alongside `RISK_REVOKED`. Caught immediately because
+  the new integration test below asserts `GET /auth/me` on session A's
+  *original* token returns 401 after the cascade, not just that the session
+  row shows `terminated` — this class of gap only shows up when the test
+  checks the token, not just the row, which is now recorded here as the
+  reason that specific assertion is in the test rather than an incidental
+  extra check.
+- **Everything else about the cascade is free, by construction**: because
+  both the triggering session and every cascaded session go through the
+  exact same, unmodified `terminate_session()` → `emit_session_closed()`
+  path, every existing hook already fires correctly with zero new code:
+  ACL removal (Module 4's `acl/wiring.py`), the WebSocket `session.closed` →
+  `session.terminated` push on each affected session's own socket (via the
+  existing `store.publish_event`/WS forwarder in `main.py`), and the
+  heartbeat/request-rate Redis cleanup (`trust_score/wiring.py`). No new
+  push message type, no new WS code, no new Redis key, anywhere.
+- **Frontend — zero functional changes needed**:
+  `LiveSessions.tsx`'s `StateBadge` already renders `termination_reason` as
+  a raw string with no lookup table (`` `terminated · ${reason}` ``), so
+  `account_locked` displays correctly with no code change.
+  `SessionProvider.tsx`'s `forceLogout()` already fires unconditionally on
+  *any* `session.terminated` push regardless of `reason`, so Firefox's tab
+  correctly gets forced out the instant the cascade reaches it, with no
+  code change either — both files got a docstring/comment update only, for
+  documentation completeness.
+
+### Tests (`backend/tests/test_continuous_trust.py`)
+
+Three new integration tests, added directly after the existing
+direct-HIGH-crossing test and before the section-18 lockout tests:
+
+- `test_direct_high_crossing_cascade_terminates_the_accounts_other_active_sessions`
+  — opens session A (score forced to 90/LOW, standing in for "the other
+  browser") and session B (score forced to 60/MEDIUM) on the same account,
+  posts `abnormal_request_rate` against B pushing it to HIGH, and asserts:
+  B's own socket gets `{"reason": "risk_revoked"}` (unchanged from the
+  single-session case); A's socket **also** gets a push, with
+  `{"reason": "account_locked"}`; A's row afterward shows
+  `state: "terminated"`, `termination_reason: "account_locked"`,
+  `acl_status` removed/removing; B's row still shows `"risk_revoked"`
+  (never overwritten by the cascade); and — the assertion that caught the
+  token-revocation gap above — a `GET /auth/me` call on session A's
+  original token now returns 401.
+- `test_cascade_termination_does_not_touch_a_different_users_sessions` — a
+  second, unrelated account's own active session is confirmed still
+  `"active"` after the first account's direct HIGH crossing and cascade.
+- `test_delivery_failure_revoke_does_not_cascade_terminate_other_sessions`
+  — mirrors the existing MEDIUM-reverify-email-failure test (SMTP settings
+  and `send_verification_email` monkeypatched to raise): a MEDIUM-risk
+  reverify reassigned to revoke because it couldn't even be emailed still
+  ends only that one session — the account's other active session is
+  confirmed still `"active"` — proving the cascade is scoped to a genuine
+  direct HIGH crossing exactly as the lockout offense already is, not to
+  every revoke.
+- **Test technique**: a second token for the same account is minted
+  directly via `create_access_token(user_id)` (from `app.core.security`)
+  rather than a real second `POST /auth/login` call, to simulate "a second
+  browser/device already logged in" without going through Adaptive MFA's
+  own risk evaluation on that call (which can require a step-up challenge
+  or fail unpredictably on a second login for the same user in a short
+  window) — this exact technique is already precedented in
+  `test_token_revocation.py`.
+
+### Verification
+
+- **Full backend suite**, run from the same clean virtualenv used for every
+  prior section's verification: **136/136 passing** — the prior 133
+  (section 22) plus the 3 new tests above, zero prior tests deleted,
+  skipped, or weakened.
+- The first run of the new tests caught the `_REVOKE_ON_REASONS` gap
+  described above (2 of 3 new tests failed with the cascaded session's
+  token still returning 200 instead of 401) — fixed by adding
+  `ACCOUNT_LOCKED` to that set; re-run afterward: all 3 pass.
+- **No migration** — `termination_reason` is a free-form `String(32)`
+  column with no DB enum; `ACCOUNT_LOCKED` is just a new string value.
+- **Frontend**: `npx tsc -b --noEmit` → 0 errors. No frontend runtime
+  behavior changed — confirmed by inspection that `StateBadge` and
+  `forceLogout()` both already handle an unrecognized/new `reason` value
+  correctly with no lookup table to update.
+- **Regression check against sections 1-22**: every change is additive (one
+  new flag local to one existing branch, one new call to an existing
+  function, one new constant, one existing set gaining one member) — no
+  existing model, schema, endpoint field, or prior termination path's
+  behavior was altered. `risk_lockout`'s own login-gate check (section 18)
+  is completely untouched; this section only adds a second, independent
+  consequence to the same trigger it already fires on.
+
+**Conclusion:** the gap surfaced by testing with the same account open in
+two browsers — a direct HIGH crossing correctly locked the account out of
+*future* logins but left every *other already-open* session on that
+account running untouched — is now closed. The instant one session on an
+account has a direct HIGH crossing, every other active session on that
+same account is cascade-terminated (`account_locked`) through the same,
+unmodified termination path, including token revocation and ACL removal,
+with no new WebSocket/push code and no frontend code changes required. As
+flagged during the recommendation: this makes the system behave more
+aggressively than before — a risky event on one device now instantly ends
+every other open window/device on that account, not just the one that
+crossed — which is worth calling out explicitly in a demo. Every prior
+module and hardening pass remains otherwise intact. Still ready to proceed
+to **Module 8 — Security Dashboard**.
