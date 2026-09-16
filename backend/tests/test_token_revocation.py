@@ -67,10 +67,17 @@ def test_logout_revokes_the_sessions_own_token(client):
 def test_ordinary_disconnect_does_not_revoke_the_token(client):
     """An ordinary WEBSOCKET_DISCONNECT (tab closed, or a page refresh) must
     NOT revoke the token -- per docs/architecture.md and Project status.md
-    section 6b, that same still-valid token reopening a fresh session on
-    reload is documented, intended behaviour, not the gap this fix closes.
-    Only a "terminated for cause" reason (logout / admin / idle / max-lifetime
-    / risk-revoked) revokes."""
+    section 6b, that same still-valid token being usable again afterward is
+    documented, intended behaviour, not the gap this fix closes. Only a
+    "terminated for cause" reason (logout / admin / idle / max-lifetime /
+    risk-revoked / account-locked) revokes.
+
+    2026-09-16: what that "usable again afterward" means changed shape, but
+    not the property under test here -- see
+    test_refresh_reconnect_reattaches_without_resetting_the_score and
+    test_reconnect_after_grace_window_opens_a_genuinely_new_session in
+    test_sessions.py for the now-reattaches-instead-of-always-fresh behavior
+    itself. This test only asserts the token itself was never revoked."""
     _register(client, ADMIN)
     user_token = _register(client, USER)["access_token"]
 
@@ -79,7 +86,10 @@ def test_ordinary_disconnect_does_not_revoke_the_token(client):
 
     # the token still authenticates REST calls...
     assert client.get("/api/v1/auth/me", headers=_bearer(user_token)).status_code == 200
-    # ...and can still open a brand-new session, exactly like a page refresh
+    # ...and can still open a socket again -- reconnecting instantly like
+    # this reattaches to the very same (still-ACTIVE, grace-window) session
+    # rather than opening a brand-new one (2026-09-16), but either way the
+    # point of THIS test holds: the token was never revoked by the disconnect.
     with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
         assert ws.receive_json()["type"] == "session.established"
 

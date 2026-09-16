@@ -60,6 +60,31 @@ def get_current_session_for_user(db: DbSession, user_id: int) -> Session | None:
     )
 
 
+def get_active_session_by_token_jti(db: DbSession, token_jti: str | None) -> Session | None:
+    """The still-ACTIVE session that was opened by this exact access token
+    (matched on its `jti`), if any.
+
+    2026-09-16: used by the WS handshake to tell a page-refresh reconnect --
+    the same browser tab presenting the SAME still-valid token it already
+    had -- apart from a genuine new login, which always mints a brand-new
+    token (and therefore a brand-new `jti`) at `/auth/login`. A token's `jti`
+    is unique per mint, so at most one ACTIVE session can ever match; `None`
+    means either no `token_jti` was presented (defensive -- a WS handshake
+    always resolves one, see app.ws.auth.resolve_ws_user) or the session that
+    token originally opened is gone (already terminated, including by the
+    reconnect-grace finalize in app.api.v1.endpoints.sessions) -- either way
+    the caller should open a fresh session exactly as before this hardening
+    pass."""
+    if not token_jti:
+        return None
+    return db.scalar(
+        select(Session).where(
+            Session.token_jti == token_jti,
+            Session.state == SessionState.ACTIVE,
+        )
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Writes
 # --------------------------------------------------------------------------- #

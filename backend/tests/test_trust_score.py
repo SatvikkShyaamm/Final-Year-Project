@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from app.core.config import get_settings
+from app.core.security import create_access_token
 from app.models.trust_score import RiskLevel
 from app.models.user import User
 from app.services.trust_score.evaluator import evaluate
@@ -86,7 +87,16 @@ def test_second_session_is_recognised_as_known_device_and_ip(client):
 
     with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
         first_id = ws.receive_json()["session_id"]
-    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
+
+    # 2026-09-16: this must be a genuinely SECOND login (its own token/jti),
+    # not the same tab reconnecting -- reusing `user_token` here would now
+    # reattach to the first session instead of opening a fresh one scored
+    # from scratch by Module 5, which is exactly what this test needs to
+    # observe (see sessions.py's WS handler and
+    # get_active_session_by_token_jti).
+    me = client.get("/api/v1/auth/me", headers=_bearer(user_token)).json()
+    user_token_2 = create_access_token(me["id"])
+    with client.websocket_connect(f"{WS_PATH}?token={user_token_2}") as ws:
         second_id = ws.receive_json()["session_id"]
 
     first = _score_body(client, admin_token, first_id)
@@ -243,10 +253,16 @@ def test_user_trust_history(client):
 
     with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
         ws.receive_json()
-    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
+
+    # 2026-09-16: a genuinely second login (its own token/jti) -- see the
+    # comment in test_second_session_is_recognised_as_known_device_and_ip
+    # above. Reusing `user_token` would reattach to the first session instead
+    # of creating the second history entry this test expects.
+    me = client.get("/api/v1/auth/me", headers=_bearer(user_token)).json()
+    user_token_2 = create_access_token(me["id"])
+    with client.websocket_connect(f"{WS_PATH}?token={user_token_2}") as ws:
         ws.receive_json()
 
-    me = client.get("/api/v1/auth/me", headers=_bearer(user_token)).json()
     hist = client.get(
         f"/api/v1/trust-score/user/{me['id']}/history", headers=_bearer(admin_token)
     ).json()

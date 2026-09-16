@@ -2817,3 +2817,216 @@ every other open window/device on that account, not just the one that
 crossed — which is worth calling out explicitly in a demo. Every prior
 module and hardening pass remains otherwise intact. Still ready to proceed
 to **Module 8 — Security Dashboard**.
+
+---
+
+## 24. Module 3/7 Hardening — Page-Refresh Reconnect Reattaches Instead of Resetting the Session (2026-09-16)
+
+### Gap found
+
+Found live, testing continuous evaluation directly: with a session driven
+down into MEDIUM (a pending re-verify challenge outstanding) or otherwise
+mid-score, refreshing the browser tab made the score jump straight back to a
+fresh baseline and the pending re-verify prompt vanished — the developer
+could dodge an outstanding MFA challenge just by pressing refresh.
+
+Root cause, and it's a Module 3 one, not a Module 7 bug: Module 3's FSM ties
+a "session" 1:1 to the *liveness of one specific WebSocket connection* — its
+`onopen` drives S1 -> S2, its `onclose` drives S2 -> S3 -> gone,
+unconditionally, per the session-lifecycle docstring going all the way back
+to Module 3's original implementation. A page refresh drops that connection
+exactly the same way closing the tab does — the two are indistinguishable at
+the transport level — so the WS handler's `finally` block terminated the
+session immediately either way, and the still-valid JWT (moved to
+`sessionStorage` a while back specifically so it survives a same-tab
+refresh — see the relevant earlier section) simply opened a **brand-new**
+session on reconnect, scored fresh from Module 5's login-time baseline. That
+was fine, arguably correct, for Module 3 alone. It became a real security
+gap the moment Module 7 started accumulating state *within* a session's
+lifetime that mattered to keep: a degrading trust score, and a pending
+re-verify challenge that shouldn't be dischargeable by just not answering it.
+
+The developer asked for a recommendation before committing to a fix, same
+process as section 23. Given the severity — this is a working bypass of
+continuous evaluation's whole premise, not a cosmetic inconsistency — the
+recommendation was to fix it properly rather than patch around symptoms,
+and to do so without touching the parts of Module 3 that don't need to
+change (a genuinely closed tab must still lose its session and ACL quickly).
+Approved; this section is the as-built, verified record.
+
+### What was built
+
+- **Reattachment, scoped to the exact token**: every access token carries a
+  unique `jti`, already stored on the session row it opened
+  (`token_jti` — Module 2/3 hardening, see the token-revocation section
+  above) for revocation purposes. A page refresh presents that *same* token;
+  a genuine new login always mints a fresh one at `POST /auth/login`. That
+  distinction is exactly what's needed and already existed —
+  **`backend/app/services/session/service.py`** gained one new read,
+  `get_active_session_by_token_jti(db, token_jti)`, doing nothing but that
+  lookup (at most one ACTIVE session can ever match, since a `jti` is unique
+  per mint).
+- **A short, dedicated grace window, not the idle timeout**:
+  `backend/app/core/config.py` gained `session_reconnect_grace_seconds`
+  (default 5s, env `SESSION_RECONNECT_GRACE_SECONDS`). An ordinary WS drop no
+  longer finalizes the session immediately — `backend/app/api/v1/endpoints/
+  sessions.py`'s WS handler schedules a background `_finalize_disconnect`
+  task (mirroring `app.main`'s existing `_session_sweeper` background-task
+  pattern: its own short-lived `SessionLocal()`, since the request-scoped
+  `db` is already gone by the time it runs) that sleeps the grace window,
+  then finalizes the close with `TerminationReason.WEBSOCKET_DISCONNECT`
+  **only if nothing reattached in the meantime** (checked via `ws_connected`
+  and a `last_seen_at` marker captured at the moment of that specific drop —
+  guards against a slow, stale finalize task cutting short a *second* drop's
+  own, separately-scheduled grace window after a reattach-then-drop-again
+  sequence). Deliberately NOT reusing `session_idle_timeout_minutes` (30
+  minutes) — a tab that's actually just closed should still lose its
+  session/ACL in seconds, matching this project's own "revoke fast" framing
+  everywhere else; only a refresh-speed reconnect gets the benefit.
+- **The reattach itself, at handshake time**: if
+  `get_active_session_by_token_jti` finds a match, the handler reuses that
+  session row outright — `touch_session` + `set_ws_connected(True)`, same
+  `session_id` sent back in `session.established` (now carrying a
+  `reconnected: bool` field) — instead of calling `create_session`. Nothing
+  else runs: no `emit_session_opened`, so Module 4's ACL is never re-created
+  (it was never torn down) and Module 5's login-time evaluator is never
+  re-invoked (the CURRENT, possibly-degraded score and risk band are sent
+  back exactly as they stood). A miss (no match — a real new login, or the
+  earlier session's grace window already lapsed) falls through to
+  `create_session` exactly as before this hardening pass.
+- **The pending re-verify challenge is resent, not just the score**: this is
+  the actual fix for the reported bypass. On a reattach, the handler calls
+  the existing `continuous.has_open_retrigger_challenge` and, if one is
+  still PENDING, re-pushes `trust.reverify_required` down the newly-attached
+  socket — same construction `security.py`'s `_push_result` already uses
+  (fresh `mfa_token`, same underlying `MFAChallenge` row and `challenge_id`),
+  so the frontend's `ReverifyModal` reappears instead of the refreshed tab
+  looking clean. One accepted, narrow gap: `dev_code` (the SMTP-unconfigured
+  local/demo convenience that echoes the raw OTP back) is never re-shown on
+  a resend, only on the original push — it's a transient, deliberately
+  never-persisted attribute of the object `create_challenge` returns at
+  creation (storing a real OTP in cleartext anywhere would be the actual
+  regression), and a resend reads a freshly re-queried row that was never
+  that object. The real code is still sitting in that session's server log
+  from the first push.
+- **Frontend — zero code changes needed.** `SessionProvider.tsx`'s
+  `SessionSocket` already reconnects on any ordinary drop and treats
+  `session.established` the same regardless of an unrecognized extra field;
+  its `onMessage` handler already applies `trust.reverify_required` and
+  `trust.updated` pushes exactly the way a fresh one behaves. The refresh
+  itself (a full page reload) recreates the whole React tree anyway, so
+  there was never any client-side session-identity state to reconcile —
+  everything the reattach needs the client to see arrives correctly shaped
+  over the same two message types the frontend already handles.
+- **Testability fix found along the way, not a feature change**: writing
+  the first reattach test surfaced that `app.core.database.SessionLocal`
+  (used directly by `_finalize_disconnect`, and — it turns out — by the
+  pre-existing `_session_sweeper` too) bypasses `app.dependency_overrides`
+  entirely, since that override only intercepts FastAPI's own
+  `Depends(get_db)` resolution. Both background paths were quietly trying to
+  reach the real (Postgres) `database_url` in every test all along; the
+  sweeper's failure was invisible because it only wakes on a 30-second timer
+  that essentially never fires within one fast test (this is the harmless
+  "session sweeper iteration failed" warning visible in verbose test output
+  going back to Module 3). The new grace-window path runs on a
+  sub-second timer, so it hit this immediately. Fixed once, at the root, in
+  `backend/tests/conftest.py`'s `client` fixture: `SessionLocal` is a
+  `sessionmaker` *instance*, not a plain reference, so `SessionLocal.
+  configure(bind=db_engine)` reaches every module that already imported it
+  (including ones imported long before the fixture runs) — no per-call-site
+  patching needed, and it incidentally makes the idle sweeper properly
+  testable against the in-memory SQLite too, for whenever a test needs that.
+
+### Tests
+
+- **`backend/tests/test_sessions.py`** (new section, "Reconnect-within-grace
+  reattach"): `test_refresh_reconnect_reattaches_without_resetting_the_score`
+  — disconnect, degrade the score directly, reconnect with the same token,
+  confirm the SAME `session_id`, `reconnected: true`, and the degraded score
+  untouched. `test_reconnect_after_grace_window_opens_a_genuinely_new_session`
+  — disconnect, let the (test-shortened) grace window actually lapse via the
+  existing `_wait_terminated` poll, reconnect with the same still-valid
+  token, confirm a genuinely NEW `session_id` and `reconnected: false` — the
+  pre-2026-09-16 behaviour, correctly preserved for a tab that's actually
+  gone. `test_a_different_token_never_reattaches_even_if_reconnecting_
+  instantly` — a second, distinct token for the same account, reconnecting
+  immediately, still opens its own independent session — reattachment is
+  scoped to the exact `jti`, never to "this user reconnected recently."
+  `test_get_current_session_for_caller` extended: immediately after an
+  ordinary disconnect the session is still the caller's current one (new,
+  correct behaviour); only once the grace window actually lapses does it
+  stop being so.
+- **`backend/tests/test_continuous_trust.py`** (new section, "reconnect
+  reattach resends a pending reverify challenge"):
+  `test_refresh_reconnect_resends_the_pending_reverify_challenge` — the
+  direct regression test for the reported bug: force a session into MEDIUM
+  with a real pending challenge, disconnect, reconnect with the same token,
+  confirm `session.established` shows the SAME session/unreset score AND a
+  resent `trust.reverify_required` carrying the identical `challenge_id` and
+  a fresh, usable `mfa_token` (with `dev_code` correctly null on the resend,
+  per the accepted gap above) — and that the underlying `MFAChallenge` row
+  itself, and `GET /sessions/{id}`'s `current_action`, are undisturbed.
+  `test_reconnect_without_a_pending_challenge_gets_no_reverify_push` —
+  a reattach on an ordinary LOW/no-challenge session pushes nothing extra.
+- **Existing tests updated for the new timing/identity semantics** (all were
+  previously exploiting an ordinary disconnect finalizing instantly, or two
+  sockets sharing one token to mean "two independent sessions" — neither
+  assumption holds after this hardening pass):
+  `test_token_revocation.py::test_ordinary_disconnect_does_not_revoke_the_token`
+  (docstring + comment updated; its actual assertion — the token itself is
+  never revoked by an ordinary disconnect — needed no change).
+  `test_acl.py::test_session_close_removes_acl_rule` and
+  `test_refcount_keeps_entry_until_last_session_closes` (the latter also
+  switched its second concurrent connection to a genuinely separate
+  minted token — reusing the first would now reattach instead of opening a
+  second session, collapsing its own "two sessions, one IP" premise) —
+  both now wait out the grace window before draining the ACL queue.
+  `test_trust_score.py::test_second_session_is_recognised_as_known_device_and_ip`
+  and `test_user_trust_history` — both switched their sequential second
+  connection to a second minted token for the same reason.
+- **New test-infra fixture**: `backend/tests/conftest.py`'s
+  `_fast_reconnect_grace` (autouse) monkeypatches
+  `session_reconnect_grace_seconds` to 0.3s for the whole suite — comfortably
+  under existing polling helpers' ~1s budget (so `_wait_terminated`-based
+  tests needed no changes) and comfortably above realistic in-process
+  reconnect latency (so a reattach test's immediate reconnect reliably lands
+  inside the window).
+
+### Verification
+
+- **Full backend suite**: **141/141 passing** — the prior 136 (section 23)
+  plus 5 new tests above, zero prior tests deleted or weakened; every
+  existing test's original assertions are intact, with only the specific
+  ones enumerated above adjusted for the new (correct) timing/identity
+  semantics.
+- **The `SessionLocal` testability gap above was caught BY these new
+  tests failing first** (`OperationalError: connection to server at
+  "localhost", port 5432 failed`), not discovered by inspection — fixed once
+  in `conftest.py`, confirmed by re-running the full suite clean afterward.
+- **No migration** — no model, schema, or column changed; the token-`jti`
+  column this reuses already existed for revocation, and the grace window
+  is Redis/DB-free (a single in-process `asyncio.sleep` plus the existing
+  `sessions` table).
+- **Frontend**: `npx tsc -b --noEmit` → 0 errors. No frontend file changed —
+  confirmed by inspection that `SessionSocket`'s reconnect handling and
+  `SessionProvider`'s `onMessage`/`onEstablished` handlers both already treat
+  the reattach case correctly with the message shapes they already handle.
+- **Regression check against sections 1-23**: the WS handler's non-refresh
+  paths (logout, admin terminate, idle/lifetime sweep, every Module 7
+  revoke including the section-23 cascade) all set a real termination
+  reason on the session row *before* the socket closes, so they hit the
+  `finally` block's unchanged "already ended for a real reason — finalize
+  immediately" branch, never the new grace-window branch — none of those
+  paths' timing changed at all, only the plain-drop-with-no-prior-cause path
+  did.
+
+**Conclusion:** a page refresh no longer means "session over, start fresh."
+An ordinary WebSocket drop now gets a short, dedicated window to reconnect
+with the same token and reattach to its existing session — keeping its
+live, possibly-degraded Module 7 trust score and re-delivering any pending
+re-verify challenge — while a genuinely closed tab still loses its session
+and ACL within seconds, exactly as before. The specific bypass this closes
+(refreshing past an outstanding MFA re-verify) is now fixed at its actual
+root cause in Module 3's session-identity model, not patched around in
+Module 7. Every prior module and hardening pass remains otherwise intact.
+Still ready to proceed to **Module 8 — Security Dashboard**.

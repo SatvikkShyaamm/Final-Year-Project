@@ -15,6 +15,7 @@ import pytest
 from sqlalchemy.orm import sessionmaker
 from starlette.websockets import WebSocketDisconnect
 
+from app.core.security import create_access_token
 from app.models.session import Session, SessionState, utcnow
 from app.models.user import User
 from app.services import session as session_service
@@ -102,6 +103,96 @@ def test_ping_pong(client, user_token):
 
 
 # --------------------------------------------------------------------------- #
+# Reconnect-within-grace reattach (2026-09-16 hardening)
+#
+# The gap this closes: a page refresh drops the WS exactly like a closed tab
+# does (indistinguishable at the transport level) -- before this, that ALWAYS
+# meant "session over, open a fresh one," so refreshing mid-session silently
+# reset an in-progress Module 7 trust score back to a brand-new login-time
+# baseline and dropped any pending reverify challenge. Now an ordinary drop
+# sits in a short grace window (`session_reconnect_grace_seconds`, monkey-
+# patched short for this whole suite -- see conftest.py's
+# `_fast_reconnect_grace`) during which a reconnect presenting the SAME
+# access token (same `jti` -- a genuine new login always mints a fresh one)
+# reattaches to that exact session instead.
+# --------------------------------------------------------------------------- #
+def test_refresh_reconnect_reattaches_without_resetting_the_score(
+    client, admin_token, user_token, db_session
+):
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
+        session_id = ws.receive_json()["session_id"]
+
+    # Simulate the session having already been marked down mid-session by
+    # Module 7 (a real IP-change/VPN/etc. event -- see test_continuous_trust.py
+    # for that path in full) BEFORE the "refresh" reconnects.
+    row = db_session.get(Session, session_id)
+    row.trust_score = 55
+    row.risk_level = "MEDIUM"
+    db_session.commit()
+
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws2:
+        established = ws2.receive_json()
+        assert established["type"] == "session.established"
+        assert established["session_id"] == session_id  # the SAME session
+        assert established["reconnected"] is True
+        assert established["trust_score"] == 55   # NOT reset to a fresh baseline
+        assert established["risk_level"] == "MEDIUM"
+
+    # it was reattached, not closed-and-reopened -- the row stayed ACTIVE the
+    # whole time this test has been running (well inside the grace window).
+    row_after = client.get(
+        f"/api/v1/sessions/{session_id}", headers=_bearer(admin_token)
+    ).json()
+    assert row_after["state"] == "active"
+
+
+def test_reconnect_after_grace_window_opens_a_genuinely_new_session(
+    client, admin_token, user_token
+):
+    """Reattachment is bounded, not permanent amnesty for a dead token. If
+    nobody reconnects before the grace window elapses, the old session is
+    finalized for real, and a LATER reconnect with the same (still-valid)
+    token opens a brand-new session -- the pre-2026-09-16 behaviour, correctly
+    preserved for a tab that's actually gone rather than just refreshing."""
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
+        first_id = ws.receive_json()["session_id"]
+
+    _wait_terminated(client, first_id, admin_token)  # let the grace window lapse
+
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws2:
+        established = ws2.receive_json()
+        assert established["session_id"] != first_id
+        assert established["reconnected"] is False
+
+    first_row = client.get(
+        f"/api/v1/sessions/{first_id}", headers=_bearer(admin_token)
+    ).json()
+    assert first_row["state"] == "terminated"
+    assert first_row["termination_reason"] == "websocket_disconnect"
+
+
+def test_a_different_token_never_reattaches_even_if_reconnecting_instantly(
+    client, admin_token, user_token
+):
+    """Reattachment is scoped to the EXACT token (its `jti`), not "this user
+    reconnected recently" -- a genuine second login (a different token, even
+    for the same account) must always open its own independent session, same
+    as before this hardening pass, regardless of timing."""
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
+        first_id = ws.receive_json()["session_id"]
+
+    me = client.get("/api/v1/auth/me", headers=_bearer(user_token)).json()
+    second_token = create_access_token(me["id"])
+
+    # reconnect immediately (well inside the grace window) but with a
+    # DIFFERENT token for the same account.
+    with client.websocket_connect(f"{WS_PATH}?token={second_token}") as ws2:
+        established = ws2.receive_json()
+        assert established["session_id"] != first_id
+        assert established["reconnected"] is False
+
+
+# --------------------------------------------------------------------------- #
 # Handshake auth
 # --------------------------------------------------------------------------- #
 def test_ws_rejects_missing_token(client):
@@ -135,7 +226,18 @@ def test_get_current_session_for_caller(client, admin_token, user_token):
         ).json()
         assert current["id"] == session_id
 
-    # once the socket closes there is no active session
+    # 2026-09-16: an ordinary socket close is no longer instantly final -- it
+    # sits inside the reconnect-grace window (see sessions.py's WS handler)
+    # in case the same tab reconnects, so the session is still "current"
+    # immediately after the `with` block exits.
+    current = client.get("/api/v1/sessions/current", headers=_bearer(user_token)).json()
+    assert current is not None
+    assert current["id"] == session_id
+
+    # only once the grace window actually elapses with nobody reattaching
+    # does it stop being the caller's current session.
+    body = _wait_terminated(client, session_id, admin_token)
+    assert body["state"] == "terminated"
     assert client.get("/api/v1/sessions/current", headers=_bearer(user_token)).json() is None
 
 

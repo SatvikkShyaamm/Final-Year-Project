@@ -8,9 +8,11 @@ the admin read surface, and the enforcer backends.
 """
 from __future__ import annotations
 
+import time
 from contextlib import suppress
 
 from app.core.config import get_settings
+from app.core.security import create_access_token
 from app.models.acl import ACLState
 from app.services import acl as acl_service
 from app.services.acl import store as acl_store
@@ -90,7 +92,13 @@ def test_session_close_removes_acl_rule(client, db_session):
         ipset_name = rule_before["ipset_name"]
         client_ip = rule_before["client_ip"]
 
-    # socket closed -> session terminated -> ACL remove task enqueued
+    # socket closed -> session terminated -> ACL remove task enqueued.
+    # 2026-09-16: an ordinary disconnect now sits in a short reconnect-grace
+    # window first (see sessions.py's WS handler) in case the same tab
+    # reconnects, so the ACL isn't torn down until that window actually
+    # lapses -- comfortably short in tests, see conftest.py's
+    # `_fast_reconnect_grace`, but still real wall-clock time to wait out.
+    time.sleep(get_settings().session_reconnect_grace_seconds + 0.2)
     acl_service.drain_queue(db_session)
     rule = _rule_for_session(client, admin_token, session_id)
     assert rule["state"] == ACLState.REMOVED
@@ -106,11 +114,19 @@ def test_session_close_removes_acl_rule(client, db_session):
 def test_refcount_keeps_entry_until_last_session_closes(client, db_session):
     admin_token = _admin_token(client)
     user_token = _user_token(client)
+    # 2026-09-16: a SECOND real login mints its own token/jti, so it opens
+    # its own independent session -- exactly what two concurrent devices on
+    # the same IP would do in reality. Reusing `user_token` for both sockets
+    # would instead have the second one reattach to the first's session (same
+    # jti), collapsing this test's whole "two sessions, one IP" premise; see
+    # sessions.py's WS handler and get_active_session_by_token_jti.
+    me = client.get("/api/v1/auth/me", headers=_bearer(user_token)).json()
+    user_token_2 = create_access_token(me["id"])
 
     ws1 = client.websocket_connect(f"{WS_PATH}?token={user_token}")
     sock1 = ws1.__enter__()
     sid1 = sock1.receive_json()["session_id"]
-    ws2 = client.websocket_connect(f"{WS_PATH}?token={user_token}")
+    ws2 = client.websocket_connect(f"{WS_PATH}?token={user_token_2}")
     sock2 = ws2.__enter__()
     sock2.receive_json()
 
@@ -120,14 +136,19 @@ def test_refcount_keeps_entry_until_last_session_closes(client, db_session):
     assert acl_store.get_refcount(ip) == 2
     assert ip in acl_store.kernel_members(ipset_name)
 
-    # close the first — entry must stay for the second
+    # close the first — entry must stay for the second. An ordinary
+    # disconnect now sits in a short reconnect-grace window before it's
+    # actually finalized (2026-09-16) -- wait it out, same as
+    # test_session_close_removes_acl_rule above.
     ws1.__exit__(None, None, None)
+    time.sleep(get_settings().session_reconnect_grace_seconds + 0.2)
     acl_service.drain_queue(db_session)
     assert acl_store.get_refcount(ip) == 1
     assert ip in acl_store.kernel_members(ipset_name)
 
     # close the second — now it goes
     ws2.__exit__(None, None, None)
+    time.sleep(get_settings().session_reconnect_grace_seconds + 0.2)
     acl_service.drain_queue(db_session)
     assert acl_store.get_refcount(ip) == 0
     assert ip not in acl_store.kernel_members(ipset_name)

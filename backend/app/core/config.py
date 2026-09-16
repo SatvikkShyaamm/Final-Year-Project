@@ -43,13 +43,28 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 30
 
     # ---- Session lifecycle (Module 3) ----
-    # An application session ends when its WebSocket closes; these bound how
-    # long an *idle* or *very old* session may linger if the socket somehow
-    # stays half-open. All tunable for Module 10's evaluation.
+    # An application session ends when its WebSocket closes AND stays closed
+    # past session_reconnect_grace_seconds (2026-09-16 -- see that setting);
+    # session_idle_timeout_minutes/session_max_lifetime_minutes bound how long
+    # an *idle* or *very old* session may otherwise linger if the socket
+    # somehow stays half-open. All tunable for Module 10's evaluation.
     session_idle_timeout_minutes: int = 30
     session_max_lifetime_minutes: int = 480
     session_sweep_interval_seconds: int = 30
     session_ws_heartbeat_seconds: int = 20
+    # 2026-09-16: how long an ordinary WebSocket drop (tab closed OR a page
+    # refresh -- the two are indistinguishable at the transport level) is held
+    # as still-ACTIVE-but-disconnected before being finalized as a genuine
+    # close. A reconnect within this window that presents the SAME access
+    # token (same jti -- see app.services.session.service.
+    # get_active_session_by_token_jti) reattaches to this exact session
+    # instead of opening a new one, so a page refresh no longer resets an
+    # in-progress Module 7 trust score (or silently drops a pending re-verify
+    # challenge) back to a fresh login-time baseline. Deliberately a short,
+    # dedicated window -- NOT session_idle_timeout_minutes's 30 minutes -- so
+    # a tab that's actually just closed still loses its ACL/session quickly,
+    # matching this project's own "revoke fast" framing everywhere else.
+    session_reconnect_grace_seconds: float = 5.0
 
     # ---- Dynamic ACL (Module 4) ----
     # Which enforcement backend the L-PEP worker uses:

@@ -19,7 +19,7 @@ from sqlalchemy.pool import StaticPool
 
 import app.models  # noqa: F401  (register all ORM models on Base.metadata)
 from app.core.config import get_settings
-from app.core.database import Base, get_db
+from app.core.database import Base, SessionLocal, get_db
 from app.main import app
 from app.services.acl.enforcer import reset_enforcer
 
@@ -70,6 +70,26 @@ def _acl_test_env(monkeypatch):
     reset_enforcer()
 
 
+@pytest.fixture(autouse=True)
+def _fast_reconnect_grace(monkeypatch):
+    """A short `session_reconnect_grace_seconds` for every test (2026-09-16
+    hardening -- see app/api/v1/endpoints/sessions.py's WS handler).
+
+    Production defaults to 5s, generous enough for a real page refresh over a
+    slow connection. Tests need the opposite trade-off: existing polling
+    helpers like `_wait_terminated` (tries=20, 0.05s sleep = a 1s budget) were
+    written assuming an ordinary disconnect finalizes near-instantly, and
+    keeping that budget correct without editing every one of those tests
+    means the grace window here has to stay comfortably under it. 0.3s
+    leaves 20x headroom (in-process ASGI transport reconnects in low single-
+    digit milliseconds, no real network involved) for a reattach test's
+    "reconnect immediately with the same token" step to land safely inside
+    the window, while `_wait_terminated`'s 1s budget still lands safely
+    outside it for tests that want the eventual finalize instead."""
+    settings = get_settings()
+    monkeypatch.setattr(settings, "session_reconnect_grace_seconds", 0.3, raising=False)
+
+
 @pytest.fixture()
 def db_engine():
     engine = create_engine(
@@ -105,7 +125,7 @@ def db_session(_testing_session_local):
 
 
 @pytest.fixture()
-def client(_testing_session_local):
+def client(_testing_session_local, db_engine):
     def override_get_db():
         db = _testing_session_local()
         try:
@@ -120,6 +140,25 @@ def client(_testing_session_local):
                 db.close()
 
     app.dependency_overrides[get_db] = override_get_db
+
+    # 2026-09-16: dependency_overrides only reaches code that asks for the DB
+    # via FastAPI's own Depends(get_db) resolution -- it has no effect on
+    # code that opens its own session straight from app.core.database.
+    # SessionLocal, which is exactly what app.main's idle/lifetime sweeper
+    # background task already does, and what sessions.py's new reconnect-
+    # grace `_finalize_disconnect` background task does too. SessionLocal is
+    # a sessionmaker INSTANCE, not a plain reference, so every module that
+    # did `from app.core.database import SessionLocal` holds the SAME object
+    # -- reconfiguring its bind here (rather than swapping which object the
+    # name points to) reaches all of them, including ones already imported
+    # long before this fixture runs. Without this, those two background
+    # paths try to reach the real (Postgres) database_url from settings,
+    # which doesn't exist in CI, and silently never finish their job -- this
+    # is the exact "OperationalError: Connection refused" this hardening
+    # pass's own new tests surfaced; the sweeper had the identical latent gap
+    # all along, just never exercised because it only wakes on a 30s timer
+    # that essentially never fires within one fast test.
+    SessionLocal.configure(bind=db_engine)
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()

@@ -16,6 +16,7 @@ from app.services.session.fsm import (
 from app.services.session.service import (
     count_active,
     create_session,
+    get_active_session_by_token_jti,
     get_current_session_for_user,
     get_session,
     list_sessions,
@@ -32,6 +33,7 @@ __all__ = [
     "can_transition",
     "count_active",
     "create_session",
+    "get_active_session_by_token_jti",
     "get_current_session_for_user",
     "get_session",
     "list_sessions",

@@ -8,10 +8,20 @@ Module 3 — Session Lifecycle.
     DELETE /sessions/{id}            admin: force-terminate a session
 
 The socket is the base paper's SS-PDP signalling channel: its onopen drives
-FSM S1 -> S2 (session active), its onclose drives S2 -> S3 -> gone. Logout
-(Module 2 endpoint), an admin DELETE here, and the idle sweeper (app.main)
-are the other ways a session leaves S2 — all of them go through
-``services.session.terminate_session`` so the FSM stays authoritative.
+FSM S1 -> S2 (session active); its onclose drives S2 -> S3 -> gone, but
+(2026-09-16) not instantly — an ordinary drop (tab closed, or a page refresh,
+indistinguishable at the transport level) is held for a short
+`session_reconnect_grace_seconds` window first, since a reconnect presenting
+the SAME access token within that window is treated as the SAME browser tab
+resuming, and reattaches to this exact session (see the handshake's
+`get_active_session_by_token_jti` lookup and `_finalize_disconnect` below)
+rather than opening a fresh one with a reset trust score. Logout (Module 2
+endpoint), an admin DELETE here, and the idle sweeper (app.main) are the
+other ways a session leaves S2 — all of them go through
+``services.session.terminate_session`` so the FSM stays authoritative, and
+none of them go through the reconnect-grace path (they've already recorded
+a real reason before the socket closes, so the handler's `finally` block
+finalizes them immediately, exactly as before this hardening pass).
 
 The session-service calls below are synchronous (sync SQLAlchemy, as
 everywhere in this codebase). They are single-row operations, so the async
@@ -30,14 +40,17 @@ from starlette.websockets import WebSocketDisconnect
 
 from app.api.deps import CurrentAdmin, CurrentUser, get_db
 from app.core.config import get_settings
+from app.core.database import SessionLocal
 from app.core.logging import get_logger
-from app.models.session import SessionState, TerminationReason
+from app.core.security import create_mfa_token
+from app.models.session import SessionState, TerminationReason, utcnow
 from app.schemas.session import (
     SessionListResponse,
     SessionRead,
     SessionTerminateResponse,
 )
 from app.services import acl as acl_service
+from app.services import mfa as mfa_service
 from app.services import session as session_service
 from app.services.trust_score import continuous as continuous_service
 from app.ws.auth import WsAuthError, resolve_ws_user
@@ -194,6 +207,46 @@ async def _handle_client_message(websocket: WebSocket, raw: str) -> None:
         await _send_json(websocket, {"type": "pong", "server_time": _now_iso()})
 
 
+async def _finalize_disconnect(session_id: str, disconnect_marker: datetime) -> None:
+    """
+    Runs `session_reconnect_grace_seconds` after an ordinary WS drop (see the
+    handler's `finally` block below) and finalizes the close ONLY if nothing
+    reattached in the meantime. 2026-09-16 hardening.
+
+    Uses its own short-lived DB session via `SessionLocal` directly (the same
+    pattern app.main's `_session_sweeper` background task already uses) --
+    the request-scoped `db` the handler received is closed by the time this
+    fires, since the handler itself has already returned.
+
+    `disconnect_marker` is that session's `last_seen_at` AT THE MOMENT this
+    particular drop was detected (captured by the caller, not read fresh
+    here) -- guards against a subtle race: if the client reattaches and then
+    disconnects AGAIN before this task's sleep finishes, `last_seen_at` will
+    have moved past this marker (the reattach's own `touch_session` bumped
+    it), so this stale task backs off and leaves finalizing to the SECOND
+    drop's own, separately-scheduled `_finalize_disconnect` -- otherwise a
+    slow first task could cut the second drop's own grace window short.
+    """
+    await asyncio.sleep(max(0.0, settings.session_reconnect_grace_seconds))
+    db = SessionLocal()
+    try:
+        session = session_service.get_session(db, session_id)
+        if session is None or session.state != SessionState.ACTIVE:
+            return  # already terminated some other way (or never existed)
+        if session.ws_connected:
+            return  # reattached, and still connected right now
+        if session.last_seen_at > disconnect_marker:
+            return  # reattached, then dropped again -- that drop owns this
+        session_service.terminate_session(
+            db, session_id, reason=TerminationReason.WEBSOCKET_DISCONNECT
+        )
+        logger.info(
+            "session finalized after reconnect grace window id=%s", session_id
+        )
+    finally:
+        db.close()
+
+
 @router.websocket("/ws/session")
 async def session_ws(
     websocket: WebSocket,
@@ -210,24 +263,43 @@ async def session_ws(
 
     await websocket.accept()
 
-    # --- open the session (FSM S1 -> S2) ---
-    try:
-        session = session_service.create_session(
-            db,
-            user=user,
-            ip_address=_client_ip(websocket),
-            user_agent=websocket.headers.get("user-agent"),
-            token_jti=resolved.token_jti,
-            token_exp=resolved.token_exp,
+    # --- open or reattach the session (FSM S1 -> S2) ---
+    # 2026-09-16: a page refresh (or any ordinary tab-drop-and-reconnect
+    # within the grace window below) presents the SAME access token it
+    # already had -- same `jti` -- unlike a genuine new login, which always
+    # mints a fresh one. Reattaching to that still-ACTIVE session instead of
+    # opening a brand-new one is what stops a refresh from silently resetting
+    # an in-progress Module 7 trust score back to a fresh login-time
+    # baseline, and from dropping a pending re-verify challenge on the floor.
+    reattached = False
+    existing = session_service.get_active_session_by_token_jti(db, resolved.token_jti)
+    if existing is not None:
+        session = existing
+        reattached = True
+        session_service.touch_session(db, session.id)
+        session_service.set_ws_connected(db, session.id, True)
+        logger.info(
+            "ws reattached session=%s user_id=%s (reconnect within grace window)",
+            session.id, user.id,
         )
-    except Exception:  # noqa: BLE001
-        logger.exception("failed to open session for user_id=%s", user.id)
-        await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="session open failed")
-        return
+    else:
+        try:
+            session = session_service.create_session(
+                db,
+                user=user,
+                ip_address=_client_ip(websocket),
+                user_agent=websocket.headers.get("user-agent"),
+                token_jti=resolved.token_jti,
+                token_exp=resolved.token_exp,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to open session for user_id=%s", user.id)
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="session open failed")
+            return
+        session_service.set_ws_connected(db, session.id, True)
 
     session_id = session.id
     manager.register(session_id, websocket)
-    session_service.set_ws_connected(db, session_id, True)
     await _send_json(
         websocket,
         {
@@ -236,12 +308,57 @@ async def session_ws(
             "state": SessionState.ACTIVE,
             "server_time": _now_iso(),
             "user": {"id": user.id, "username": user.username, "role": user.role},
-            # Static trust score, computed by the session_opened hook (Module 5).
+            # On a fresh session this is the static score Module 5 computed at
+            # open. On a reattach it's whatever Module 7 last recomputed it to
+            # -- deliberately NOT reset, that's the whole point of reattaching.
             "trust_score": session.trust_score,
             "risk_level": session.risk_level,
+            "reconnected": reattached,
         },
     )
     logger.info("ws attached session=%s user_id=%s", session_id, user.id)
+
+    if reattached:
+        # A pending Module 7 re-verify challenge was pushed once, down the
+        # NOW-DEAD socket this session had before the drop -- the client's
+        # ReverifyModal has no way to know it's still outstanding unless this
+        # resends it. Mirrors _push_result's own construction in
+        # app/api/v1/endpoints/security.py exactly, so the client sees the
+        # identical payload shape whether this is the first push or a resend
+        # -- with one deliberate exception: `challenge.dev_code` (the SMTP-
+        # unconfigured dev/demo convenience that echoes the raw code back)
+        # only ever lives on the in-memory object `mfa_service.create_challenge`
+        # returned at the moment of creation (`build_challenge_out` reads a
+        # transient `_plaintext_code` attribute -- see mfa/service.py); it is
+        # never persisted, by design, since storing a real OTP in cleartext
+        # anywhere would be the actual security regression. A freshly
+        # re-queried row here (has_open_retrigger_challenge runs its own
+        # SELECT) is a different Python object without that attribute, so a
+        # resent push always has `dev_code: null` even though the original
+        # one didn't -- everything else about the challenge (id, reason,
+        # expiry, remaining attempts) is identical. Acceptable: this only
+        # affects the local/demo convenience code path in the first place,
+        # and the original code is still sitting in that session's server log.
+        pending_challenge = continuous_service.has_open_retrigger_challenge(db, session_id)
+        if pending_challenge is not None:
+            mfa_token = create_mfa_token(
+                session.user_id, pending_challenge.id,
+                expires_minutes=settings.mfa_challenge_ttl_minutes,
+            )
+            challenge_out = mfa_service.build_challenge_out(pending_challenge, mfa_token=mfa_token)
+            await _send_json(
+                websocket,
+                {
+                    "type": "trust.reverify_required",
+                    "session_id": session_id,
+                    "risk_level": session.risk_level,
+                    "trust_score": session.trust_score,
+                    "challenge": challenge_out.model_dump(mode="json"),
+                },
+            )
+            logger.info(
+                "resent pending reverify challenge on reattach session=%s", session_id
+            )
 
     heartbeat = max(1, settings.session_ws_heartbeat_seconds)
     reason = TerminationReason.WEBSOCKET_DISCONNECT
@@ -286,9 +403,29 @@ async def session_ws(
                 await recv_task
         manager.unregister(session_id)
         session_service.set_ws_connected(db, session_id, False)
-        # Idempotent: if logout/admin/sweep already terminated it, this keeps
-        # the original reason; otherwise this is the real S2 -> S3 close.
-        session_service.terminate_session(db, session_id, reason=reason)
+        if reason == TerminationReason.WEBSOCKET_DISCONNECT:
+            # 2026-09-16: don't finalize an ordinary drop immediately -- give
+            # the same browser tab a short window (session_reconnect_grace_
+            # seconds) to reconnect with the same token and reattach to THIS
+            # session instead of losing its accumulated trust score / pending
+            # reverify challenge to a freshly-scored new one (see the
+            # reattach block above and _finalize_disconnect's own docstring).
+            # A fresh read here (not the `current` from inside the loop,
+            # which may be stale or never assigned if the WebSocketDisconnect
+            # exception fired before the loop's own next iteration) is what
+            # `_finalize_disconnect` compares its wake-up state against.
+            current_row = session_service.get_session(db, session_id)
+            disconnect_marker = current_row.last_seen_at if current_row else utcnow()
+            asyncio.create_task(_finalize_disconnect(session_id, disconnect_marker))
+        else:
+            # Already ended for a real, already-recorded reason (logout /
+            # admin / sweep / risk-revoke) -- this is just the idempotent
+            # confirmation, not a fresh decision, so it happens immediately
+            # exactly as before this hardening pass.
+            session_service.terminate_session(db, session_id, reason=reason)
         with suppress(Exception):
             await websocket.close()
-        logger.info("ws detached session=%s reason=%s", session_id, reason)
+        logger.info(
+            "ws detached session=%s reason=%s grace_scheduled=%s",
+            session_id, reason, reason == TerminationReason.WEBSOCKET_DISCONNECT,
+        )

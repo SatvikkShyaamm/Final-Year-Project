@@ -192,6 +192,80 @@ def test_second_medium_event_reuses_the_pending_challenge_no_spam(
         assert push2["challenge"]["challenge_id"] == challenge_id
 
 
+# --------------------------------------------------------------------------- #
+# reconnect reattach resends a pending reverify challenge (2026-09-16 hardening)
+#
+# This is the exact bug report the hardening pass closes: refreshing the page
+# while a re-verify challenge is outstanding used to open a brand-new session
+# (fresh score, no memory of the challenge), silently letting the user dodge
+# MFA entirely. Now the refresh reattaches to the SAME session (see
+# test_sessions.py's own reattach tests for that mechanism in isolation) --
+# this file's job is to confirm the reattach also puts the reverify prompt
+# back in front of the client, not just the number.
+# --------------------------------------------------------------------------- #
+def test_refresh_reconnect_resends_the_pending_reverify_challenge(
+    client, admin_token, user_token, db_session
+):
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
+        session_id = ws.receive_json()["session_id"]
+        _force_score(db_session, session_id, 85, "LOW")
+
+        resp = _post_event(
+            client, admin_token, session_id, SecurityEventType.VPN_DETECTED, ip_address="185.220.100.7"
+        )
+        assert resp.json()["action"] == "reverify"
+        challenge_id = resp.json()["mfa_challenge_id"]
+        first_push = ws.receive_json()
+        assert first_push["type"] == "trust.reverify_required"
+        # the tab "refreshes" here -- `with` block exit closes this socket.
+
+    # reconnect with the SAME token, well inside the reconnect-grace window.
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws2:
+        established = ws2.receive_json()
+        assert established["session_id"] == session_id      # reattached, not fresh
+        assert established["reconnected"] is True
+        assert established["trust_score"] == 70              # NOT reset by the refresh
+        assert established["risk_level"] == "MEDIUM"
+
+        resent = ws2.receive_json()
+        assert resent["type"] == "trust.reverify_required"
+        assert resent["session_id"] == session_id
+        assert resent["risk_level"] == "MEDIUM"
+        assert resent["trust_score"] == 70
+        assert resent["challenge"]["challenge_id"] == challenge_id  # same challenge
+        assert resent["challenge"]["mfa_token"]                     # a usable token
+        assert resent["challenge"]["reason"] == "risk_retrigger"
+        # dev_code is NOT re-echoed on a resend -- it's a transient,
+        # never-persisted attribute of the object create_challenge originally
+        # returned (see mfa/service.py's build_challenge_out); a resend reads
+        # a freshly re-queried row, which never carries it. The real code is
+        # still visible in that session's server log from the first push.
+        assert resent["challenge"]["dev_code"] is None
+
+    # the underlying MFAChallenge row itself was never disturbed by the
+    # reattach -- still exactly one pending challenge, still answerable.
+    row = client.get(f"/api/v1/sessions/{session_id}", headers=_bearer(admin_token)).json()
+    assert row["current_action"] == "reverify_required"
+
+
+def test_reconnect_without_a_pending_challenge_gets_no_reverify_push(
+    client, admin_token, user_token, db_session
+):
+    """The resend is conditional -- a reattach on an otherwise-ordinary LOW
+    session must not manufacture a challenge that was never there."""
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
+        session_id = ws.receive_json()["session_id"]
+
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws2:
+        established = ws2.receive_json()
+        assert established["session_id"] == session_id
+        assert established["reconnected"] is True
+        # nothing else should arrive on this socket -- no reverify push queued.
+        ws2.send_json({"type": "ping"})
+        reply = ws2.receive_json()
+        assert reply["type"] == "pong"
+
+
 def test_reverify_success_keeps_session_alive_without_restoring_score(
     client, admin_token, user_token, db_session
 ):
