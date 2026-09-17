@@ -50,16 +50,20 @@ failed-login burst counter, the token-revocation denylist, the MFA
 lockout): a Redis outage lets a login through rather than locking every
 account out over an infrastructure blip.
 
-No admin "unlock" UI yet (deliberately deferred -- see Project status.md
-and the project's account-risk-lockout plan doc). The documented fallback
-if you get stuck (including as the only admin account) is clearing the
-Redis keys by hand:
+An admin "unlock" UI was deliberately deferred out of this module when it
+shipped (see Project status.md and the project's account-risk-lockout plan
+doc) -- it is now built in Module 8 (`GET /dashboard/lockouts`,
+`DELETE /dashboard/lockouts/{user_id}`, see `list_risk_lockouts` /
+`clear_risk_lockout` below), which wraps the same manual fallback that
+remains true and available directly against Redis if ever needed (e.g. no
+admin account is reachable to use the dashboard itself):
 
     redis-cli DEL ztsaacm:risk_lockout:<user_id> ztsaacm:risk_offense:<user_id>
 """
 from __future__ import annotations
 
 import redis
+from sqlalchemy.orm import Session as DbSession
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -128,3 +132,59 @@ def record_risk_offense(user_id: int) -> None:
         )
     except redis.RedisError:
         logger.debug("redis risk offense record failed for user_id=%s", user_id, exc_info=True)
+
+
+# --------------------------------------------------------------------------- #
+# Admin visibility/recovery (Module 8) -- turns the manual redis-cli fallback
+# documented above into a real dashboard panel/button.
+# --------------------------------------------------------------------------- #
+def list_risk_lockouts(db: DbSession) -> list[dict]:
+    """Every account currently under this lockout -- Module 8's admin
+    "Locked Accounts" panel. Redis IS the source of truth for who's locked
+    out; this scans the (small, bounded -- one key per currently-locked
+    account) key namespace directly and joins a username/email from
+    Postgres for display."""
+    from app.models.user import User
+
+    out: list[dict] = []
+    try:
+        r = get_redis()
+        for key in r.scan_iter(match="ztsaacm:risk_lockout:*"):
+            ttl = r.ttl(key)
+            if not ttl or ttl <= 0:
+                continue
+            try:
+                user_id = int(key.rsplit(":", 1)[-1])
+            except ValueError:
+                continue
+            tier_raw = r.get(key)
+            try:
+                tier = int(tier_raw) if tier_raw is not None else None
+            except ValueError:
+                tier = None
+            user = db.get(User, user_id)
+            out.append(
+                {
+                    "user_id": user_id,
+                    "username": user.username if user else None,
+                    "email": user.email if user else None,
+                    "lock_type": "risk",
+                    "retry_after_seconds": ttl,
+                    "tier": tier,
+                }
+            )
+    except redis.RedisError:
+        logger.warning("redis list_risk_lockouts failed", exc_info=True)
+    return out
+
+
+def clear_risk_lockout(user_id: int) -> bool:
+    """Admin unlock (Module 8) -- turns the documented manual fallback
+    (`redis-cli DEL ztsaacm:risk_lockout:<id> ztsaacm:risk_offense:<id>`)
+    into a real button. Returns True if anything was actually cleared."""
+    try:
+        removed = get_redis().delete(_lockout_key(user_id), _offense_key(user_id))
+        return bool(removed)
+    except redis.RedisError:
+        logger.warning("redis clear_risk_lockout failed for user_id=%s", user_id, exc_info=True)
+        return False

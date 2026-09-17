@@ -2,7 +2,7 @@
 
 ## 1. Current Status
 
-Current Module: Module 8 – Security Dashboard (next)
+Current Module: Module 9 – Attack Simulation (next)
 Overall Project Status: Core base-paper flow complete (Modules 1-4) + static
 Trust Score (Module 5) + risk-gated Adaptive MFA at login (Module 6) + a
 post-Module-6 hardening pass closing the server-side token-revocation and
@@ -11,13 +11,17 @@ Evaluation (Module 7): mid-session security events recompute a session's
 LIVE trust score and can re-trigger the same email MFA or revoke the
 session/ACL/token outright — hardened 2026-09-13/14 with a shorter
 re-verification window, an account-level MFA lockout, and an account-level
-RISK lockout, and, as of 2026-09-15, with **Real Passive Network Detection**
-(Section 18): a periodic authenticated heartbeat now drives `ip_change` /
-`vpn_detected` / `unknown_device` / `abnormal_request_rate` events
-automatically from a real user's own traffic, so Module 7 no longer depends
-on an admin manually clicking "Trigger" to produce a security event — see
-section 21.
-Modules 8-10 not started.
+RISK lockout; hardened 2026-09-15 with **Real Passive Network Detection**
+(Section 18, sections 21-22): a periodic authenticated heartbeat now drives
+`ip_change` / `vpn_detected` / `unknown_device` / `abnormal_request_rate`
+events automatically from a real user's own traffic (the latter counting
+every non-GET authenticated call, not just heartbeats), so Module 7 no
+longer depends on an admin manually clicking "Trigger"; and hardened
+2026-09-16 with cascading account-lockout termination and a page-refresh
+reconnect-reattach fix (sections 23-24). Module 8 – Security Dashboard is
+now also complete (section 25): real Dashboard Home/Analytics aggregates,
+an admin lockout-management panel, and a live admin WebSocket feed.
+Modules 9-10 not started.
 
 |         Module                         |              Status          |
 |----------------------------------------|------------------------------|
@@ -27,8 +31,8 @@ Modules 8-10 not started.
 | Module 4 – Dynamic ACL                 | Completed & independently verified |
 | Module 5 – Trust Score Engine          | Completed                    |
 | Module 6 – Adaptive MFA                | Completed & independently verified (MFA method revised 2026-09-10 — see section 11) |
-| Module 7 – Continuous Trust Evaluation | Completed — see section 16; hardened with account-level lockouts (sections 17-18), live-display fixes (sections 19-20), and Real Passive Network Detection (section 21) |
-| Module 8 – Security Dashboard          | Not started                  |
+| Module 7 – Continuous Trust Evaluation | Completed — see section 16; hardened with account-level lockouts (sections 17-18), live-display fixes (sections 19-20), Real Passive Network Detection (sections 21-22), cascading lockout termination + reconnect-reattach (sections 23-24) |
+| Module 8 – Security Dashboard          | Completed — see section 25   |
 | Module 9 – Attack Simulation           | Not started                  |
 | Module 10 – Testing & Evaluation       | Not started                  |
 
@@ -346,6 +350,51 @@ one-time code, never TOTP).
   HIGH-crossing revocation, validation, RBAC, unit tests. Full backend suite:
   **98 passing** (83 prior, per section 11, + 15 new). `frontend` type-checks
   and builds clean.
+
+Module 7 was subsequently hardened through five further passes, all recorded
+in their own sections: a shorter re-verification window + account-level MFA
+lockout (section 17), an account-level risk lockout (section 18), two
+frontend live-score-display fixes (sections 19-20), Real Passive Network
+Detection — genuine automatic event detection off real heartbeat traffic
+(sections 21-22), and cascading account-lockout termination + a page-refresh
+reconnect-reattach fix (sections 23-24). By the end of section 24 the full
+backend suite stood at **141 passing**.
+
+### Module 8 — Security Dashboard (2026-09-17 — see section 25 for the full implementation/verification writeup)
+
+Implemented against Section 5 of `MASTER_PROJECT_CONTEXT.docx` (the
+Dashboard Home / Analytics field lists) and Section 18's own "no admin
+unlock UI yet — natural fit for Module 8" deferral (sections 17b/18 above).
+
+- **Pure aggregation, zero new persisted state** — `app/services/dashboard/`
+  reads Modules 2-7's own tables/Redis state only; no model, no migration.
+- **`GET /dashboard/overview`** (admin) — active users/sessions, average
+  trust score, HIGH-band active sessions, pending MFA requests, sessions
+  revoked specifically for risk, current ACL rules + its avg authorization/
+  revocation latency, and a combined locked-accounts count.
+- **`GET /dashboard/analytics`** (admin) — login activity (sessions/day,
+  real counts only — no fabricated multi-day failed-login trend, since
+  Module 5's own counter has no historical record to chart), trust-score
+  distribution, risk-level breakdown, MFA events by status, revoked sessions
+  by reason, security alerts by event type.
+- **Admin lockout panel** (`GET`/`DELETE /dashboard/lockouts/{id}`) — lists
+  and clears both the Module 6 MFA lockout and the Module 7 risk lockout,
+  turning their documented manual `redis-cli DEL` fallback into a real
+  button.
+- **`WS /ws/dashboard`** (admin-only) — forwards the session/ACL/MFA event
+  channels every earlier module already publishes to, plus a new
+  `ztsaacm:events:security` channel Module 7 gained alongside this module —
+  Section 5's "real-time updates via WebSocket" requirement. Purely
+  additive: every admin page keeps its existing REST polling as the real
+  data path; a live push only makes it refetch sooner.
+- **Frontend**: `DashboardHome.tsx` and `Analytics.tsx` (placeholders since
+  Module 1) are now real; `DashboardHome` also renders the new Locked
+  Accounts panel.
+- **Tests**: `backend/tests/test_dashboard.py` (12 tests) — overview/
+  analytics/lockouts RBAC, real state reflection, both lockout types listed
+  and cleared, the dashboard WebSocket's admin gating and live forwarding.
+  Full backend suite: **153 passing** (141 prior + 12 new). `frontend`
+  type-checks and builds clean.
 
 ---
 
@@ -3030,3 +3079,238 @@ and ACL within seconds, exactly as before. The specific bypass this closes
 root cause in Module 3's session-identity model, not patched around in
 Module 7. Every prior module and hardening pass remains otherwise intact.
 Still ready to proceed to **Module 8 — Security Dashboard**.
+
+---
+
+## 25. Module 8 — Security Dashboard: Implementation + Verification (2026-09-17)
+
+Before starting, re-read `MASTER_PROJECT_CONTEXT.docx` in full (Section 5's
+Dashboard Home/Live Session Monitoring/Trust Score Monitoring/Security
+Alerts/ACL Monitor/Analytics field lists; Section 9's Module 8 description;
+Section 18's own "no admin unlock UI yet ... natural fit for Module 8"
+deferral), this `Project status.md` in full (sections 1-24 — the entire
+Module 7 build-and-hardening history, since Module 8 aggregates over all of
+it), `docs/architecture.md` in full, and every backend/frontend file this
+module needed to read from (session/ACL/trust-score/MFA/security-event
+models and services, the three existing Redis event-publish call sites, both
+lockout modules, `LiveSessions.tsx`/`TrustScorePage.tsx`/`SecurityAlerts.tsx`
+for the established admin-page polling pattern, and the still-placeholder
+`DashboardHome.tsx`/`Analytics.tsx`/`dashboard.py`) — confirmed against the
+actual current code, not any prior description of it. Also confirmed, before
+writing anything, that `MASTER_PROJECT_CONTEXT.docx` had been locally edited
+(uncommitted) since the last session touched this project — re-extracted and
+re-read it fresh rather than trusting a stale copy.
+
+### What was found already built
+
+Most of Module 8's own field list was, in fact, already real by the end of
+Module 7's hardening: Live Session Monitoring (`LiveSessions.tsx` — user,
+session id, IP, device, login time, duration, trust score, risk level,
+WebSocket status, ACL status, and current action are all live), Trust Score
+Monitoring (`TrustScorePage.tsx` — score, risk, history, factor breakdown),
+Security Alerts (`SecurityAlerts.tsx` — MFA events feed + the Module 7
+continuous-evaluation events feed), and ACL Monitor (`ACLMonitor.tsx`) were
+each built incrementally by the module that introduced the state they show,
+per this project's own "each module produces a working deliverable" sequencing
+rule (Section 12). What remained genuinely unbuilt were exactly the two
+pieces still rendering `PlaceholderCard` since Module 1 — Dashboard Home and
+Analytics — plus the admin lockout-unlock UI explicitly deferred out of
+Modules 6/7, and a genuine real-time push channel (every admin page so far
+only polls REST on an interval). This section's scope is precisely those
+gaps, not a rebuild of pages that were already real.
+
+### What was built
+
+- **`backend/app/services/dashboard/`** (new package, `service.py` +
+  `__init__.py`) — pure read aggregation over Modules 2-7's own tables
+  (`sessions`, `acl_rules`, `mfa_challenges`, `security_events`) and their
+  Redis-backed lockout keys. No FastAPI imports, no new model, no migration —
+  this module computes nothing that wasn't already true elsewhere, it only
+  reads and counts it.
+  - `overview()` — `active_users` (distinct `user_id` with an ACTIVE
+    session), `active_sessions` (reuses Module 3's `count_active`),
+    `average_trust_score` (reuses Module 5's `average_trust_score(active_only=True)`
+    unchanged), `high_risk_sessions` (ACTIVE + `risk_level == HIGH` —
+    documented as expected to read near-zero in normal operation, since
+    Module 7 revokes a session the instant it crosses into HIGH; a nonzero
+    reading is a live health signal, not a steady-state population),
+    `mfa_requests_pending` (reuses Module 6's `count_by_status`),
+    `revoked_sessions` (sessions terminated specifically `risk_revoked` or
+    `account_locked` — deliberately not every termination reason, which
+    would dilute the one thing this stat is meant to show), `current_acl_rules`
+    + `avg_authorization_latency_ms`/`avg_revocation_latency_ms` (reuse
+    Module 4's `count_active`/`average_latencies` unchanged), and
+    `locked_out_accounts` (MFA + risk lockouts combined).
+  - `analytics(days=14)` — `login_activity` (sessions opened per day, oldest
+    first; explicitly does NOT attempt a matching failed-login trend, since
+    Module 5's failed-login counter is a 15-minute Redis burst counter with
+    no historical Postgres record to chart over multiple days — a metric
+    with no real source is not offered, not fabricated, per Section 15's
+    "do not build fake data" rule), `trust_score_distribution` (10-point
+    buckets, ACTIVE sessions), `risk_levels` (ACTIVE sessions by band),
+    `mfa_events` (by status, reusing Module 6's own tally), `revoked_sessions`
+    (by termination reason — the full set this time, not narrowed to risk
+    like the overview stat above), `security_alerts` (by event type), plus
+    the same ACL latency averages.
+  - `locked_accounts()` / `clear_lockouts(user_id)` — see the lockout panel
+    below.
+- **Admin lockout panel — the deferred Module 6/7 unlock UI**:
+  - `app/services/mfa/service.py` gained `list_mfa_lockouts(db)` (SCANs
+    `ztsaacm:mfa_lockout:*`, checks each key's remaining TTL, joins a
+    username/email from Postgres) and `clear_mfa_lockout(user_id)` (deletes
+    both the lockout key and the underlying wrong-attempt counter — the
+    exact `redis-cli DEL` fallback that module's own docstring already
+    documented, now a real function).
+  - `app/services/trust_score/risk_lockout.py` gained the mirror pair,
+    `list_risk_lockouts(db)` / `clear_risk_lockout(user_id)`, additionally
+    surfacing the current escalation `tier` (1/2/3) read back from the
+    lockout key's own value. That module's docstring, which previously said
+    "No admin unlock UI yet (deliberately deferred)," now points to this
+    section instead of describing it as unbuilt.
+  - Both scans are bounded and cheap (at most one key per currently-locked
+    account at any moment) and are only ever called from the admin
+    dashboard's own polling — never a per-request hot path.
+  - `GET /dashboard/lockouts` (admin) lists both types together;
+    `DELETE /dashboard/lockouts/{user_id}` (admin) clears both for one
+    account in a single call, reporting which of the two actually had
+    something to clear.
+- **`WS /ws/dashboard`** (admin-only) — Section 5's "real-time updates via
+  WebSocket" line, which nothing before this module actually implemented
+  (every admin page so far only polls REST on a 5-second interval).
+  - Discovered while reading `app/services/session/store.py` that its own
+    docstring already said `EVENT_CHANNEL` ("`ztsaacm:events:session`") is
+    "consumed by Module 8" — confirming this was the intended design all
+    along, just never built. Module 4's ACL service and Module 6's MFA
+    service already had their own equivalent publish calls
+    (`ztsaacm:events:acl`, `ztsaacm:events:mfa`) that likewise had no
+    consumer until now.
+  - Module 7's own `continuous.py` had no such publish call yet — added one,
+    `ztsaacm:events:security`, mirroring the exact same fire-and-forget,
+    fail-open pattern the other three already used, called once per
+    `record_event()` right after its `security_events` row commits. This is
+    the only change this module made to a file outside its own new package/
+    endpoint — one new private helper and one new call site, nothing about
+    scoring, MFA re-triggering, or revocation logic touched.
+  - The handshake reuses `app.ws.auth.resolve_ws_user` (the same JWT +
+    revocation check every other socket in this app already uses), plus an
+    admin check this socket alone needs (its feed spans every user's
+    sessions/events, not just the caller's own).
+  - The loop polls `pubsub.get_message(ignore_subscribe_messages=True,
+    timeout=0)` (non-blocking) roughly every 0.25s from inside the async
+    handler, rather than a background thread bridging a blocking
+    `pubsub.listen()` — chosen deliberately to match this codebase's
+    existing, established style of making sync Redis/DB calls directly
+    inside async WS handlers (e.g. `sessions.py`'s own `session_ws` already
+    does this for `session_service` calls) instead of introducing a second
+    threading model just for this one socket.
+  - **Deliberately additive, never a new source of truth**: every existing
+    admin page keeps its REST polling exactly as it was — a live push only
+    makes a page refetch sooner than its next scheduled poll tick, it never
+    replaces the read. If Redis is ever unreachable, the socket still opens
+    and simply never pushes; nothing about the underlying REST-driven pages
+    depends on it.
+- **Frontend**:
+  - `frontend/src/api/dashboard.ts` (new) — typed wrappers for the four REST
+    endpoints above.
+  - `frontend/src/ws/dashboardSocket.ts` + `useDashboardSocket.ts` (new) —
+    a small, capped-backoff-reconnect WS client (deliberately simpler than
+    `SessionSocket`: no session lifecycle, purely a "something changed"
+    signal) and a hook exposing a `tick` counter a page's own polling effect
+    adds to its dependency array.
+  - `frontend/src/pages/admin/DashboardHome.tsx` (real, replacing the
+    Module-1 placeholder) — Section 5's nine stat cards, plus the new Locked
+    Accounts panel (table + per-row Unlock button calling the DELETE
+    endpoint), refreshing on its own 5-second poll and on every live push.
+  - `frontend/src/pages/admin/Analytics.tsx` (real, replacing the Module-1
+    placeholder) — every chart from `analytics()` above, rendered with
+    Recharts (already a dependency, first used by Module 5's
+    `TrustScorePage.tsx`) — a line chart for login activity, bar charts for
+    every other bucketed breakdown, and two plain stat tiles for the ACL
+    latency averages.
+- **`backend/tests/test_health.py`** — `/dashboard/overview` removed from
+  the "still a 501 stub" placeholder-endpoint list (it's real now); the
+  still-genuinely-unbuilt `/simulate/ip_change` (Module 9) is the only one
+  left in it.
+
+### Tests
+
+`backend/tests/test_dashboard.py` (new, 12 tests):
+
+- **RBAC** — `/dashboard/overview`, `/dashboard/analytics`, and
+  `/dashboard/lockouts` (both GET and DELETE) all reject an unauthenticated
+  caller (401) and a non-admin user (403).
+- **Overview reflects real state** — opening one real session shows
+  `active_users`/`active_sessions` == 1 and a real `average_trust_score`;
+  driving a session to a direct HIGH crossing (reusing the same
+  `_post_event`/`_force_score` pattern `test_continuous_trust.py`
+  established) increments `revoked_sessions` and drops `active_sessions`
+  back to 0.
+- **Analytics shape + content** — `?days=7` returns exactly 7 login-activity
+  buckets with today's real session counted in the last one; risk-level
+  bucket counts sum to the number of active sessions; after an `ip_change`
+  event and its session's eventual disconnect-and-grace-window termination,
+  the `security_alerts` breakdown shows exactly one `ip_change` and the
+  `revoked_sessions` breakdown shows at least one `websocket_disconnect`.
+- **Lockout panel, both types** — trips the Module 6 MFA lockout (mirroring
+  `test_mfa.py`'s own trigger pattern) and confirms it's listed with the
+  right username and a positive `retry_after_seconds`; DELETE clears it and
+  confirms both that it's gone from the listing AND that the account can
+  immediately verify a fresh code again (not just hidden, actually cleared).
+  Separately drives a session into a direct HIGH crossing (reusing
+  `test_continuous_trust.py`'s `_drive_session_into_high`-equivalent setup)
+  to trip the Module 7 risk lockout, confirms it's listed with `tier: 1` and
+  blocks a login attempt with 423, then confirms DELETE clears it and the
+  login attempt no longer returns 423.
+- **Dashboard WebSocket** — a non-admin token and a missing token both get
+  the handshake rejected with WS close code 1008 (mirroring the exact
+  assertion style `test_sessions.py`'s own handshake-rejection tests use);
+  an admin connection receives a live, real `security` channel event
+  end-to-end after a manual `POST /security/events` call, with the pushed
+  payload's `event_type`/`session_id` matching what was actually posted.
+  This last test needed one small, deliberate timing allowance (a 200ms
+  sleep between opening the dashboard socket and publishing the event) —
+  documented in the test itself: a real Redis pub/sub channel (fakeredis
+  included) never replays a message published before a subscriber attached,
+  so this closes a genuine subscribe-vs-publish race rather than papering
+  over a flaky assertion.
+
+### Verification
+
+- **Full backend suite**, run from the project's throwaway
+  Python-3.14-compatible virtualenv (see the `dev-env-backend-build` memory
+  note): **153/153 passing** — the prior 141 (section 24) plus the 12 new
+  tests above, with zero prior tests deleted, skipped, or weakened. The new
+  suite passed on its very first full run with no fixes needed afterward.
+- **No migration** — confirmed by design, not just by outcome: Module 8
+  introduces no new SQLAlchemy model and touches no existing one; `alembic
+  current` and the migration chain are unchanged from the end of Module 7
+  (head is still `0009_security_event_source`).
+- **Regression check against Modules 1-7**: every backend change outside the
+  new `dashboard` package/endpoint is strictly additive — two new functions
+  each on two pre-existing, independent lockout modules, one new private
+  helper + one new call site in `continuous.py`'s `record_event()` (the
+  publish, placed after the event's own commit — nothing about the
+  scoring/action logic above it was touched), and one line removed from
+  `test_health.py`'s placeholder list (because the endpoint it referenced is
+  no longer a placeholder). No existing model, schema, endpoint field, or
+  prior module's behavior was removed, renamed, or altered.
+- **Frontend**: `npx tsc -b --noEmit` → 0 errors. `npm run build` →
+  succeeds. `npx oxlint` on every new/changed frontend file → 0 issues
+  beyond the same `react(set-state-in-effect)` advisory warning already
+  present, unchanged, on every one of this project's pre-existing polling
+  admin pages (`LiveSessions.tsx`, `TrustScorePage.tsx`,
+  `SecurityAlerts.tsx`) — confirmed by running `oxlint` against those
+  existing files too, side by side, before concluding this is pre-existing,
+  accepted project style rather than a new issue introduced here.
+
+**Conclusion:** Module 8 — Security Dashboard is implemented per Section 5's
+field lists, integrates with Modules 1-7 entirely through composition and
+existing Redis publish points rather than new coupling, and does not regress
+any prior module — verified by a from-scratch full test run (153/153, first
+try), a confirmed absence of any migration, and clean frontend
+type-checking, build, and linting. The admin lockout-unlock UI flagged as
+deferred at the end of the Module 6/7 hardening passes (sections 17b/18) is
+now built, and Section 5's "real-time updates via WebSocket" requirement,
+previously unmet by every admin page's REST-only polling, is now genuinely
+satisfied by a live, additive push channel. Ready to proceed to
+**Module 9 — Attack Simulation**.

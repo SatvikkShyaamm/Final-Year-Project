@@ -48,6 +48,7 @@ Module 3 stays purely session-lifecycle.
 | Trust Score            | `backend/app/services/trust_score/` (Module 5) — `evaluator.py` implements the finalized Section-6 formula `clamp(70 + Σ+ - Σ-, 0, 100)`; config-driven weights; `sessions.trust_score`/`risk_level` + `trust_score_factors` audit rows; Redis `ztsaacm:failed_logins:{user_id}` (15-min TTL) fed from `POST /auth/login` failures. `evaluate_login()` is the login-time (non-persisting) entry point Module 6 calls |
 | Adaptive MFA            | `backend/app/services/mfa/` (Module 6) — `decide(risk_level)` (LOW/MEDIUM/HIGH → allow/mfa/block) + email one-time-code challenge lifecycle (`mfa_challenges` one row per prompt: create / verify / expiry / retry — code hashed, never stored plaintext). `mfa_pending` token type (`app/core/security.create_mfa_token`) is rejected by `decode_access_token`. Redis `ztsaacm:events:mfa` for the dashboard, plus (2026-09-13) `ztsaacm:mfa_failed:{id}`/`ztsaacm:mfa_lockout:{id}` for the account-level lockout |
 | Continuous evaluation   | `backend/app/services/trust_score/continuous.py` (Module 7) -- composition of trust_score + mfa + session services, no separate service package. `record_event()` recomputes the session's CURRENT score (not the static baseline) and carries out none / reverify (email, reusing Module 6) / revoke (`TerminationReason.RISK_REVOKED`, already wired into token revocation) |
+| Security Dashboard      | `backend/app/services/dashboard/` (Module 8) -- pure aggregation over every prior module's own tables/Redis state, no new persisted state. `GET /dashboard/overview` (Section 5's stat cards), `GET /dashboard/analytics` (its charts), `GET`/`DELETE /dashboard/lockouts` (the admin unlock UI deferred from Modules 6/7), `WS /ws/dashboard` (admin-only live forwarder over the session/ACL/MFA/security Redis event channels every earlier module already publishes) |
 
 ## Module -> folder map (Module 1 baseline)
 
@@ -66,6 +67,8 @@ frontend/src/auth/               token store, AuthProvider, useAuth, ProtectedRo
 frontend/src/session/            SessionProvider, useSession (Module 3)
 frontend/src/ws/socket.ts        SessionSocket signalling client (Module 3)
 frontend/src/pages/admin/        one page per Module 8 dashboard section
+backend/app/services/dashboard/  pure aggregation queries over Modules 2-7's own state -- no persisted state of its own, no migration (Module 8)
+frontend/src/ws/dashboardSocket.ts + useDashboardSocket.ts   admin-only live "something changed" feed (Module 8) -- see its own section below
 infra/l-pep/                     setup-ipset.sh + run notes for the standalone L-PEP (Module 4)
 ```
 
@@ -833,3 +836,75 @@ the recommendation discussion that preceded building this.
   no model/schema/column changed, the reused `token_jti` column already
   existed. `frontend` type-checks (`tsc -b --noEmit`) clean; no frontend
   file changed.
+
+## Module 8 — Security Dashboard (as implemented, 2026-09-17)
+
+Spec: Section 5 (the Dashboard Home / Analytics field lists), Section 9's
+Module 8 description, and Section 18's own "no admin unlock UI yet --
+natural fit for Module 8" deferral (Project status.md sections 17b/18).
+
+- **Pure aggregation, no new persisted state** — `backend/app/services/dashboard/service.py`
+  is read-only over Modules 2-7's own tables (`sessions`, `acl_rules`,
+  `mfa_challenges`, `security_events`) plus their Redis-backed lockout keys.
+  No model, no migration: Module 8 introduces zero schema of its own.
+- **`GET /dashboard/overview`** (admin) — Section 5's Dashboard Home cards:
+  active users/sessions, average trust score (reuses Module 5's own
+  `average_trust_score`), high-risk (HIGH-band, ACTIVE) sessions, pending
+  MFA requests, revoked-for-risk sessions (`risk_revoked` +
+  `account_locked` specifically -- not diluted by ordinary logout/idle/admin
+  terminations), current ACL rules and its avg authorization/revocation
+  latency (reuses Module 4's own `average_latencies` unchanged), and a
+  `locked_out_accounts` count (MFA + risk lockouts combined).
+- **`GET /dashboard/analytics`** (admin) — Section 5's Analytics charts, all
+  real bucketed counts, never fabricated: login activity (sessions opened
+  per day -- the real, measurable proxy; a multi-day failed-login trend is
+  deliberately not offered, since Module 5's failed-login counter is a
+  15-minute Redis burst counter with no historical record to chart), trust
+  score distribution (10-point buckets, ACTIVE sessions), risk-level
+  breakdown, MFA events by status, revoked sessions by termination reason,
+  security alerts by event type, plus the same ACL latency averages.
+- **Admin lockout UI** (`GET`/`DELETE /dashboard/lockouts/{user_id}`) — the
+  panel Sections 17b/18 explicitly deferred: lists every account currently
+  under Module 6's MFA lockout or Module 7's risk lockout (SCAN over their
+  small, bounded Redis key namespaces, joined with a username/email from
+  Postgres) and clears both with one DELETE, wrapping the documented
+  `redis-cli DEL ...` fallback in a real button. `app/services/mfa/service.list_mfa_lockouts`/
+  `clear_mfa_lockout` and `app/services/trust_score/risk_lockout.list_risk_lockouts`/
+  `clear_risk_lockout` are the two small additions this needed to each
+  existing lockout module.
+- **`WS /ws/dashboard`** (admin-only) — Section 5's "real-time updates via
+  WebSocket" requirement. Forwards the Redis pub/sub channels every earlier
+  module already publishes to but nothing previously consumed:
+  `ztsaacm:events:session` (Module 3, `app/services/session/store.py` --
+  its own docstring already said "consumed by Module 8"), `ztsaacm:events:acl`
+  (Module 4), `ztsaacm:events:mfa` (Module 6), and a new
+  `ztsaacm:events:security` Module 7 gained alongside this module
+  (`app/services/trust_score/continuous.py`, mirroring the exact same
+  publish pattern the other three already used). The handshake reuses
+  `app.ws.auth.resolve_ws_user` (the same JWT/revocation check every other
+  socket in this app uses) plus an admin check this one alone needs. The
+  loop polls `pubsub.get_message(timeout=0)` (non-blocking) every ~0.25s
+  inside the async handler rather than a background thread -- consistent
+  with this codebase's existing style of sync Redis/DB calls inside async
+  WS handlers (e.g. `sessions.py`'s own `session_ws`), and avoids a second
+  threading model. **Purely additive, never a new source of truth**: every
+  admin page keeps its existing REST polling (Modules 3-7's own pattern)
+  unchanged as the real data path and fallback; a page only listens for a
+  push to refetch sooner than its next poll tick
+  (`frontend/src/ws/useDashboardSocket.ts`'s `tick` counter).
+- **Frontend**: `DashboardHome.tsx` and `Analytics.tsx` (both placeholders
+  since Module 1) are now real, reading `frontend/src/api/dashboard.ts`.
+  `DashboardHome` also renders the new Locked Accounts panel with a per-row
+  Unlock button. `Analytics` charts every bucket list with Recharts (already
+  a dependency), reusing the same bar/line styling `TrustScorePage.tsx`
+  established in Module 5.
+- **Tests**: `backend/tests/test_dashboard.py` -- overview/analytics/lockouts
+  RBAC; overview reflects real active-session/user/ACL state and counts a
+  risk-revoked session; analytics' login-activity bucket count and shape,
+  and its MFA/security-alert/revoked-session breakdowns after triggering
+  each; the lockouts panel lists and clears both an MFA lockout and a risk
+  lockout (confirmed by the account being immediately usable again, not just
+  absent from the listing); the dashboard WebSocket rejects a non-admin and
+  a missing token, and forwards a real, live `security` channel event end to
+  end. Full backend suite: **153 passing** (141 prior + 12 new). `frontend`
+  type-checks (`tsc -b --noEmit`) and builds clean.

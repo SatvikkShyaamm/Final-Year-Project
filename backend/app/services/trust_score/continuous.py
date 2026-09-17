@@ -70,17 +70,26 @@ genuine mid-session IP/User-Agent change or an abnormal request rate. The
 only new thing either caller must supply is ``source`` (audit-trail only,
 see ``record_event``'s docstring) -- nothing about scoring, MFA
 re-triggering, or revocation logic changed for this hardening pass.
+
+Module 8 (Security Dashboard): every recorded event is also published on
+``ztsaacm:events:security`` (best-effort, fail-open) -- the admin dashboard's
+`/ws/dashboard` subscribes to this alongside the session/ACL/MFA event
+channels those modules already publish, so a live continuous-evaluation
+event reaches the dashboard immediately rather than only on its next poll.
 """
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
 
+import redis
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.core.redis_client import get_redis
 from app.models.mfa import MFAChallenge, MFAChallengeReason, MFAChallengeStatus
 from app.models.security_event import (
     SecurityEvent,
@@ -98,6 +107,33 @@ from app.services.trust_score.factors import Factor, classify_risk
 
 logger = get_logger(__name__)
 settings = get_settings()
+
+# Module 8 (Security Dashboard): the live event channel this module was
+# always missing relative to session/acl/mfa's own -- see app.services.
+# session.store.EVENT_CHANNEL ("consumed by Module 8"), app.services.acl.
+# service's "ztsaacm:events:acl" publishes, and app.services.mfa.service's
+# _EVENT_CHANNEL. Best-effort/fail-open, same policy as every other
+# auxiliary Redis mechanism in this codebase.
+_EVENT_CHANNEL = "ztsaacm:events:security"
+
+
+def _publish(event: SecurityEvent) -> None:
+    payload = {
+        "type": "security.event",
+        "id": event.id,
+        "session_id": event.session_id,
+        "user_id": event.user_id,
+        "event_type": event.event_type,
+        "action": event.action,
+        "source": event.source,
+        "new_score": event.new_score,
+        "new_risk": event.new_risk,
+        "ts": event.created_at.isoformat() if event.created_at else None,
+    }
+    try:
+        get_redis().publish(_EVENT_CHANNEL, json.dumps(payload))
+    except redis.RedisError:
+        logger.debug("redis security event publish failed", exc_info=True)
 
 
 class ContinuousTrustError(Exception):
@@ -316,6 +352,7 @@ def record_event(
     db.commit()
     db.refresh(session)
     db.refresh(event)
+    _publish(event)
 
     logger.info(
         "continuous trust event session=%s type=%s score %s->%s risk %s->%s action=%s",
