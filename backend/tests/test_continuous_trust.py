@@ -762,3 +762,184 @@ def test_classify_event_rejects_unknown_type():
 
     with pytest.raises(ValueError):
         classify_event("bogus")
+
+
+# --------------------------------------------------------------------------- #
+# automatic multiple_failed_logins detection (2026-09-17 hardening)
+#
+# Closes the gap flagged during Module 8's own verification: Module 5's
+# failed-login burst counter only ever affected the NEXT login's initial
+# score -- nothing watched it and reacted against an account's ALREADY-OPEN
+# session(s). Now, the exact same POST /auth/login credential failure that
+# feeds that counter also fires the mid-session `multiple_failed_logins`
+# event (source=auto) against every one of that account's currently ACTIVE
+# sessions, the moment the burst first crosses trust_failed_login_threshold
+# -- an attacker guessing a live user's password is no longer invisible to
+# that user's already-open session(s). The manual admin path
+# (POST /security/events with event_type=multiple_failed_logins) is
+# untouched and still works exactly as before -- see
+# test_manual_multiple_failed_logins_event_still_works below.
+# --------------------------------------------------------------------------- #
+def _bad_password_attempts(client, *, n: int) -> None:
+    for _ in range(n):
+        r = client.post(
+            "/api/v1/auth/login", json={"username": USER["username"], "password": "WRONGWRONG"}
+        )
+        assert r.status_code == 401
+
+
+def test_manual_multiple_failed_logins_event_still_works(client, admin_token, user_token, db_session):
+    """Regression guard: the pre-existing manual/admin trigger path for this
+    event type is untouched by the automatic-detection hardening below."""
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
+        session_id = ws.receive_json()["session_id"]
+        _force_score(db_session, session_id, 95, "LOW")
+
+        resp = _post_event(client, admin_token, session_id, SecurityEventType.MULTIPLE_FAILED_LOGINS)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["action"] == "none"
+        assert body["weight_applied"] == -settings.trust_weight_failed_logins
+        assert body["new_score"] == 95 - settings.trust_weight_failed_logins
+        assert body["source"] == "admin"
+
+        push = ws.receive_json()
+        assert push["type"] == "trust.updated"
+        assert push["trust_score"] == 95 - settings.trust_weight_failed_logins
+
+
+def test_failed_login_burst_auto_fires_against_the_accounts_active_session(
+    client, admin_token, user_token, db_session
+):
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
+        session_id = ws.receive_json()["session_id"]
+        _force_score(db_session, session_id, 95, "LOW")
+
+        # 3 bad-password attempts -> the burst crosses trust_failed_login_
+        # threshold (3) on the last one, which is also what auto-fires the
+        # mid-session event against this account's active session.
+        _bad_password_attempts(client, n=settings.trust_failed_login_threshold)
+
+        push = ws.receive_json()
+        assert push == {
+            "type": "trust.updated",
+            "session_id": session_id,
+            "risk_level": "LOW",
+            "trust_score": 95 - settings.trust_weight_failed_logins,
+        }
+
+    feed = client.get(
+        f"/api/v1/security/events?session_id={session_id}", headers=_bearer(admin_token)
+    ).json()["events"]
+    auto_rows = [e for e in feed if e["event_type"] == SecurityEventType.MULTIPLE_FAILED_LOGINS]
+    assert len(auto_rows) == 1
+    assert auto_rows[0]["source"] == "auto"
+    assert auto_rows[0]["new_score"] == 95 - settings.trust_weight_failed_logins
+
+
+def test_failed_login_burst_auto_fires_against_every_active_session_on_the_account(
+    client, admin_token, user_token, db_session
+):
+    """Two browsers, one account (the scenario that motivated this hardening
+    pass) -- both currently-open sessions get their own event, not just
+    whichever one happens to be "current"."""
+    user_token_b = _second_token_for(client, user_token)
+
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws_a:
+        session_a = ws_a.receive_json()["session_id"]
+        _force_score(db_session, session_a, 100, "LOW")
+
+        with client.websocket_connect(f"{WS_PATH}?token={user_token_b}") as ws_b:
+            session_b = ws_b.receive_json()["session_id"]
+            _force_score(db_session, session_b, 95, "LOW")
+
+            _bad_password_attempts(client, n=settings.trust_failed_login_threshold)
+
+            # Each socket gets exactly its own push -- order between the two
+            # sockets is not guaranteed (active_session_ids_for_user is an
+            # unordered set), only that each receives its own.
+            push_a = ws_a.receive_json()
+            push_b = ws_b.receive_json()
+            assert push_a == {
+                "type": "trust.updated", "session_id": session_a,
+                "risk_level": "LOW", "trust_score": 100 - settings.trust_weight_failed_logins,
+            }
+            assert push_b == {
+                "type": "trust.updated", "session_id": session_b,
+                "risk_level": "LOW", "trust_score": 95 - settings.trust_weight_failed_logins,
+            }
+
+    feed = client.get("/api/v1/security/events", headers=_bearer(admin_token)).json()["events"]
+    auto_rows = [e for e in feed if e["event_type"] == SecurityEventType.MULTIPLE_FAILED_LOGINS]
+    assert {r["session_id"] for r in auto_rows} == {session_a, session_b}
+    assert all(r["source"] == "auto" for r in auto_rows)
+
+
+def test_failed_login_burst_auto_detection_fires_only_once_per_window(
+    client, admin_token, user_token, db_session
+):
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws:
+        session_id = ws.receive_json()["session_id"]
+        _force_score(db_session, session_id, 95, "LOW")
+
+        _bad_password_attempts(client, n=settings.trust_failed_login_threshold)
+        first_push = ws.receive_json()
+        assert first_push["trust_score"] == 95 - settings.trust_weight_failed_logins
+
+        # Two more wrong attempts, still well within the same 15-minute
+        # window -- must NOT re-fire a second mid-session event (mirrors
+        # abnormal_request_rate's own fire-once-per-window guarantee).
+        _bad_password_attempts(client, n=2)
+
+        feed = client.get(
+            f"/api/v1/security/events?session_id={session_id}", headers=_bearer(admin_token)
+        ).json()["events"]
+        auto_rows = [e for e in feed if e["event_type"] == SecurityEventType.MULTIPLE_FAILED_LOGINS]
+        assert len(auto_rows) == 1  # still just the one from crossing the threshold
+
+
+def test_failed_login_burst_with_no_active_session_is_a_harmless_noop(client, admin_token):
+    """An account with nothing open anywhere: the burst counter still
+    increments (Module 5's own login-time factor is unaffected), but there
+    is no active session for the mid-session detector to touch -- no crash,
+    no event, and the failed attempts still return their ordinary 401s."""
+    _register(client, USER)
+    _bad_password_attempts(client, n=settings.trust_failed_login_threshold + 2)
+
+    feed = client.get("/api/v1/security/events", headers=_bearer(admin_token)).json()["events"]
+    assert not [e for e in feed if e["event_type"] == SecurityEventType.MULTIPLE_FAILED_LOGINS]
+
+
+def test_failed_login_burst_direct_high_crossing_cascades_and_locks_the_account(
+    client, admin_token, user_token, db_session
+):
+    """If the -15 penalty pushes one of the account's active sessions
+    straight into HIGH, this is just an ordinary direct HIGH crossing as
+    far as continuous.record_event is concerned -- so it gets everything a
+    manually-triggered one already gets, for free: that session revoked,
+    every OTHER active session on the account cascade-terminated
+    (account_locked), and the account-level risk lockout tripped."""
+    user_token_b = _second_token_for(client, user_token)
+
+    with client.websocket_connect(f"{WS_PATH}?token={user_token}") as ws_a:
+        session_a = ws_a.receive_json()["session_id"]
+        _force_score(db_session, session_a, 100, "LOW")  # stays LOW after -15
+
+        with client.websocket_connect(f"{WS_PATH}?token={user_token_b}") as ws_b:
+            session_b = ws_b.receive_json()["session_id"]
+            _force_score(db_session, session_b, 50, "MEDIUM")  # 50-15=35 -> HIGH
+
+            _bad_password_attempts(client, n=settings.trust_failed_login_threshold)
+
+    row_a = client.get(f"/api/v1/sessions/{session_a}", headers=_bearer(admin_token)).json()
+    row_b = client.get(f"/api/v1/sessions/{session_b}", headers=_bearer(admin_token)).json()
+    assert row_a["state"] == "terminated"
+    assert row_a["termination_reason"] == "account_locked"
+    assert row_b["state"] == "terminated"
+    assert row_b["termination_reason"] == "risk_revoked"
+
+    locked = client.post(
+        "/api/v1/auth/login", json={"username": USER["username"], "password": USER["password"]}
+    )
+    assert locked.status_code == 423
+    assert locked.json()["detail"]["code"] == "risk_locked"

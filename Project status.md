@@ -16,11 +16,16 @@ RISK lockout; hardened 2026-09-15 with **Real Passive Network Detection**
 `ip_change` / `vpn_detected` / `unknown_device` / `abnormal_request_rate`
 events automatically from a real user's own traffic (the latter counting
 every non-GET authenticated call, not just heartbeats), so Module 7 no
-longer depends on an admin manually clicking "Trigger"; and hardened
+longer depends on an admin manually clicking "Trigger"; hardened
 2026-09-16 with cascading account-lockout termination and a page-refresh
-reconnect-reattach fix (sections 23-24). Module 8 – Security Dashboard is
-now also complete (section 25): real Dashboard Home/Analytics aggregates,
-an admin lockout-management panel, and a live admin WebSocket feed.
+reconnect-reattach fix (sections 23-24); and hardened 2026-09-17 (section
+27) with automatic `multiple_failed_logins` detection — reusing Module 5's
+own failed-login burst counter to fire the identical mid-session event
+against every one of an account's currently open sessions the moment a
+real password-guessing burst crosses threshold, alongside (not replacing)
+the manual admin Trigger. Module 8 – Security Dashboard is also complete
+(section 25): real Dashboard Home/Analytics aggregates, an admin
+lockout-management panel, and a live admin WebSocket feed.
 Modules 9-10 not started.
 
 |         Module                         |              Status          |
@@ -31,7 +36,7 @@ Modules 9-10 not started.
 | Module 4 – Dynamic ACL                 | Completed & independently verified |
 | Module 5 – Trust Score Engine          | Completed                    |
 | Module 6 – Adaptive MFA                | Completed & independently verified (MFA method revised 2026-09-10 — see section 11) |
-| Module 7 – Continuous Trust Evaluation | Completed — see section 16; hardened with account-level lockouts (sections 17-18), live-display fixes (sections 19-20), Real Passive Network Detection (sections 21-22), cascading lockout termination + reconnect-reattach (sections 23-24) |
+| Module 7 – Continuous Trust Evaluation | Completed — see section 16; hardened with account-level lockouts (sections 17-18), live-display fixes (sections 19-20), Real Passive Network Detection (sections 21-22), cascading lockout termination + reconnect-reattach (sections 23-24), automatic multiple_failed_logins detection (section 27) |
 | Module 8 – Security Dashboard          | Completed — see section 25   |
 | Module 9 – Attack Simulation           | Not started                  |
 | Module 10 – Testing & Evaluation       | Not started                  |
@@ -3314,3 +3319,304 @@ now built, and Section 5's "real-time updates via WebSocket" requirement,
 previously unmet by every admin page's REST-only polling, is now genuinely
 satisfied by a live, additive push channel. Ready to proceed to
 **Module 9 — Attack Simulation**.
+
+---
+
+## 26. Module 8 — Independent Regression Verification (2026-09-17)
+
+Independently re-verified Module 8 (section 25's own build) against
+`MASTER_PROJECT_CONTEXT.docx` Section 5's field lists, this `Project
+status.md` file (sections 1-25) as the "as implemented" record, and the
+actual code in the repo — not just section 25's own claims. Method:
+connected directly to the developer's machine (git history + working tree),
+diffed the isolated `Module 8: Security Dashboard` commit
+(`36d1cb4`) against its direct parent to see exactly what that commit
+touched (as opposed to the wider range that also includes the unrelated,
+already-landed section 23/24 hardening commits it was built on top of), read
+every backend/frontend file that diff touched, reinstalled the backend into
+a clean virtualenv and re-ran the full suite twice, ran the frontend
+TypeScript compiler/build/linter, and confirmed the local `main` branch is
+in sync with `origin/main`.
+
+**Requirements checklist (MASTER_PROJECT_CONTEXT.docx Section 5, Module 8's field list):**
+
+| Area | Verified |
+|---|---|
+| Dashboard Home stat cards | Yes — `GET /dashboard/overview`, real aggregates (`dashboard_service.overview`) over Modules 2-7's own tables/Redis state, no synthetic data |
+| Analytics (login activity, trust-score distribution, MFA events, revoked sessions, security alerts, risk levels, authorization/revocation latency) | Yes — `GET /dashboard/analytics`, one real bucket list per chart; a would-be multi-day failed-login trend is honestly omitted rather than fabricated (no historical Postgres record exists for it), matching Section 15's "do not build fake data" instruction |
+| Live Session Monitoring / Trust Score Monitoring / Security Alerts / ACL Monitor | Confirmed already real prior to Module 8 (built incrementally by Modules 3-7 per this project's own sequencing rule) — section 25 correctly scoped its own work to the two still-placeholder pages plus the deferred lockout UI, not a rebuild |
+| Real-time updates via WebSocket | Yes — new admin-only `WS /ws/dashboard` forwards the four Redis pub/sub channels (session/ACL/MFA/security) that already existed or were given one (`security`, added here) to any open admin dashboard page; purely additive on top of each page's existing REST polling, never a replacement data path |
+| Admin lockout visibility/recovery (deferred from sections 17b/18) | Yes — `GET /dashboard/lockouts` + `DELETE /dashboard/lockouts/{user_id}`, backed by real `list_/clear_mfa_lockout` and `list_/clear_risk_lockout` functions added to the two pre-existing lockout modules |
+
+**Isolated-commit diff review (`git diff 36d1cb4^..36d1cb4`, 19 files,
+1974(+)/71(-)):** every backend file touched is either wholly new
+(`app/services/dashboard/__init__.py`, `service.py`,
+`app/api/v1/endpoints/dashboard.py`, `app/schemas/dashboard.py`,
+`backend/tests/test_dashboard.py`) or a small, additive change to an
+existing one — `app/services/mfa/service.py` and
+`app/services/trust_score/risk_lockout.py` each gained exactly two new
+functions (`list_*_lockouts` / `clear_*_lockout`) and nothing else in either
+file changed; `app/services/trust_score/continuous.py` gained one private
+publish helper and one call site inside `record_event()`, placed after the
+`security_events` row's own commit, with no line above it touched (scoring,
+MFA re-trigger, and revoke logic are byte-for-byte unchanged — confirmed by
+reading the diff, not just trusting the docstring's claim); `test_health.py`
+lost exactly the one line asserting `/dashboard/overview` is still a 501
+stub, correctly, since it no longer is. No Module 1-7 model, schema, or
+endpoint field was removed, renamed, or had its behavior altered. No new
+Alembic migration exists in this commit — confirmed independently via
+`alembic history`, whose head is still `0008_continuous_trust_evaluation ->
+0009_security_event_source`, unchanged since section 22.
+
+**Full backend suite**, reinstalled from scratch into a throwaway virtualenv
+(`requirements.txt`, Python 3.10) and run twice independently:
+
+- Run 1: **152 passed, 1 failed** — `tests/test_trust_score.py::test_user_trust_history`
+  failed with `assert False` on `all(e["trust_score"] is not None for e in
+  hist["entries"])`.
+- Isolated re-run of just `test_trust_score.py` on its own: **12/12
+  passing**, including that same test — confirming the failure is
+  order-dependent, not a deterministic defect.
+- Run 2 (full suite again, no code change in between): **153/153 passing**,
+  including `test_user_trust_history`.
+- **Conclusion on this test**: a pre-existing, order-dependent flake in the
+  same family already documented in section 22 ("an isolated regression
+  check... confirmed to fail identically in isolation... a pre-existing
+  order-dependent flake unrelated to this change"), just manifesting in the
+  opposite direction here (failed once inside the full run, passed both in
+  isolation and on a clean re-run of the full suite) — consistent with a
+  timing-sensitive interaction involving the async reconnect-grace-window
+  background task (section 24) rather than a deterministic bug. Not caused
+  by Module 8: `test_user_trust_history` and every file it exercises
+  (`trust_score` history, `session` service) are outside Module 8's own
+  diff, and section 25's own single clean run (153/153) did not hit it,
+  which is exactly what "order-dependent, not deterministic" predicts.
+  Flagged here for the record rather than silently ignored, per this
+  project's own "report outcomes faithfully" standard — worth a
+  `pytest-randomly` bisect or an explicit `-p no:randomly`/fixed seed
+  re-run if it starts showing up more often, but not blocking Module 8.
+- Zero prior tests were deleted, skipped, or weakened to reach either
+  passing run.
+
+**Frontend:**
+
+- `npx tsc -b --noEmit` → 0 errors.
+- `npm run build` (in place) failed with `EPERM: operation not permitted,
+  unlink .../dist/assets/...` while clearing the pre-existing `dist/`
+  output directory — a file-permission artifact of this verification
+  session's sandboxed access to the developer's machine, not a code defect.
+  Confirmed by building to a scratch output directory instead
+  (`vite build --outDir /tmp/verify_dist --emptyOutDir`): **688 modules
+  transformed, build succeeds**, same single pre-existing "chunk larger than
+  500 kB" advisory warning already flagged in prior sections, nothing new.
+  The `@rolldown/binding-linux-x64-gnu` native-binding error noted in
+  earlier Module 4/6 verifications also reappeared on first attempt in this
+  session's environment and was resolved the same documented way (`npm
+  install` after the fact, without clearing `node_modules`/`package-lock.json`
+  first) — environment-specific, not a Module 8 regression.
+- `npx oxlint` on every Module 8 file (`DashboardHome.tsx`, `Analytics.tsx`,
+  `dashboardSocket.ts`, `useDashboardSocket.ts`, `api/dashboard.ts`,
+  `types/index.ts`) → 0 errors, 4 `react(set-state-in-effect)` advisory
+  warnings. Independently confirmed these are pre-existing, accepted project
+  style rather than new: running the same lint rule against
+  `LiveSessions.tsx`, `TrustScorePage.tsx`, `SecurityAlerts.tsx`, and
+  `ACLMonitor.tsx` (all pre-Module-8) trips the identical warning on the
+  identical `load()`-in-`useEffect` polling pattern.
+- No mock/fabricated data found in `DashboardHome.tsx`, `Analytics.tsx`, or
+  `dashboard/service.py` — every figure traces to a real query or a reused
+  Module 2-7 service call; grepped for `mock`/`fake`/`dummy`/`hardcod` across
+  all of Module 8's own files with no hits.
+
+**Repo/deployment hygiene:**
+
+- `git status` shows the local `main` branch up to date with `origin/main`
+  (no unpushed local commits); the merge commit
+  `2892185 Merge branch 'module-8-security-dashboard' into main` is present
+  in history on both.
+- The working tree does show ~97 files as modified with a
+  15,583(+)/15,583(-) `git diff --shortstat` — confirmed with `git diff
+  --ignore-all-space` (empty) to be 100% line-ending churn (LF/CRLF) on this
+  Windows checkout, the same pre-existing, harmless condition this file's
+  own section 9 housekeeping note first flagged — not a Module 8 issue and
+  not new.
+- `backend/.env` (which carries the real Gmail SMTP App Password) is
+  correctly gitignored and was not part of any commit.
+- `backend/app/api/v1/endpoints/simulation.py` (Module 9) has zero diff
+  across the entire Module 8 commit — confirmed no scope creep into the
+  next module.
+
+**Conclusion:** Module 8 — Security Dashboard, as built and documented in
+section 25, is independently confirmed genuinely implemented per Section 5's
+field lists, introduces no fabricated/mock data anywhere, adds no new
+migration, and does not regress any prior module — every file it touched
+outside its own new package/endpoint is strictly additive, and the full
+backend suite passes (153/153) with the one observed failure traced to a
+pre-existing, order-dependent flake outside Module 8's own diff, not a
+Module 8 defect. Frontend type-checks, builds, and lints clean, with the two
+build hiccups encountered here (`dist/` permissions, the rolldown native
+binding) both confirmed to be artifacts of this verification session's
+environment rather than the code. No regression to Modules 1-7 was found.
+Ready to proceed to **Module 9 — Attack Simulation** with no known gap
+blocking it.
+
+## 27. Module 7 Hardening — Automatic `multiple_failed_logins` Detection (2026-09-17)
+
+**Why:** while explaining to the project owner how to independently verify
+the `multiple_failed_logins` alert, the honest answer turned out to be "you
+currently can't — it's the one event type in the whole Module 7 catalogue
+that only ever fires from the admin's manual `POST /security/events`
+Trigger button." Every other event type by this point (Section 18's
+heartbeat detectors, the request-rate redesign, the cascading-lockout and
+reconnect-reattach hardening above) had a real, automatic detector sitting
+behind it; this one didn't, even though the underlying signal — Module 5's
+own failed-login burst counter — already existed and was already being
+computed on every `POST /auth/login` failure. The project owner
+specifically pushed back on this: *"login attempts is checked only during
+authentication right and we already have a condition for that then why do
+we have to implement this condition since its just a manual one?"* — a fair
+critique of the pre-existing state, since a manual-only event has zero
+actual protective value; it only demonstrates that the scoring pipeline
+*can* react to this event type if told to. The concrete gap: **an attacker
+guessing a live user's password produced no live signal on that user's own
+already-open session anywhere**, unlike a real IP/device change, which
+Section 18 already makes visible to an open session within ~20 seconds.
+After confirming the project owner wanted this built — "yes i want you to
+implement the dynamic functionality of the above alert without removing the
+existing manual option in the admin panel" — this section is that build,
+following the exact precedent Section 18 itself set: add the automatic
+detector *alongside* the manual path, never replacing it.
+
+**Design — reuse the existing counter, don't build a second one:**
+`backend/app/services/trust_score/store.py`'s `ztsaacm:failed_logins:
+{user_id}` key (`INCR` + refresh-TTL on every failed login against a known
+username, 15-minute window, `trust_failed_login_threshold`) has existed
+since Module 5, purely to compute the `-15` login-time scoring penalty on
+the *next* successful login. This hardening does not add a parallel
+counter; it reads that exact same key mid-burst and, the first time it's
+observed at/over threshold within a window, treats that as the trigger to
+fire a mid-session event — the identical "reuse an existing signal instead
+of inventing a new one" discipline this project has followed since Section
+18's `abnormal_request_rate` redesign.
+
+**Fire-once-per-window guard:** a new Redis key,
+`ztsaacm:failed_logins_fired:{user_id}`, set (via a plain existence check,
+not a real Redis `NX`, since this project's fail-open convention already
+tolerates the narrow race) the first time the burst counter crosses
+threshold, carrying the *counter's own remaining TTL* so the two expire
+together. `store.check_and_mark_burst_fired(user_id) -> bool` is the single
+new function this required — returns `True` exactly once per window,
+`False` on every attempt before or after that one. This is a byte-for-byte
+structural copy of `request_rate.py`'s pre-existing
+`check_and_mark_fired` for `abnormal_request_rate`, for the identical
+reason: without it, the 4th, 5th, 6th, ... wrong password inside the same
+15-minute window would each independently re-fire the mid-session event
+again, spamming every open session with duplicate alerts for what is really
+one ongoing burst. `clear_failed_logins(user_id)` (used by tests and any
+future manual-unlock path) now clears both keys together.
+
+**Where it hooks in — `record_failed_login_attempt`, already the sole
+caller from `/auth/login`:** `trust_score/service.py`'s
+`record_failed_login_attempt(db, username=...)` already ran on every
+`InvalidCredentialsError` inside `POST /auth/login`, purely to `INCR` the
+counter. It now, immediately after that increment, calls
+`store.check_and_mark_burst_fired(user.id)`; on `True`, it looks up every
+currently ACTIVE session on that account via
+`app.services.session.store.active_session_ids_for_user(user.id)` — the
+same per-user Redis index `request_rate.py` already reuses for its own
+cross-endpoint attribution — and calls the completely unmodified
+`continuous.record_event(db, session_id=..., event_type=
+MULTIPLE_FAILED_LOGINS, source=SecurityEventSource.AUTO)` against **each**
+one, not just one arbitrarily chosen session, since an attacker guessing a
+password has no way to know (and this system has no reason to guess) which
+of the account's open tabs, if any, is the "right" one to warn. A
+`SessionNotFound`/`SessionNotActive` on any individual session (a benign
+Redis/Postgres drift — the session finished closing in the moment between
+the index read and the DB call) is skipped, not raised, so one stale index
+entry can never turn a failed-login attempt into a 500 for the *attacker's*
+own request. The function's return type changed from `None` to
+`list[ContinuousEvalResult]` — empty in the ordinary case (unknown
+username, below threshold, already fired this window, or no active session
+anywhere on the account) — mirroring the shape every other
+`continuous.record_event` call site already returns to its own caller.
+
+**`POST /auth/login` becomes `async`:** pushing each returned
+`ContinuousEvalResult` over its session's live WebSocket requires an
+`await`, so `login()` in `auth.py` changed from a sync `def` to `async def`
+— the same, already-precedented reason Section 16 made `verify_mfa` async.
+Nothing else about the endpoint's signature, request/response shape, or
+status codes changed. The push itself reuses the exact helper the manual
+admin Trigger and the Section 18 heartbeat detector already shared,
+renamed from the module-private `_push_result` to the importable
+`push_continuous_result` (`security.py`) specifically so `auth.py` could
+call it too — a rename only; its logic is untouched.
+
+**The manual admin path is provably untouched:** `POST /security/events`
+with `event_type=multiple_failed_logins` still calls
+`continuous.record_event(..., source=SecurityEventSource.ADMIN)` exactly as
+it always has — no branch, condition, or line inside `ingest_security_event`
+changed. A dedicated regression test
+(`test_manual_multiple_failed_logins_event_still_works`) asserts this path
+end to end, checking specifically for `source == "admin"` in the response,
+to guard against ever conflating the two paths later.
+
+**What this looks like end to end (plain terms, as explained to the
+project owner):** if someone tries to log into a live user's account and
+gets the password wrong repeatedly, the moment that burst crosses the same
+threshold Module 5 already used for the login-time penalty, every browser
+tab that user currently has open elsewhere gets hit with the identical
+`multiple_failed_logins` scoring event a manual admin Trigger would have
+produced — same score drop, same risk-band re-evaluation, and (if that
+push crosses into HIGH) the same revoke-and-cascade-lockout behavior
+Section 23 already built. If the burst happens to push a session across
+into HIGH, the account is locked out of future logins for the same tiered
+window Section 18's account-lockout hardening already established — no new
+policy, just a new, automatic path into policy that already existed.
+
+**Tests:** six new tests in `backend/tests/test_continuous_trust.py`:
+
+- `test_failed_login_burst_auto_fires_against_the_accounts_active_session`
+  — three bad passwords against a user with one open session; asserts the
+  session's live score drops by the documented weight and the push carries
+  `source="auto"`.
+- `test_failed_login_burst_auto_fires_against_every_active_session_on_the_account`
+  — the same burst with **two** active sessions open on the account (two
+  browsers, via the existing `_second_token_for` helper) — both get hit,
+  not just one.
+- `test_failed_login_burst_auto_detection_fires_only_once_per_window` —
+  a fourth and fifth bad password past the threshold, still inside the same
+  window, produce no further event (the fire-once guard).
+- `test_failed_login_burst_with_no_active_session_is_a_harmless_noop` — the
+  same burst against a user with nothing open anywhere: still a plain 401,
+  nothing else happens, no error.
+- `test_failed_login_burst_direct_high_crossing_cascades_and_locks_the_account`
+  — one session forced to a MEDIUM score close enough to the HIGH boundary
+  that the burst's own penalty crosses it: confirms the automatic path
+  revokes that session, cascades `account_locked` to the account's *other*
+  active session (Section 23's machinery, reused unmodified), and that a
+  subsequent login attempt correctly returns `423`/`risk_locked`.
+- `test_manual_multiple_failed_logins_event_still_works` — the explicit
+  regression guard for the pre-existing admin Trigger path described above.
+
+Full backend suite, run twice (isolated file, then the complete suite):
+**32/32** in `test_continuous_trust.py` alone, **159 passing** overall (153
+prior, per section 26's verification, + 6 new) — no regressions, including
+no recurrence of the pre-existing order-dependent `test_user_trust_history`
+flake noted in section 22/26 (it passed cleanly in both runs this session).
+No migration — this is Redis/service-layer only, no schema or model
+changed. `frontend` unaffected: no request/response contract changed on
+`POST /auth/login`, and the pushed WebSocket message shapes
+(`trust.updated` / `trust.reverify_required` / `session.terminated`) are
+byte-for-byte identical regardless of which caller produced the
+`ContinuousEvalResult`, so no frontend file needed a change and none was
+made.
+
+**Files touched:** `backend/app/services/trust_score/store.py` (new
+`_fired_key`/`check_and_mark_burst_fired`, `clear_failed_logins` extended),
+`backend/app/services/trust_score/service.py`
+(`record_failed_login_attempt` extended, now returns
+`list[ContinuousEvalResult]`), `backend/app/api/v1/endpoints/security.py`
+(`_push_result` renamed to the importable `push_continuous_result`, no
+behavior change), `backend/app/api/v1/endpoints/auth.py` (`login` made
+`async`, pushes the new results before raising its 401), `backend/tests/
+test_continuous_trust.py` (+6 tests), `docs/architecture.md` (new section),
+this file (this section).

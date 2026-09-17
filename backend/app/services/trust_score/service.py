@@ -12,6 +12,7 @@ recorder (from the auth endpoint), and the trust endpoints.
 from __future__ import annotations
 
 import uuid
+from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session as DbSession
@@ -25,6 +26,9 @@ from app.services.auth import get_user_by_username
 from app.services.trust_score import store
 from app.services.trust_score.evaluator import evaluate
 from app.services.trust_score.factors import Factor, TrustEvaluation
+
+if TYPE_CHECKING:  # avoid the module-level circular-import risk noted below
+    from app.services.trust_score.continuous import ContinuousEvalResult
 
 logger = get_logger(__name__)
 settings = get_settings()
@@ -84,14 +88,78 @@ def evaluate_login(
     )
 
 
-def record_failed_login_attempt(db: DbSession, *, username: str) -> None:
+def record_failed_login_attempt(
+    db: DbSession, *, username: str
+) -> list["ContinuousEvalResult"]:
     """Called from POST /auth/login on a credential failure. Only counts attempts
-    against a *known* username (Section 6 keys the counter by user_id)."""
+    against a *known* username (Section 6 keys the counter by user_id).
+
+    Since 2026-09-17 (Module 7 hardening), this is also the single choke
+    point for turning that same burst into a mid-session ``multiple_failed_
+    logins`` security event against any of this user's currently ACTIVE
+    sessions elsewhere -- an attacker guessing a live user's password
+    should not be invisible to that user's already-open session, the same
+    way Section 18's heartbeat detector made a real IP/device/VPN/rate
+    change visible to it. Fires at most once per burst window
+    (``store.check_and_mark_burst_fired``), exactly mirroring
+    ``request_rate.check_and_mark_fired``'s own fire-once-per-window guard
+    for ``abnormal_request_rate`` -- without it, every wrong password past
+    the threshold within the same 15-minute window would re-fire the event
+    again. Only affects sessions that are genuinely ACTIVE right now (read
+    from the same Redis index ``request_rate.py`` already reuses); an
+    account with nothing open anywhere simply has nothing this can touch,
+    exactly as before this hardening pass.
+
+    Returns the list of ``ContinuousEvalResult`` objects the caller
+    (``POST /auth/login``) must push over each affected session's own
+    WebSocket -- empty if the burst didn't just cross the threshold, or the
+    account has no active session. This mirrors every other
+    ``continuous.record_event`` call site (the manual admin Trigger, the
+    heartbeat detector): the scoring/action logic itself stays fully sync
+    and pushing the result is the async caller's job.
+
+    ``continuous`` and ``session.store`` are imported locally, not at
+    module level: this package's own ``__init__.py`` deliberately does not
+    import ``continuous.py`` at all, to avoid eagerly pulling in the
+    heavier ``mfa``/``session`` packages it composes at every import of
+    *this* file (``service.py`` IS imported eagerly by ``__init__.py``) --
+    the same precaution ``app.services.auth.wiring``'s ``on_session_closed``
+    hook already takes for the identical reason (see that module)."""
     user = get_user_by_username(db, username)
     if user is None:
-        return
+        return []
     count = store.record_failed_login(user.id)
     logger.info("failed login recorded user_id=%s count=%s", user.id, count)
+
+    if not store.check_and_mark_burst_fired(user.id):
+        return []
+
+    from app.models.security_event import SecurityEventSource, SecurityEventType
+    from app.services.session import store as session_store
+    from app.services.trust_score import continuous
+
+    results: list[continuous.ContinuousEvalResult] = []
+    for session_id in session_store.active_session_ids_for_user(user.id):
+        try:
+            result = continuous.record_event(
+                db,
+                session_id=session_id,
+                event_type=SecurityEventType.MULTIPLE_FAILED_LOGINS,
+                source=SecurityEventSource.AUTO,
+            )
+        except (continuous.SessionNotFound, continuous.SessionNotActive):
+            # Redis's active-session index and Postgres's own row can drift
+            # by a moment (e.g. the session finished terminating in
+            # between) -- skip it rather than raising past a failed login
+            # attempt that must still return its ordinary 401 either way.
+            continue
+        logger.warning(
+            "multiple-failed-logins auto-detected user_id=%s session_id=%s "
+            "burst_count=%s new_score=%s new_risk=%s action=%s",
+            user.id, session_id, count, result.new_score, result.new_risk, result.action,
+        )
+        results.append(result)
+    return results
 
 
 # --------------------------------------------------------------------------- #

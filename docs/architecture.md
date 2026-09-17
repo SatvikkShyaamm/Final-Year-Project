@@ -908,3 +908,89 @@ natural fit for Module 8" deferral (Project status.md sections 17b/18).
   a missing token, and forwards a real, live `security` channel event end to
   end. Full backend suite: **153 passing** (141 prior + 12 new). `frontend`
   type-checks (`tsc -b --noEmit`) and builds clean.
+
+## Automatic `multiple_failed_logins` detection (Module 7 hardening, 2026-09-17)
+
+Closes the last "manual-only" gap in Module 7's event catalogue.
+`multiple_failed_logins` had been modeled in `classify_event`/the weights
+table since Module 7's original design, but nothing ever fired it except an
+admin manually calling `POST /security/events` -- unlike every other event
+type, which by this point (Section 18, the request-rate redesign, and the
+cascading-lockout/reattach hardening above) also had a real, automatic
+detector behind it. Found while explaining to the project owner how to
+verify this alert: the honest answer was "you currently can't, except by
+clicking the manual Trigger yourself" -- a real attacker guessing a live
+user's password produced no live signal on that user's own already-open
+session anywhere. See `Project status.md` section 27 for the full
+gap/design discussion that preceded building this.
+
+- **Reuses Module 5's existing burst counter as the trigger signal, adds no
+  new counting logic**: `backend/app/services/trust_score/store.py`'s
+  `ztsaacm:failed_logins:{user_id}` (`INCR`+`EXPIRE`, 15-minute window,
+  threshold `trust_failed_login_threshold`) already existed to compute the
+  Section 6 `-15` login-time penalty. This hardening reads that exact same
+  counter mid-burst instead of adding a second one.
+- **A new fire-once-per-window guard**, `store.check_and_mark_burst_fired()`
+  -- a second Redis key, `ztsaacm:failed_logins_fired:{user_id}`, set once
+  the counter is observed at/above threshold, with the counter's own
+  remaining TTL. Structurally identical to `request_rate.py`'s
+  `check_and_mark_fired` for `abnormal_request_rate`, and for the same
+  reason: without it, every wrong password past the threshold within the
+  same 15-minute window would re-fire the mid-session event again. Cleared
+  alongside the counter itself by `clear_failed_logins` (unlocks/tests).
+  Fail-open on any Redis error, matching every other auxiliary Redis
+  mechanism in this codebase.
+- **Where it hooks in**: `trust_score/service.py`'s
+  `record_failed_login_attempt` (already the sole caller from
+  `POST /auth/login`'s `InvalidCredentialsError` branch) now, immediately
+  after incrementing the counter, checks the fire-once guard and -- on a
+  fresh crossing -- calls the identical, unmodified
+  `continuous.record_event(..., event_type=MULTIPLE_FAILED_LOGINS,
+  source=SecurityEventSource.AUTO)` against **every** currently ACTIVE
+  session on that account (`app.services.session.store
+  .active_session_ids_for_user`, the same per-user Redis index
+  `request_rate.py` already reuses) -- not just one, since an attacker
+  guessing a password has no way to know which of the account's open tabs,
+  if any, to target. `continuous`/`session.store` are imported locally
+  inside the function, not at module level, for the same circular-import
+  reason `trust_score/__init__.py` already avoids importing `continuous.py`
+  eagerly (documented in `service.py`'s own module docstring; precedented
+  by `app.services.auth.wiring`'s `on_session_closed` hook).
+- **`POST /auth/login` had to become `async`** (`auth.py`) so it can
+  `await` the WebSocket push each returned `ContinuousEvalResult` calls
+  for -- the same reason Section 16 made `verify_mfa` async. The push
+  itself reuses the exact helper the manual admin path and the Section 18
+  heartbeat path already share, renamed from the module-private
+  `_push_result` to the importable `push_continuous_result`
+  (`security.py`) purely so `auth.py` can call it too; its behavior is
+  otherwise byte-for-byte unchanged.
+- **A no-op, by construction, whenever there is no live target**: an
+  unknown username, an account with nothing currently open anywhere, or a
+  burst that hasn't yet crossed the threshold all return an empty result
+  list and change nothing about the plain 401 the failed attempt still
+  gets. A Redis/Postgres drift between the active-session index and the
+  session's real row (closed in between) is skipped per-session rather
+  than raised, so one stale entry can never turn a failed login into a 500.
+- **The manual admin path is completely untouched**: `POST
+  /security/events` with `event_type=multiple_failed_logins` still calls
+  the same `continuous.record_event(..., source=SecurityEventSource.ADMIN)`
+  it always did, unmodified -- this hardening only adds a second, automatic
+  caller alongside it, exactly like Section 18 added an automatic caller
+  alongside the manual Trigger without removing it.
+- **Tests**: six new tests added to
+  `backend/tests/test_continuous_trust.py` -- a burst against a single
+  active session fires `multiple_failed_logins` with `source=auto` and the
+  documented `-` weight/score change; a burst on an account with two active
+  sessions (two browsers) fires it against both; the fire-once guard
+  suppresses a second automatic fire for further failed attempts inside the
+  same window (only the first crossing fires); a burst against an account
+  with no active session anywhere is a harmless no-op (still a plain 401);
+  a direct HIGH crossing via this path still cascades and account-locks
+  exactly like the manual path does (reuses the existing cascading-lockout
+  machinery unmodified). Plus one explicit regression test asserting the
+  manual `POST /security/events` path for this same event type still works
+  end to end with `source=admin`. Full suite: **159 passing** (153 prior,
+  per Module 8 above, + 6 new). No migration -- no schema change, Redis/
+  config only. `frontend` unaffected (no API contract change: the pushed
+  WebSocket message shapes are identical regardless of which caller
+  produced the `ContinuousEvalResult`).

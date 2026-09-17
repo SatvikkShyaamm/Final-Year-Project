@@ -15,6 +15,17 @@ Authentication endpoints — Module 2, with the Module 6 risk gate on /auth/logi
                             A locked-out account gets HTTP 423 instead, once
                             its password has already been verified -- see
                             app.services.trust_score.risk_lockout.
+                            A credential FAILURE (2026-09-17 hardening) also
+                            feeds the same burst counter into a mid-session
+                            `multiple_failed_logins` Module 7 event against
+                            any of this account's OTHER currently active
+                            sessions -- see
+                            app.services.trust_score.service.
+                            record_failed_login_attempt and Project
+                            status.md's Module 7 hardening log. `login` is
+                            `async` (like `logout` below) purely so it can
+                            await the WebSocket push that event calls for;
+                            everything else about this endpoint is unchanged.
     GET  /auth/me        -> current user (requires a real Bearer access token)
     POST /auth/logout    -> terminate the user's active session(s)
 """
@@ -24,6 +35,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import CurrentUser, get_db
+from app.api.v1.endpoints.security import push_continuous_result
 from app.core.config import get_settings
 from app.core.security import create_access_token, create_mfa_token
 from app.models.session import TerminationReason
@@ -87,7 +99,7 @@ def register(payload: UserCreate, db: Session = Depends(get_db)) -> Token:
     response_model=LoginResponse,
     summary="Verify credentials, then apply the trust-score risk gate",
 )
-def login(
+async def login(
     payload: LoginRequest, request: Request, db: Session = Depends(get_db)
 ) -> LoginResponse:
     try:
@@ -96,8 +108,20 @@ def login(
         )
     except InvalidCredentialsError as exc:
         # Feed Module 5's failed-login burst counter (Redis, 15-min TTL). Only
-        # counts against a known username; a no-op otherwise.
-        trust_score_service.record_failed_login_attempt(db, username=payload.username)
+        # counts against a known username; a no-op otherwise. Since
+        # 2026-09-17, this can ALSO return a live continuous-evaluation
+        # result per one of this account's OTHER currently active sessions,
+        # if this failure is the one that pushed the burst counter at/over
+        # its threshold for the first time in the current window -- see
+        # record_failed_login_attempt's own docstring. Pushed over each
+        # affected session's own WebSocket before this failed attempt's
+        # ordinary 401 is returned; the two are unrelated to each other
+        # (this request still gets a plain 401 either way).
+        affected = trust_score_service.record_failed_login_attempt(
+            db, username=payload.username
+        )
+        for result in affected:
+            await push_continuous_result(result)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(exc),

@@ -34,11 +34,16 @@ The scoring/action logic lives in app.services.trust_score.continuous (a
 composition of the existing trust_score + mfa + session services -- no new
 service package, per docs/architecture.md). That module is sync, like every
 other service in this codebase; this endpoint's only extra job is the async
-WebSocket push/close its result says to perform -- shared by both the manual
-and the automatic path via `_push_result` below, so a real detection looks,
-live, identical to a manual admin Trigger from the session's own tab's point
-of view (Section 18's own requirement: "no admin Trigger click involved
-anywhere in the path").
+WebSocket push/close its result says to perform -- shared by every path that
+can produce a ContinuousEvalResult via `push_continuous_result` below, so a
+real detection looks, live, identical to a manual admin Trigger from the
+session's own tab's point of view (Section 18's own requirement: "no admin
+Trigger click involved anywhere in the path"). Besides this endpoint's own
+two POST handlers, `push_continuous_result` is also imported directly by
+`POST /auth/login` (2026-09-17 hardening) to push the results of an
+automatically-detected `multiple_failed_logins` burst against any of the
+account's other active sessions -- see
+app.services.trust_score.service.record_failed_login_attempt.
 """
 from __future__ import annotations
 
@@ -79,10 +84,14 @@ def _client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
-async def _push_result(result: continuous_service.ContinuousEvalResult) -> None:
+async def push_continuous_result(result: continuous_service.ContinuousEvalResult) -> None:
     """The WebSocket push/close one continuous-evaluation result calls for --
     identical regardless of whether `result` came from a manual admin
-    Trigger or the automatic heartbeat detector (Section 18)."""
+    Trigger, the automatic heartbeat detector (Section 18), or the
+    automatic multiple-failed-logins detector (2026-09-17, called directly
+    from POST /auth/login). Not prefixed with an underscore: it is
+    deliberately importable from outside this module for exactly that last
+    case -- see the module docstring."""
     if result.should_push_reverify and result.mfa_challenge is not None:
         mfa_token = create_mfa_token(
             result.user_id, result.mfa_challenge.id,
@@ -153,8 +162,9 @@ async def ingest_security_event(
 
     # The service layer stays sync (see continuous.py's docstring); the
     # WebSocket push/close its result calls for happens here, via the same
-    # `_push_result` helper the automatic heartbeat path (below) also uses.
-    await _push_result(result)
+    # `push_continuous_result` helper the automatic heartbeat path (below)
+    # and POST /auth/login's automatic multiple-failed-logins path also use.
+    await push_continuous_result(result)
 
     return SecurityEventResultOut(
         security_event_id=result.security_event_id,
@@ -200,7 +210,7 @@ async def security_heartbeat(
         return HeartbeatResultOut(session_id=row.id, seeded=False, events=[])
 
     for eval_result in result.events:
-        await _push_result(eval_result)
+        await push_continuous_result(eval_result)
 
     return HeartbeatResultOut(
         session_id=result.session_id,
