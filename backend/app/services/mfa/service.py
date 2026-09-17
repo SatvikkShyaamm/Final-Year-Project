@@ -43,6 +43,7 @@ from app.models.mfa import (
 )
 from app.models.session import utcnow
 from app.models.trust_score import RiskLevel
+from app.models.user import User
 from app.schemas.mfa import MFAChallengeOut
 from app.services.mfa import email_otp
 
@@ -170,6 +171,56 @@ def _clear_failed_attempts(user_id: int) -> None:
         get_redis().delete(_failed_key(user_id))
     except redis.RedisError:
         logger.debug("redis mfa failed-attempt clear failed for user_id=%s", user_id, exc_info=True)
+
+
+def list_mfa_lockouts(db: DbSession) -> list[dict]:
+    """Every account currently under the account-level MFA lockout (Section
+    7's account-wide wrong-code streak -- not one challenge's own
+    attempts/max_attempts) -- Module 8's admin "Locked Accounts" panel.
+
+    Redis IS the source of truth for who's locked out (there is no
+    Postgres record of it), so this scans the lockout key namespace
+    directly and joins a username/email from Postgres for display. Scoped
+    to a small, bounded key space (one key per currently-locked account, at
+    most, at any moment) so a SCAN here is cheap -- not called from any
+    per-request hot path, only the admin dashboard's own polling."""
+    out: list[dict] = []
+    try:
+        r = get_redis()
+        for key in r.scan_iter(match="ztsaacm:mfa_lockout:*"):
+            ttl = r.ttl(key)
+            if not ttl or ttl <= 0:
+                continue
+            try:
+                user_id = int(key.rsplit(":", 1)[-1])
+            except ValueError:
+                continue
+            user = db.get(User, user_id)
+            out.append(
+                {
+                    "user_id": user_id,
+                    "username": user.username if user else None,
+                    "email": user.email if user else None,
+                    "lock_type": "mfa",
+                    "retry_after_seconds": ttl,
+                    "tier": None,
+                }
+            )
+    except redis.RedisError:
+        logger.warning("redis list_mfa_lockouts failed", exc_info=True)
+    return out
+
+
+def clear_mfa_lockout(user_id: int) -> bool:
+    """Admin unlock (Module 8) -- turns the documented manual fallback
+    (`redis-cli DEL ztsaacm:mfa_lockout:<id> ztsaacm:mfa_failed:<id>`) into a
+    real button. Returns True if anything was actually cleared."""
+    try:
+        removed = get_redis().delete(_lockout_key(user_id), _failed_key(user_id))
+        return bool(removed)
+    except redis.RedisError:
+        logger.warning("redis clear_mfa_lockout failed for user_id=%s", user_id, exc_info=True)
+        return False
 
 
 # --------------------------------------------------------------------------- #

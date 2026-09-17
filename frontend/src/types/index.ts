@@ -399,3 +399,74 @@ export interface TrustUpdatedMessage {
   risk_level: RiskLevel
   trust_score: number
 }
+
+/* --------------------------------------------------------------------------
+ * Module 8 — Security Dashboard
+ * Mirrors backend/app/schemas/dashboard.py.
+ * ---------------------------------------------------------------------- */
+
+/** GET /dashboard/overview — Section 5's "Dashboard Home" stat cards. */
+export interface DashboardOverview {
+  active_users: number
+  active_sessions: number
+  average_trust_score: number | null
+  high_risk_sessions: number
+  mfa_requests_pending: number
+  revoked_sessions: number
+  current_acl_rules: number
+  avg_authorization_latency_ms: number | null
+  avg_revocation_latency_ms: number | null
+  locked_out_accounts: number
+  generated_at: string
+}
+
+/** One bar/slice of an Analytics chart. */
+export interface CountBucket {
+  label: string
+  count: number
+}
+
+/** GET /dashboard/analytics — Section 5's "Analytics" charts. */
+export interface DashboardAnalytics {
+  login_activity: CountBucket[]
+  trust_score_distribution: CountBucket[]
+  risk_levels: CountBucket[]
+  mfa_events: CountBucket[]
+  revoked_sessions: CountBucket[]
+  security_alerts: CountBucket[]
+  avg_authorization_latency_ms: number | null
+  avg_revocation_latency_ms: number | null
+  generated_at: string
+}
+
+export type LockType = 'mfa' | 'risk'
+
+/** One row of the admin "Locked Accounts" panel — deferred from the Module
+ * 6/7 lockout hardening passes to Module 8. */
+export interface LockedAccount {
+  user_id: number
+  username: string | null
+  email: string | null
+  lock_type: LockType
+  retry_after_seconds: number
+  tier: number | null
+}
+
+export interface LockedAccountsResponse {
+  accounts: LockedAccount[]
+  generated_at: string
+}
+
+export interface LockoutClearedResponse {
+  user_id: number
+  cleared_mfa: boolean
+  cleared_risk: boolean
+}
+
+/** One forwarded message on WS /ws/dashboard — a live "something changed"
+ * signal, never a new source of truth (every admin page still reads its own
+ * REST endpoint; this only tells it to refetch sooner than its next poll). */
+export interface DashboardWsMessage {
+  channel: 'session' | 'acl' | 'mfa' | 'security' | string
+  data: unknown
+}
