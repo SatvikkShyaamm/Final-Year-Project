@@ -49,6 +49,7 @@ Module 3 stays purely session-lifecycle.
 | Adaptive MFA            | `backend/app/services/mfa/` (Module 6) — `decide(risk_level)` (LOW/MEDIUM/HIGH → allow/mfa/block) + email one-time-code challenge lifecycle (`mfa_challenges` one row per prompt: create / verify / expiry / retry — code hashed, never stored plaintext). `mfa_pending` token type (`app/core/security.create_mfa_token`) is rejected by `decode_access_token`. Redis `ztsaacm:events:mfa` for the dashboard, plus (2026-09-13) `ztsaacm:mfa_failed:{id}`/`ztsaacm:mfa_lockout:{id}` for the account-level lockout |
 | Continuous evaluation   | `backend/app/services/trust_score/continuous.py` (Module 7) -- composition of trust_score + mfa + session services, no separate service package. `record_event()` recomputes the session's CURRENT score (not the static baseline) and carries out none / reverify (email, reusing Module 6) / revoke (`TerminationReason.RISK_REVOKED`, already wired into token revocation) |
 | Security Dashboard      | `backend/app/services/dashboard/` (Module 8) -- pure aggregation over every prior module's own tables/Redis state, no new persisted state. `GET /dashboard/overview` (Section 5's stat cards), `GET /dashboard/analytics` (its charts), `GET`/`DELETE /dashboard/lockouts` (the admin unlock UI deferred from Modules 6/7), `WS /ws/dashboard` (admin-only live forwarder over the session/ACL/MFA/security Redis event channels every earlier module already publishes) |
+| Attack Simulation       | `backend/app/services/simulation/` (Module 9) -- thin, admin-only dispatch over Modules 3/5/7's own real functions (`continuous.record_event`, `trust_score_service.record_failed_login_attempt`, `session_service.terminate_session`); no new scoring/revocation logic. `GET /simulate/scenarios` (the live catalogue), `POST /simulate/{scenario}` (one of Section 5's eight named scenarios against one ACTIVE session) |
 
 ## Module -> folder map (Module 1 baseline)
 
@@ -69,6 +70,7 @@ frontend/src/ws/socket.ts        SessionSocket signalling client (Module 3)
 frontend/src/pages/admin/        one page per Module 8 dashboard section
 backend/app/services/dashboard/  pure aggregation queries over Modules 2-7's own state -- no persisted state of its own, no migration (Module 8)
 frontend/src/ws/dashboardSocket.ts + useDashboardSocket.ts   admin-only live "something changed" feed (Module 8) -- see its own section below
+backend/app/services/simulation/ thin admin-only dispatch over Modules 3/5/7's real functions -- no scoring/revocation logic of its own, no persisted state, no migration (Module 9)
 infra/l-pep/                     setup-ipset.sh + run notes for the standalone L-PEP (Module 4)
 ```
 
@@ -994,3 +996,91 @@ gap/design discussion that preceded building this.
   config only. `frontend` unaffected (no API contract change: the pushed
   WebSocket message shapes are identical regardless of which caller
   produced the `ContinuousEvalResult`).
+
+## Module 9 — Attack Simulation (as implemented, 2026-09-18)
+
+Spec: Section 5's eight named "Simulate ..." buttons, Section 6's "Attack
+Simulation -- VPN buttons" note (two independent, self-contained buttons,
+not a generic VPN toggle), Section 9's Module 9 description, and Section
+15's "these should trigger the actual backend logic rather than simply
+changing text on the UI" instruction.
+
+- **No new scoring/revocation logic** -- `backend/app/services/simulation/`
+  (a package; the directory already existed as an empty Module-1 scaffold,
+  now filled in, matching the one-sub-package-per-module convention) is a
+  thin dispatch layer over functions Modules 3/5/7 already built:
+  `continuous.record_event()` for six of the eight scenarios,
+  `trust_score_service.record_failed_login_attempt()` for
+  `failed_login`, and `session_service.terminate_session()` for
+  `session_termination`. No new model, no migration.
+- **The two VPN buttons pick a real, classifiable IP automatically** --
+  `pick_sample_ip()` returns the first usable host address in the first
+  configured CIDR block: `trust_approved_vpn_cidrs` for "Simulate Approved
+  VPN", `trust_known_vpn_cidrs` for "Simulate Unknown VPN" -- the admin
+  picks a scenario, not an IP, per Section 6's own framing of these as two
+  complete, self-contained buttons.
+- **`ip_change` uses a fixed RFC 5737 TEST-NET-3 address**
+  (`203.0.113.10`), deliberately outside both configured VPN CIDR lists, so
+  it always classifies as a plain `ip_change` and never gets accidentally
+  reclassified as `vpn_detected`.
+- **Five scenarios (`ip_change`, `approved_vpn`, `unknown_vpn`,
+  `unknown_device`, `large_download`, `abnormal_requests`) call
+  `continuous.record_event()` directly**, exactly the same call the
+  pre-existing manual admin Trigger (`POST /security/events`, Module 7)
+  already makes -- deliberately NOT routed through the Section 18 heartbeat/
+  request-rate detectors, since those compare against Redis-held "last
+  observed" state a polished, always-reliable demo control cannot assume is
+  seeded. Tagged `source=admin`.
+- **`failed_login` reuses the REAL Section 27 detector end to end** -- calls
+  `record_failed_login_attempt()` `trust_failed_login_threshold` times in a
+  row against the target session's own username, exercising the identical
+  Redis burst counter and fire-once guard a genuine password-guessing
+  attacker would trip. This is safe to do for real here (unlike the IP/
+  device scenarios) because it has no unpredictable prior-state dependency
+  -- a tight loop deterministically crosses the threshold every time. Hits
+  **every** currently active session on the account, not just the one
+  selected in the UI (the endpoint pushes each affected session's own
+  result over its own live socket); tagged `source=auto`, since it is
+  genuinely running the automatic detector, not injecting a synthetic
+  event.
+- **`session_termination` calls `session_service.terminate_session(reason=
+  ADMIN_TERMINATED)`** -- the identical call `DELETE /sessions/{id}` already
+  makes, including the same pre-close WebSocket push ordering.
+- **New endpoints**: `GET /simulate/scenarios` (admin -- the live
+  scenario -> label catalogue, mirroring `/security/config`/`/mfa/config`'s
+  "live reference" shape) and `POST /simulate/{scenario}` (admin -- runs one
+  scenario against a `session_id` in the request body; replaces the
+  Module-1 `501` stub).
+- **Frontend**: `AttackSimulation.tsx` (a placeholder with disabled buttons
+  since Module 1) is now real -- a session picker plus all eight scenario
+  buttons rendered from the live catalogue, and a running "Recent results"
+  table showing each run's actual score/risk/action or termination state.
+  Deliberately a separate, dedicated surface from `LiveSessions.tsx`'s own
+  per-row "Simulate (Module 7)" control, which stays exactly as it was (a
+  quick single-event tester for any of Module 7's six event types) --
+  Module 9's page is Section 5's actual eight named scenarios, including
+  the VPN split and the two scenarios (`failed_login`, `session_termination`)
+  the Live Sessions control doesn't offer at all.
+- **Tests**: `backend/tests/test_simulation.py` (16 tests) -- RBAC on both
+  endpoints, the scenario catalogue's shape, validation (unknown scenario,
+  unknown/inactive session), each of the eight scenarios' real effect
+  (exact score-delta assertions against the live config weights, not just a
+  200 status), the VPN buttons' automatic IP selection and correct
+  classification, `failed_login`'s fire-once-per-window guard and its
+  hitting every active session on the account, `session_termination`'s
+  real state/ACL/token effects, and one full integration check that a
+  Module 9 scenario crossing into HIGH drives the exact same revoke +
+  account-lockout pipeline every other trigger already does. Full backend
+  suite: **175 passing** (159 prior + 16 new). `frontend` type-checks,
+  builds, and lints clean.
+- **A real packaging bug caught while building this**: an empty
+  `app/services/simulation/__init__.py` had existed since Module 1's
+  original scaffold, alongside which a first draft of this module was
+  written as a flat `app/services/simulation.py` file -- Python resolves
+  the package over the same-named module in that situation, so
+  `app.services.simulation.UnknownScenario` (etc.) raised `AttributeError`
+  at runtime despite the class genuinely existing in the file on disk.
+  Caught immediately by the very first test run (not shipped); fixed by
+  moving the implementation into `app/services/simulation/service.py` and
+  populating the existing `__init__.py` to re-export it, matching every
+  other module's own package layout.

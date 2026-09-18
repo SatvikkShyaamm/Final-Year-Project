@@ -470,3 +470,56 @@ export interface DashboardWsMessage {
   channel: 'session' | 'acl' | 'mfa' | 'security' | string
   data: unknown
 }
+
+/* --------------------------------------------------------------------------
+ * Module 9 — Attack Simulation
+ * Mirrors backend/app/schemas/simulation.py. Every scenario triggers real
+ * backend logic (Module 7's continuous evaluation, or Module 3's session
+ * termination) — never just changes on-screen text.
+ * ---------------------------------------------------------------------- */
+
+export type SimulationScenarioKey =
+  | 'ip_change'
+  | 'approved_vpn'
+  | 'unknown_vpn'
+  | 'unknown_device'
+  | 'large_download'
+  | 'abnormal_requests'
+  | 'failed_login'
+  | 'session_termination'
+
+export interface SimulationScenarioInfo {
+  scenario: SimulationScenarioKey
+  label: string
+}
+
+export interface SimulationScenariosResponse {
+  scenarios: SimulationScenarioInfo[]
+  generated_at: string
+}
+
+/** POST /simulate/{scenario} body. */
+export interface SimulationRequest {
+  session_id: string
+}
+
+/** What actually happened — only the fields relevant to the scenario that
+ * ran are populated (mirrors SecurityEventResult for the six continuous-
+ * evaluation scenarios; `state`/`termination_reason` for session_termination). */
+export interface SimulationResult {
+  scenario: SimulationScenarioKey
+  session_id: string
+  security_event_id: string | null
+  event_type: SecurityEventType | null
+  weight_applied: number | null
+  reason: string | null
+  previous_score: number | null
+  new_score: number | null
+  previous_risk: RiskLevel | null
+  new_risk: RiskLevel | null
+  action: SecurityEventAction | null
+  source: SecurityEventSource | null
+  mfa_challenge_id: string | null
+  state: SessionState | null
+  termination_reason: string | null
+}

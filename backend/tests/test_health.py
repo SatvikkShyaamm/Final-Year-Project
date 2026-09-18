@@ -27,13 +27,15 @@ def test_health_shape():
     assert set(body["dependencies"].keys()) == {"database", "redis"}
 
 
-def test_placeholder_endpoints_return_501():
-    # Confirms the still-unbuilt module stub (9) is wired but honestly
-    # reports "not implemented" rather than silently succeeding. Modules 2-8
-    # (auth, sessions, ws/session, acl, trust-score, mfa, security, dashboard)
-    # are implemented and covered by their own test_*.py files.
-    for method, path in [
-        ("post", "/api/v1/simulate/ip_change"),
-    ]:
-        response = getattr(client, method)(path)
-        assert response.status_code == 501
+def test_no_placeholder_endpoints_remain():
+    # Modules 1-9 (health, auth, sessions/ws, acl, trust-score, mfa, security,
+    # dashboard, simulation) are all implemented now and covered by their own
+    # test_*.py files -- there is no longer a still-unbuilt module stub to
+    # honestly report 501 here (this test used to check exactly that for
+    # Module 9's own /simulate/{event_type}). Module 10 (Testing &
+    # Evaluation) has no REST surface of its own to stub. Smoke-check that
+    # the once-placeholder route is now real and auth-gated instead of gone.
+    response = client.post(
+        "/api/v1/simulate/ip_change", json={"session_id": "does-not-matter"}
+    )
+    assert response.status_code == 401

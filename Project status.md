@@ -2,7 +2,7 @@
 
 ## 1. Current Status
 
-Current Module: Module 9 – Attack Simulation (next)
+Current Module: Module 10 – Testing & Evaluation (next)
 Overall Project Status: Core base-paper flow complete (Modules 1-4) + static
 Trust Score (Module 5) + risk-gated Adaptive MFA at login (Module 6) + a
 post-Module-6 hardening pass closing the server-side token-revocation and
@@ -25,8 +25,11 @@ against every one of an account's currently open sessions the moment a
 real password-guessing burst crosses threshold, alongside (not replacing)
 the manual admin Trigger. Module 8 – Security Dashboard is also complete
 (section 25): real Dashboard Home/Analytics aggregates, an admin
-lockout-management panel, and a live admin WebSocket feed.
-Modules 9-10 not started.
+lockout-management panel, and a live admin WebSocket feed. Module 9 –
+Attack Simulation is now also complete (section 28): all eight Section-5
+scenarios trigger real Module 3/5/7 backend logic, on a dedicated Attack
+Simulation page.
+Module 10 not started.
 
 |         Module                         |              Status          |
 |----------------------------------------|------------------------------|
@@ -38,7 +41,7 @@ Modules 9-10 not started.
 | Module 6 – Adaptive MFA                | Completed & independently verified (MFA method revised 2026-09-10 — see section 11) |
 | Module 7 – Continuous Trust Evaluation | Completed — see section 16; hardened with account-level lockouts (sections 17-18), live-display fixes (sections 19-20), Real Passive Network Detection (sections 21-22), cascading lockout termination + reconnect-reattach (sections 23-24), automatic multiple_failed_logins detection (section 27) |
 | Module 8 – Security Dashboard          | Completed — see section 25   |
-| Module 9 – Attack Simulation           | Not started                  |
+| Module 9 – Attack Simulation           | Completed — see section 28   |
 | Module 10 – Testing & Evaluation       | Not started                  |
 
 ---
@@ -400,6 +403,52 @@ unlock UI yet — natural fit for Module 8" deferral (sections 17b/18 above).
   and cleared, the dashboard WebSocket's admin gating and live forwarding.
   Full backend suite: **153 passing** (141 prior + 12 new). `frontend`
   type-checks and builds clean.
+
+Module 8 was subsequently independently re-verified (section 26) and Module
+7 gained one further hardening pass, automatic `multiple_failed_logins`
+detection (section 27), bringing the full backend suite to **159 passing**
+before Module 9 began.
+
+### Module 9 — Attack Simulation (2026-09-18 — see section 28 for the full implementation/verification writeup)
+
+Implemented against Section 5's eight named "Simulate ..." buttons, Section
+6's "Attack Simulation — VPN buttons" note, and Section 15's "trigger the
+actual backend logic" instruction.
+
+- **No new scoring/revocation logic** — `app/services/simulation/` is a
+  thin, admin-only dispatch layer over functions Modules 3/5/7 already
+  built: `continuous.record_event()` (six scenarios),
+  `trust_score_service.record_failed_login_attempt()` (`failed_login`), and
+  `session_service.terminate_session()` (`session_termination`). No new
+  model, no migration.
+- **Eight scenarios**: `ip_change` (a fixed RFC 5737 documentation IP,
+  outside both VPN CIDR lists), `approved_vpn` / `unknown_vpn` (each
+  auto-picks a real, classifiable IP from the matching configured CIDR
+  block — the admin picks a scenario, not an IP), `unknown_device`,
+  `large_download`, `abnormal_requests` (all five call
+  `continuous.record_event()` directly, tagged `source=admin` — the same
+  call the manual Trigger already makes), `failed_login` (reuses the REAL
+  Section 27 detector end to end, hitting every active session on the
+  account, tagged `source=auto`), and `session_termination` (the identical
+  call `DELETE /sessions/{id}` already makes).
+- **New endpoints**: `GET /simulate/scenarios` (the live catalogue),
+  `POST /simulate/{scenario}` (admin; replaces the Module 1 `501` stub).
+- **Frontend**: `AttackSimulation.tsx` (disabled placeholder since Module 1)
+  is now real — a session picker, all eight scenario buttons, and a
+  "Recent results" table of actual score/risk/action or termination
+  outcomes. A separate, dedicated surface from `LiveSessions.tsx`'s own
+  per-row Module 7 "Simulate" control, which is unchanged.
+- **A real packaging bug caught before shipping**: an empty
+  `app/services/simulation/__init__.py` had existed since Module 1's
+  scaffold; a first draft written as a flat `simulation.py` file collided
+  with it (Python resolves the package over the same-named module),
+  raising `AttributeError` on every call despite the code being correct.
+  Fixed by moving the implementation into the package properly.
+- **Tests**: `backend/tests/test_simulation.py` (16 tests) — RBAC,
+  validation, each scenario's exact real effect, the VPN IP auto-selection,
+  `failed_login`'s fire-once guard and multi-session reach, and a full
+  HIGH-crossing integration check. Full backend suite: **175 passing** (159
+  prior + 16 new). `frontend` type-checks, builds, and lints clean.
 
 ---
 
@@ -3620,3 +3669,242 @@ behavior change), `backend/app/api/v1/endpoints/auth.py` (`login` made
 `async`, pushes the new results before raising its 401), `backend/tests/
 test_continuous_trust.py` (+6 tests), `docs/architecture.md` (new section),
 this file (this section).
+
+---
+
+## 28. Module 9 — Attack Simulation: Implementation + Verification (2026-09-18)
+
+Before starting, re-read `MASTER_PROJECT_CONTEXT.docx` in full (Section 5's
+eight named "Simulate ..." buttons; Section 6's "Attack Simulation — VPN
+buttons" note — two independent, self-contained buttons, not a generic VPN
+toggle; Section 9's Module 9 description, which explicitly keeps the
+existing admin "Trigger" control and Module 9's own buttons side by side
+with the Section 18 automatic detectors, not as competitors; Section 15's
+"these should trigger the actual backend logic rather than simply changing
+text on the UI" instruction), this `Project status.md` in full (sections
+1-27 — every Module 7 hardening pass through the 2026-09-17 automatic
+`multiple_failed_logins` detector, since Module 9 needed to know exactly
+which mechanisms were already real before deciding what to reuse),
+`docs/architecture.md` in full, and every backend/frontend file this module
+needed to read from or extend (`continuous.py`, `trust_score/service.py`,
+`session/service.py`, `security.py`'s `push_continuous_result`, the
+still-placeholder `simulation.py`/`AttackSimulation.tsx`, and
+`LiveSessions.tsx`'s existing per-row "Simulate (Module 7)" control, to
+avoid duplicating or conflicting with it) — confirmed against the actual
+current code, not any prior description of it. Also re-confirmed the
+current git log and working-tree state before starting, since multiple
+other sessions had pushed directly to `origin/main` (including two more
+docx re-uploads and the section-26/27 work) since this session's own last
+turn.
+
+### What was built
+
+- **`backend/app/services/simulation/`** (new content in a package whose
+  empty `__init__.py` had existed since Module 1's original scaffold) —
+  `service.py` is a thin, admin-only dispatch layer with no scoring/
+  revocation logic of its own:
+  - `SimulationScenario` — the eight scenario keys + their Section-5
+    display labels: `ip_change`, `approved_vpn`, `unknown_vpn`,
+    `unknown_device`, `large_download`, `abnormal_requests`,
+    `failed_login`, `session_termination`.
+  - `run_scenario(db, scenario, session_id)` — looks up the target session
+    (404 if unknown, 409 if not ACTIVE) and dispatches:
+    - Six scenarios call `continuous.record_event()` — the exact function
+      the pre-existing manual admin Trigger (`POST /security/events`,
+      Module 7) already calls — with the matching `SecurityEventType` and
+      `source=admin`.
+    - `approved_vpn` / `unknown_vpn` additionally call a new
+      `pick_sample_ip()` helper, which returns the first usable host
+      address in the first configured CIDR block
+      (`trust_approved_vpn_cidrs` / `trust_known_vpn_cidrs` respectively) —
+      so the admin picks a scenario, not an IP, per Section 6's own framing
+      of these as two complete, self-contained buttons rather than a
+      generic VPN toggle needing a typed address.
+    - `ip_change` uses a fixed constant, `203.0.113.10` (RFC 5737
+      TEST-NET-3, a documentation-reserved range), deliberately chosen
+      outside both configured VPN CIDR lists so it always classifies as a
+      plain `ip_change` and never gets accidentally reclassified as
+      `vpn_detected` by `continuous.classify_event`.
+    - `failed_login` calls `trust_score_service.record_failed_login_attempt()`
+      — the REAL Section 27 detector — `trust_failed_login_threshold` times
+      in a row against the target session's own username, deterministically
+      crossing the real Redis burst counter's threshold every time (a tight
+      loop within one request has no unpredictable prior-state dependency,
+      unlike the heartbeat detector's "last observed" comparison — see the
+      design note below). Hits every currently ACTIVE session on the
+      account, not just the one selected in the admin UI, exactly matching
+      what a genuine password-guessing burst would do; tagged `source=auto`
+      in the audit trail since it is genuinely running the automatic
+      detector, not injecting a synthetic event.
+    - `session_termination` calls `session_service.terminate_session(reason=
+      TerminationReason.ADMIN_TERMINATED)` — the identical call
+      `DELETE /sessions/{id}` already makes.
+  - `scenario_catalogue()` — the live scenario → label table (mirrors
+    `trust_score.factor_catalogue` / `mfa.mfa_config` /
+    `continuous.event_catalogue`'s existing "live reference, not a
+    hardcoded doc" pattern), so the frontend renders its eight buttons from
+    one source of truth instead of a duplicated hardcoded list.
+- **Design decision, recorded explicitly**: five of the eight scenarios
+  (`ip_change`, `approved_vpn`, `unknown_vpn`, `unknown_device`,
+  `abnormal_requests`) call `continuous.record_event()` directly rather
+  than routing through the Section 18 heartbeat/request-rate detectors,
+  even though those are now real for these exact event types. Reasoning: a
+  polished, always-reliable demo control cannot assume a real heartbeat has
+  already seeded that session's "last observed" Redis state — if it hasn't,
+  the heartbeat detector would silently seed-and-fire-nothing on its first
+  call, making a "Simulate IP Change" button appear to do nothing on a
+  freshly opened session. Calling `continuous.record_event()` directly is
+  deterministic regardless of timing, and is exactly what the pre-existing
+  manual admin Trigger already does — so these five scenarios are precisely
+  that path with a friendlier name (and, for the two VPN buttons, an
+  automatically chosen IP). `failed_login` is the one exception because its
+  real detector (a plain Redis counter with a fixed threshold) has no such
+  timing dependency — a tight loop deterministically crosses it every time
+  — so it safely reuses the real mechanism end to end for a strictly more
+  faithful simulation instead of a shortcut.
+- **New schemas** (`app/schemas/simulation.py`): `SimulationRequest`
+  (`session_id`), `SimulationResultOut` (a superset covering both the six
+  continuous-evaluation scenarios' score/risk/action fields — mirroring
+  `SecurityEventResultOut` — and `session_termination`'s `state`/
+  `termination_reason` fields, with whichever set doesn't apply left null),
+  `SimulationScenarioOut` / `SimulationScenariosResponse`.
+- **New endpoints** (`app/api/v1/endpoints/simulation.py`, replacing the
+  Module 1 `501` stub): `GET /simulate/scenarios` (admin), `POST
+  /simulate/{scenario}` (admin; body `{"session_id": ...}`) — 400 on an
+  unknown scenario, 404/409 on an unknown/inactive session. Reuses
+  `security.py`'s `push_continuous_result` (already made importable, not
+  module-private, during section 27's work) for the async WebSocket push
+  every continuous-evaluation-producing scenario needs, and pushes the
+  session-termination message inline for `session_termination` — the exact
+  same message `DELETE /sessions/{id}` sends, in the same pre-close order.
+- **`failed_login` pushes to every affected session's own socket, not just
+  the selected one**: `SimulationOutcome` carries both a primary
+  `continuous_result` (matching the session the admin picked) and an
+  `other_results` list (every other active session on the account the real
+  detector also hit); the endpoint pushes all of them. Caught by writing
+  the first multi-session test for this scenario, before it shipped: an
+  earlier draft only returned/pushed the primary result, which would have
+  silently left a second open browser tab on the same account never
+  finding out its score had also just dropped — a divergence from what the
+  real Section 27 mechanism actually does when a genuine burst occurs, not
+  a cosmetic gap.
+- **Frontend**: `frontend/src/api/simulation.ts` (new) wraps both endpoints.
+  `frontend/src/pages/admin/AttackSimulation.tsx` (a disabled-placeholder
+  page since Module 1) is now real: a target-session picker (polling active
+  sessions the same way `TrustScorePage.tsx` already does), all eight
+  scenario buttons rendered from the live catalogue, and a "Recent results"
+  table showing each run's actual before/after score, risk-band
+  transition, and resulting action or termination state — not just a
+  success toast. Deliberately left `LiveSessions.tsx`'s own pre-existing
+  per-row "Simulate (Module 7)" dropdown completely untouched: that one
+  remains a quick single-event tester for any of Module 7's six event
+  types from within the sessions table itself; this page is Section 5's
+  actual eight named scenarios (including the VPN split and the two
+  scenarios — `failed_login`, `session_termination` — the Live Sessions
+  control never offered), as its own dedicated surface.
+- **`backend/tests/test_health.py`** — its placeholder-501 test, which had
+  checked `POST /api/v1/simulate/ip_change`, no longer has a target
+  endpoint to check (the route is real now); renamed to
+  `test_no_placeholder_endpoints_remain` and repointed at a smoke check
+  that the once-placeholder route is now real and auth-gated (401 without
+  credentials) rather than simply deleting the coverage.
+
+### A real bug caught before shipping, not after
+
+The very first test run failed every single test in the new suite with
+`AttributeError: module 'app.services.simulation' has no attribute
+'UnknownScenario'` — despite that class visibly existing in the file on
+disk. Root cause: `app/services/simulation/__init__.py` had existed as an
+empty file since Module 1's original project scaffold (every module's
+service package got an empty placeholder directory at setup time, the same
+pattern `app/services/dashboard/` was filled into for Module 8), but this
+module's first draft was written as a flat `app/services/simulation.py`
+file sitting alongside that empty package directory. Python's import
+system resolves a same-named package over a plain module in that
+situation, so `app.services.simulation` silently bound to the empty
+package, not the new file — every class/function in the file was
+unreachable at runtime even though it imported without error. Fixed before
+ever running against a clean environment a second time: moved the
+implementation into `app/services/simulation/service.py` and populated the
+existing `__init__.py` to re-export its public API, matching every other
+module's own package layout exactly. Recorded here because it is a genuine
+"looked right, wasn't" class of bug worth remembering — an `ls`/`find`
+check for a same-named directory before creating a new top-level service
+module would have caught it before writing a line of logic into the wrong
+file.
+
+### Tests
+
+`backend/tests/test_simulation.py` (new, 16 tests):
+
+- **RBAC** — `GET /simulate/scenarios` and `POST /simulate/{scenario}` both
+  reject an unauthenticated caller (401) and a non-admin user (403).
+- **Catalogue** — `GET /simulate/scenarios` lists exactly the eight
+  expected scenario keys, including both VPN buttons and Session
+  Termination, with human-readable labels.
+- **Validation** — an unknown scenario name is a 400; a nonexistent session
+  is a 404; a session that has already ended (including waiting out the
+  2026-09-16 reconnect-grace window for an ordinary disconnect, not just an
+  explicitly-terminated one) is a 409.
+- **Each of the eight scenarios' real effect** — `ip_change`,
+  `unknown_device`, `large_download`, `abnormal_requests` each assert the
+  session's score actually moved by the exact configured weight;
+  `approved_vpn` / `unknown_vpn` assert the automatically-picked IP
+  classifies correctly (positive weight and an "approved" reason string
+  for one, the configured negative weight for the other) with no IP
+  supplied by the caller; `failed_login` (with two active sessions open on
+  the account, via the same `_second_token_for` direct-mint technique
+  `test_continuous_trust.py` already established) asserts BOTH sessions'
+  scores drop by the real weight, both receive their own live
+  `trust.updated` push, `source=auto` is recorded on both resulting
+  `security_events` rows, and a second `failed_login` simulate call inside
+  the same window produces no further event (the real fire-once guard);
+  `session_termination` asserts the session's real state/termination
+  reason, its own `session.terminated` push, and — the same depth of check
+  section 23's cascading-lockout test established — that the session
+  owner's original access token is genuinely revoked afterward (`GET
+  /auth/me` → 401), not just that the row shows `terminated`.
+- **Full-pipeline integration check** — an `abnormal_requests` simulation
+  that crosses a session from MEDIUM into HIGH is confirmed to drive the
+  exact same revoke-and-account-lockout pipeline every other Module 7
+  trigger already does (a subsequent login attempt for that account
+  correctly returns 423), proving Module 9's scenarios are genuinely
+  running through the real pipeline end to end, not a simplified parallel
+  path.
+
+### Verification
+
+- **Full backend suite**, run from the project's throwaway
+  Python-3.14-compatible virtualenv: **175/175 passing** — the prior 159
+  (section 27) plus the 16 new tests above, with zero prior tests deleted,
+  skipped, or weakened. `test_simulation.py` alone: 16/16, confirmed
+  isolated and in the full run.
+- **No migration** — confirmed by design: Module 9 introduces no new
+  SQLAlchemy model and touches no existing one; the migration chain's head
+  is unchanged since Module 8 (`0009_security_event_source`).
+- **Regression check against Modules 1-8**: every change outside the new
+  `simulation` package/endpoint/schema is either a rename with no behavior
+  change (`test_health.py`'s placeholder test) or genuinely new, additive
+  code. No existing model, schema, endpoint field, or prior module's
+  behavior was removed, renamed, or altered; `LiveSessions.tsx`'s own
+  Module 7 simulate control has zero diff.
+- **Frontend**: `npx tsc -b --noEmit` → 0 errors. `npm run build` →
+  succeeds. `npx oxlint` on every new/changed frontend file → 0 errors, one
+  `react(set-state-in-effect)` advisory warning on `AttackSimulation.tsx`'s
+  own `load()`-in-`useEffect` polling pattern — the same pre-existing,
+  accepted warning every other polling admin page already carries
+  (confirmed again here, as in sections 25/26, by checking it trips on
+  those pages identically).
+
+**Conclusion:** Module 9 — Attack Simulation is implemented per Section 5's
+eight named scenarios and Section 6's VPN-button framing, triggers real
+backend logic for every single one (per Section 15's explicit instruction —
+grepped the new files for `mock`/`fake`/`dummy`/`hardcod` with no hits
+beyond the deliberate, documented `203.0.113.10` simulation constant),
+integrates with Modules 3/5/7 entirely through direct reuse of their
+existing real functions, and does not regress any prior module — verified
+by a from-scratch full test run (175/175), a confirmed absence of any
+migration, and clean frontend type-checking, build, and linting. A genuine
+packaging bug (a same-named package/module collision) was caught and fixed
+before ever shipping, not discovered later. Ready to proceed to
+**Module 10 — Testing & Evaluation**.
