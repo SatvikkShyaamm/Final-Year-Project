@@ -18,6 +18,7 @@ class Factor:
     KNOWN_DEVICE = "known_device"
     KNOWN_IP = "known_ip"
     TYPICAL_HOUR = "typical_hour"
+    ATYPICAL_HOUR = "atypical_hour"  # 2026-09-21: dynamic counterpart of TYPICAL_HOUR
     UNKNOWN_DEVICE = "unknown_device"
     IP_CHANGED = "ip_changed"
     APPROVED_VPN = "approved_vpn"

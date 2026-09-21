@@ -3908,3 +3908,156 @@ migration, and clean frontend type-checking, build, and linting. A genuine
 packaging bug (a same-named package/module collision) was caught and fixed
 before ever shipping, not discovered later. Ready to proceed to
 **Module 10 — Testing & Evaluation**.
+
+---
+
+## 29. Module 5 Hardening — Dynamic, Self-Decaying Typical-Hour Band + Static Off-Hours Floor (2026-09-21)
+
+**Why:** reviewing the `typical_hour` factor with the project owner surfaced
+that, as implemented since Module 5, it was silently broken in two ways.
+First, it was **reward-only**: the factor computed a raw
+`min(history.login_hours)`/`max(history.login_hours)` range and only ever
+added a `+5` bonus when a login fell inside it — a login outside the range
+cost nothing, so the factor could never actually flag an unusual login
+hour, only reward a usual one. Second, that raw min/max range **only ever
+widened, permanently**: the very first time a user happened to log in at an
+odd hour (a late night, a timezone trip), the next score computation had to
+include that hour in the min/max, and the range never shrank back — one
+outlier redefined "typical" forever (or until it aged out of the 20-session
+window `history.py` already loads). The project owner's own framing of the
+question ("does it minus the score for every login... but should it be this
+way?") and the follow-up design discussion converged on a specific
+requirement: keep the factor **dynamic as the primary mechanism** (consistent
+with the Trust Score philosophy the rest of Module 5/7 is built on), but fix
+both weaknesses — make it **dockable, not reward-only**, and make the range
+**decay** instead of permanently widening — and additionally add a **small
+static safety net underneath it**: a fixed, org-set "always somewhat risky"
+window that no amount of learned history can fully erase. This mirrors how
+real continuous/adaptive trust systems are generally built in practice (an
+adaptive behavioral baseline — UEBA-style — layered on top of a fixed policy
+floor, e.g. NIST SP 800-207's continuous evaluation model or Microsoft Entra
+Continuous Access Evaluation), rather than picking either a purely static or
+a purely adaptive extreme.
+
+**Scope:** by explicit instruction, this hardening touches only the
+`typical_hour`/`off_hours` factor pair. No other Module 5 factor (device,
+IP, VPN, failed-logins), no Module 6 (Adaptive MFA), and no Module 7
+(Continuous Trust Evaluation) logic was changed.
+
+**Design — robust statistical band, not raw min/max:** `evaluator.py` gets a
+new `_typical_hour_band(login_hours, settings)` helper: the band is
+`mean ± k·stddev` over the same rolling last-20-session `history.login_hours`
+window `history.py` already loads (`k = TRUST_TYPICAL_HOUR_BAND_STDDEV_
+MULTIPLIER`, default `1.5`), floored at a minimum half-width
+(`TRUST_TYPICAL_HOUR_MIN_BAND_HOURS`, default `2.0`, so a very consistent
+user's band never collapses to an unreasonably thin sliver) and clamped to
+`[0, 23]`. Because the input is already the existing rolling window, a
+single new outlier hour only nudges the mean/stddev by `1/N` instead of
+snapping the boundary open to admit it, and — the "decay" the project owner
+asked for — an old outlier's influence fades out completely once it ages
+out of that same 20-session window, with no new expiry mechanism needed.
+
+**Design — dockable via a new `ATYPICAL_HOUR` factor:** a new negative
+factor, `Factor.ATYPICAL_HOUR` (`TRUST_WEIGHT_ATYPICAL_HOUR`, default `8`),
+is now mutually exclusive with `TYPICAL_HOUR`, exactly mirroring the
+existing `KNOWN_DEVICE`/`UNKNOWN_DEVICE` pairing already used elsewhere in
+this same file: both rows are always recorded once a user has enough
+history (for a complete audit-trail breakdown in `trust_score_factors`),
+but only one has `applied=True` and contributes to the score. A login
+outside the user's learned band now costs points instead of merely failing
+to earn a bonus.
+
+**Design — `OFF_HOURS` becomes the static safety net:** previously
+`OFF_HOURS` only ran as the `else` branch of "does this user have enough
+history to learn a range" — i.e. it was a fallback for new users, not a
+real policy floor. It is now **always checked**, unconditionally, before
+the dynamic band logic runs, and can stack with it: a user who logs in at
+03:00 every single night still pays the static `OFF_HOURS` penalty on every
+one of those logins, with no amount of learned history able to suppress it
+— but that same user's own learned band can independently earn back a
+positive `TYPICAL_HOUR` bonus alongside it, since 03:00 is, for them,
+genuinely typical. This is the literal "adaptive by default, with a static
+backstop" combination the project owner asked for: the floor is never fully
+erasable, only partially offset.
+
+**New config (`backend/app/core/config.py`, all `TRUST_*` env-overridable,
+matching every other weight in this file):**
+`trust_weight_atypical_hour` (default `8`),
+`trust_typical_hour_band_stddev_multiplier` (default `1.5`),
+`trust_typical_hour_min_band_hours` (default `2.0`). `trust_weight_off_hours`
+and `trust_typical_hour_min_sessions` are unchanged in value, only their
+inline comments were updated to describe the new behavior. Not added to
+`.env.example` (root or `backend/`), consistent with that file's existing
+convention of listing only the handful of "demo operator" knobs
+(`TRUST_SCORE_BASELINE`, `TRUST_RISK_*`, etc.) — no individual
+`TRUST_WEIGHT_*` value, including the pre-existing `TRUST_WEIGHT_OFF_HOURS`,
+was listed there before this change either.
+
+**Frontend: no changes required.** `frontend/src/types/index.ts` types
+`factor_name` as a plain `string`, and `TrustScorePage.tsx` renders the
+`/trust-score/{session_id}` and `/trust-score/config` factor breakdowns
+generically off whatever rows the API returns — there is no hardcoded
+factor list on the frontend to update. `service.py`'s `factor_catalogue()`
+(the source for the admin `/trust-score/config` reference table) was
+updated with the new `ATYPICAL_HOUR` entry and revised `applies_when` text
+for both it and `OFF_HOURS`, so the dashboard's own documentation stays
+accurate without any UI code change.
+
+**Tests:** three new unit tests added to `backend/tests/test_trust_score.py`
+(using a new `_seed_login_hours` helper that inserts fake prior `Session`
+rows the same way `history.load_user_history` actually reads them), plus
+the pre-existing `test_trust_config_endpoint`'s factor-count assertion
+updated from `10` to `11`:
+
+- `test_evaluate_off_hours_is_a_static_floor_independent_of_learned_history`
+  — a user with 5 prior sessions all at 09:00 (enough to learn a band still
+  centered on 09:00) logs in at 03:00: asserts **both** `OFF_HOURS` and
+  `ATYPICAL_HOUR` applied, and `TYPICAL_HOUR` did not — the static floor and
+  the dynamic penalty both firing together.
+- `test_evaluate_typical_hour_is_dockable_not_reward_only` — same
+  09:00-learned user: a 09:00 login gets `TYPICAL_HOUR` (not
+  `ATYPICAL_HOUR`); an 18:00 login gets `ATYPICAL_HOUR` (not `TYPICAL_HOUR`),
+  and its score is asserted strictly lower — proving this is now a real
+  penalty, not just a missing bonus.
+- `test_evaluate_typical_hour_band_resists_single_outlier_but_still_adapts`
+  — hand-calculated against 5×09:00 + 1×03:00 (mean `8.0`, stddev `≈2.236`,
+  band `≈[4.65, 11.35]`): a 04:00 login is still `ATYPICAL_HOUR`, proving a
+  lone outlier no longer immediately widens the range the old min/max design
+  would have. The same user is then given 8 more logins at 03:00 (enough to
+  shift the learned pattern for real), after which the identical 04:00
+  login becomes `TYPICAL_HOUR` — proving the band still genuinely adapts
+  once new evidence accumulates, rather than becoming permanently rigid
+  once hardened.
+
+### Verification
+
+- **`test_trust_score.py` in isolation**: 15/15 passing (11 pre-existing +
+  3 new + the updated factor-count assertion), confirmed via a from-scratch
+  throwaway virtualenv against `backend/requirements.txt`.
+- **Full backend suite**: **178/178 passing**, zero regressions — no
+  existing test in any other file was modified, weakened, or skipped to
+  reach this result.
+- **No migration** — this factor's outcome is written into the same
+  pre-existing `trust_score_factors` table every other factor already uses;
+  no schema change.
+- **Scope check**: `git diff` confirms application-code changes are
+  confined to `backend/app/core/config.py`,
+  `backend/app/services/trust_score/factors.py`,
+  `backend/app/services/trust_score/evaluator.py`, and
+  `backend/app/services/trust_score/service.py` — no other factor, module,
+  endpoint, schema, or frontend file touched.
+
+**Conclusion:** the `typical_hour` factor is now genuinely dynamic and
+self-decaying (a robust `mean ± k·stddev` band over the existing rolling
+20-session window, not a permanently-widening raw min/max), genuinely
+dockable (a real `ATYPICAL_HOUR` penalty, not reward-only), and backed by a
+static, org-set `OFF_HOURS` floor that continues to apply regardless of how
+much history a user has accumulated — the adaptive-primary-plus-static-
+backstop design the project owner specifically asked for, verified with
+zero regressions across the full 178-test suite.
+
+**Files touched:** `backend/app/core/config.py`, `backend/app/services/
+trust_score/factors.py`, `backend/app/services/trust_score/evaluator.py`,
+`backend/app/services/trust_score/service.py`, `backend/tests/
+test_trust_score.py` (+3 tests, 1 updated assertion), `docs/architecture.md`
+(Module 5 section revised + new hardening note), this file (this section).

@@ -114,8 +114,14 @@ Concept — FINALIZED"). The code implements it verbatim.
   `TRUST_*` env-overridable):
   - always checked: approved-VPN CIDR `+10`, known-public-VPN CIDR `−15`
     (approved wins if an IP is in both), `≥3` failed logins in 15 min `−15`.
-  - hour: `≥5` prior sessions → typical-hour range `+5`; otherwise off-hours
-    (00:00–05:00 local) fallback `−5`.
+  - hour (2026-09-21 hardened — see below): `OFF_HOURS` (00:00–05:00 local)
+    `−5` is an **always-checked static floor**, independent of history; on
+    top of it, once a user has ≥5 prior sessions, their own learned
+    typical-hour band gives `TYPICAL_HOUR` `+5` when the login falls inside it
+    or `ATYPICAL_HOUR` `−8` when it falls outside — mutually exclusive, like
+    `KNOWN_DEVICE`/`UNKNOWN_DEVICE` below. A user who habitually logs in at
+    03:00 still pays the `OFF_HOURS` floor every time, but can independently
+    earn back `TYPICAL_HOUR` alongside it once that pattern is learned.
   - history-dependent (only when the user has ≥1 prior session): known device
     `+15` / unknown device `−10`; known IP or same /24 (/64) `+10`; IP changed
     from last session `−10`. First-ever login skips all of these — it is
@@ -131,6 +137,22 @@ Concept — FINALIZED"). The code implements it verbatim.
   from the auth endpoint — the one auth→trust_score touchpoint).
 - **Known limitation** (state in the writeup): `TRUST_KNOWN_VPN_CIDRS_RAW` is
   a small static sample, not a live threat feed.
+- **Typical-hour band hardening (2026-09-21)**: the original design used a
+  raw running `min(history)`/`max(history)` as the "typical range" — that
+  was reward-only (falling outside it never cost anything) and a single
+  outlier hour permanently widened the boundary the moment it happened.
+  `evaluator._typical_hour_band` replaces this with `mean ± k·stddev`
+  (`k = TRUST_TYPICAL_HOUR_BAND_STDDEV_MULTIPLIER`, default `1.5`; floored at
+  `±TRUST_TYPICAL_HOUR_MIN_BAND_HOURS`, default `2.0`) over the same
+  rolling last-20-session window `history.py` already loads. A new outlier
+  hour now only nudges the mean/stddev by `1/N` instead of snapping the
+  boundary open, and its influence fades out entirely once it ages out of
+  that window — adaptive by default, decaying rather than permanently
+  widening. The static `OFF_HOURS` floor underneath it is the safety net: an
+  org-set window that no amount of learned history can fully erase, matching
+  how continuous/adaptive trust evaluation is generally paired with a fixed
+  policy backstop in practice (e.g. NIST SP 800-207, Microsoft Entra
+  Continuous Access Evaluation).
 - **Read surface**: `GET /api/v1/trust-score/{session_id}` (score + factor
   breakdown, admin or owner), `/trust-score/user/{id}/history` (admin or
   self), `/trust-score/config` (the live weight table, admin).

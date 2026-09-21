@@ -14,6 +14,7 @@ from app.core.config import get_settings
 from app.core.security import create_access_token
 from app.models.trust_score import RiskLevel
 from app.models.user import User
+from app.models.session import Session as SessionModel
 from app.services.trust_score.evaluator import evaluate
 from app.services.trust_score.factors import Factor, classify_risk
 
@@ -148,6 +149,104 @@ def _make_user(db_session, username="bob") -> User:
     return user
 
 
+def _seed_login_hours(db_session, user, hours: list[int], start_day: int = 1) -> None:
+    """Insert one terminated prior session per hour in `hours`, oldest first,
+    starting at `start_day` so repeated calls for the same user don't collide
+    on the same calendar day. Mirrors what history.load_user_history actually
+    reads (any state counts, ordering only matters once history exceeds the
+    rolling window, which these tests stay well under)."""
+    import uuid
+
+    base_day = datetime(2026, 9, 1)
+    for i, hour in enumerate(hours):
+        db_session.add(SessionModel(
+            id=uuid.uuid4().hex,
+            user_id=user.id,
+            ip_address="203.0.113.10",
+            user_agent="Mozilla/5.0",
+            created_at=base_day.replace(day=start_day + i, hour=hour),
+        ))
+    db_session.commit()
+
+
+# --------------------------------------------------------------------------- #
+# 2026-09-21 hardening: dynamic, self-decaying typical-hour band + static
+# off-hours floor. See evaluator._typical_hour_band's docstring for the
+# rationale (replaces the old raw min/max range).
+# --------------------------------------------------------------------------- #
+def test_evaluate_off_hours_is_a_static_floor_independent_of_learned_history(db_session):
+    """OFF_HOURS is now an always-checked org-policy floor -- a user's own
+    learned typical-hour history can earn back a positive TYPICAL_HOUR bonus
+    alongside it, but can never suppress the floor itself."""
+    user = _make_user(db_session)
+    _seed_login_hours(db_session, user, [9, 9, 9, 9, 9])
+
+    ev = evaluate(
+        db_session, user_id=user.id, ip_address="203.0.113.10",
+        user_agent="Mozilla/5.0", login_time=datetime(2026, 9, 20, 3, 0, 0),
+    )
+    applied = {o.name for o in ev.applied}
+    assert Factor.OFF_HOURS in applied  # static floor still applies at 03:00
+    assert Factor.ATYPICAL_HOUR in applied  # 03:00 is outside their 09:00 band
+    assert Factor.TYPICAL_HOUR not in applied
+
+
+def test_evaluate_typical_hour_is_dockable_not_reward_only(db_session):
+    """TYPICAL_HOUR/ATYPICAL_HOUR are now a genuine mutually-exclusive pair
+    (mirrors KNOWN_DEVICE/UNKNOWN_DEVICE) -- a login outside the learned band
+    now costs points instead of merely failing to earn a bonus."""
+    user = _make_user(db_session)
+    _seed_login_hours(db_session, user, [9, 9, 9, 9, 9])
+
+    within_band = evaluate(
+        db_session, user_id=user.id, ip_address="203.0.113.10",
+        user_agent="Mozilla/5.0", login_time=datetime(2026, 9, 20, 9, 0, 0),
+    )
+    applied_within = {o.name for o in within_band.applied}
+    assert Factor.TYPICAL_HOUR in applied_within
+    assert Factor.ATYPICAL_HOUR not in applied_within
+
+    outside_band = evaluate(
+        db_session, user_id=user.id, ip_address="203.0.113.10",
+        user_agent="Mozilla/5.0", login_time=datetime(2026, 9, 20, 18, 0, 0),
+    )
+    applied_outside = {o.name for o in outside_band.applied}
+    assert Factor.ATYPICAL_HOUR in applied_outside
+    assert Factor.TYPICAL_HOUR not in applied_outside
+    # dockable, not reward-only: the atypical login must score strictly lower
+    # than the typical one, proving this is a real penalty.
+    assert outside_band.score < within_band.score
+
+
+def test_evaluate_typical_hour_band_resists_single_outlier_but_still_adapts(db_session):
+    """A lone outlier hour must not immediately widen the learned band to
+    admit it (the old min/max design's core flaw) -- but the band must still
+    genuinely adapt once that pattern repeats often enough to become real
+    evidence, proving the mechanism decays rather than becoming permanently
+    rigid once hardened."""
+    user = _make_user(db_session)
+    # 5 typical logins at 09:00, then a single 03:00 outlier.
+    _seed_login_hours(db_session, user, [9, 9, 9, 9, 9, 3], start_day=1)
+
+    # Hand-calculated: mean=8.0, stddev=sqrt(5)~=2.236, half_width=
+    # max(2.0, 1.5*2.236)~=3.354 -> band ~= [4.65, 11.35]. The single outlier
+    # only nudged the band by a fraction of an hour, not out to admit hour 4.
+    still_atypical = evaluate(
+        db_session, user_id=user.id, ip_address="203.0.113.10",
+        user_agent="Mozilla/5.0", login_time=datetime(2026, 9, 20, 4, 0, 0),
+    )
+    assert Factor.ATYPICAL_HOUR in {o.name for o in still_atypical.applied}
+
+    # Now the "outlier" hour repeats enough times to genuinely become the
+    # pattern -- the band must still be capable of shifting to reflect it.
+    _seed_login_hours(db_session, user, [3, 3, 3, 3, 3, 3, 3, 3], start_day=20)
+    now_typical = evaluate(
+        db_session, user_id=user.id, ip_address="203.0.113.10",
+        user_agent="Mozilla/5.0", login_time=datetime(2026, 9, 20, 4, 0, 0),
+    )
+    assert Factor.TYPICAL_HOUR in {o.name for o in now_typical.applied}
+
+
 def test_evaluate_first_time_user_is_exactly_baseline(db_session):
     user = _make_user(db_session)
     noon = datetime(2026, 9, 9, 12, 0, 0)
@@ -207,7 +306,7 @@ def test_trust_config_endpoint(client):
     body = client.get("/api/v1/trust-score/config", headers=_bearer(admin_token)).json()
     assert body["baseline"] == settings.trust_score_baseline
     assert set(body["risk_bands"]) == {"LOW", "MEDIUM", "HIGH"}
-    assert len(body["factors"]) == 10
+    assert len(body["factors"]) == 11  # 2026-09-21: +ATYPICAL_HOUR
     assert body["known_vpn_list_is_static_sample"] is True
 
 

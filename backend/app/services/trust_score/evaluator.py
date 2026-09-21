@@ -61,6 +61,44 @@ def _local_hour(login_time: datetime) -> int:
     return (login_time + timedelta(hours=settings.trust_local_utc_offset_hours)).hour
 
 
+def _typical_hour_band(login_hours: list[int], s) -> tuple[float, float]:
+    """Robust, self-decaying typical-hour band -- 2026-09-21 hardening.
+
+    Replaces the original raw min/max range. min/max had two problems: (1) it
+    was reward-only (falling outside it cost nothing), and (2) a single
+    outlier hour permanently redefined the boundary the moment it happened,
+    since the very next min/max recompute had to include it.
+
+    This uses mean +/- k*stddev over the same `login_hours` the caller already
+    has (history.py's rolling last-`_RECENT_WINDOW` (20) sessions) instead. A
+    single new outlier only nudges the mean and stddev by 1/N -- it does not
+    snap the band open to admit it -- and, because the input is already
+    bounded to the last 20 sessions, an old outlier's influence fades out
+    entirely once it ages out of that window rather than persisting forever
+    the way a running min/max would. `trust_typical_hour_min_band_hours`
+    keeps the band from collapsing to an unreasonably thin sliver when a
+    user's recent history happens to be very consistent (stddev near 0).
+
+    Paired with `evaluate()`'s new ATYPICAL_HOUR factor, which docks points
+    when the login hour falls outside this band -- this factor is no longer
+    reward-only.
+    """
+    n = len(login_hours)
+    mean = sum(login_hours) / n
+    if n > 1:
+        variance = sum((h - mean) ** 2 for h in login_hours) / n
+        stddev = variance ** 0.5
+    else:
+        stddev = 0.0
+    half_width = max(
+        s.trust_typical_hour_min_band_hours,
+        s.trust_typical_hour_band_stddev_multiplier * stddev,
+    )
+    lo = max(0.0, mean - half_width)
+    hi = min(23.0, mean + half_width)
+    return lo, hi
+
+
 def evaluate(
     db: DbSession,
     *,
@@ -120,27 +158,47 @@ def evaluate(
         failed_burst,
     )
 
-    # ---- typical-hour (needs >= N prior sessions) OR off-hours fallback ----
+    # ---- 2026-09-21 hardening: static org-policy floor + dynamic per-user band ----
+    # off_hours is now an ALWAYS-checked organizational baseline -- it used to
+    # apply only as a fallback for users with no learned hour history yet.
+    # Per the "adaptive by default, with a static backstop" design: no amount
+    # of a user's own learned typical-hour history can suppress this floor: a
+    # 3 AM login still adds this penalty even for a user who logs in every
+    # night at 3 AM, though their own learned band (below) can independently
+    # earn back a positive TYPICAL_HOUR factor alongside it.
     hour = _local_hour(login_time)
+    off_hours = s.trust_off_hours_start_hour <= hour < s.trust_off_hours_end_hour
+    add(
+        Factor.OFF_HOURS, FactorKind.NEGATIVE, s.trust_weight_off_hours,
+        f"Login at hour {hour:02d} falls inside the organization's off-hours "
+        f"policy window ({s.trust_off_hours_start_hour:02d}:00-"
+        f"{s.trust_off_hours_end_hour:02d}:00) -- applies regardless of history"
+        if off_hours
+        else f"Login at hour {hour:02d} is outside the off-hours policy window",
+        off_hours,
+    )
+
+    # Dynamic, per-user typical-hour band (needs >= N prior sessions to learn).
+    # TYPICAL_HOUR / ATYPICAL_HOUR are mutually exclusive, mirroring the
+    # KNOWN_DEVICE/UNKNOWN_DEVICE pairing above: both rows are always recorded
+    # once there's enough history (for a complete audit-trail breakdown), but
+    # only one has `applied=True` and contributes to the score.
     if can_learn_hours:
-        lo, hi = min(history.login_hours), max(history.login_hours)
+        lo, hi = _typical_hour_band(history.login_hours, s)
         typical = lo <= hour <= hi
         add(
             Factor.TYPICAL_HOUR, FactorKind.POSITIVE, s.trust_weight_typical_hour,
-            f"Login at hour {hour:02d} is within the user's usual range "
-            f"({lo:02d}-{hi:02d})" if typical
-            else f"Login at hour {hour:02d} is outside the usual range "
-            f"({lo:02d}-{hi:02d})",
+            f"Login at hour {hour:02d} is within this user's learned typical "
+            f"band ({lo:.1f}-{hi:.1f}, from their last {history.session_count} sessions)"
+            if typical else "Login outside the user's learned typical band — n/a",
             typical,
         )
-    else:
-        off_hours = s.trust_off_hours_start_hour <= hour < s.trust_off_hours_end_hour
         add(
-            Factor.OFF_HOURS, FactorKind.NEGATIVE, s.trust_weight_off_hours,
-            f"Off-hours login (hour {hour:02d}); no personal hour history yet"
-            if off_hours
-            else f"Login at hour {hour:02d} is outside off-hours",
-            off_hours,
+            Factor.ATYPICAL_HOUR, FactorKind.NEGATIVE, s.trust_weight_atypical_hour,
+            f"Login at hour {hour:02d} falls outside this user's learned typical "
+            f"band ({lo:.1f}-{hi:.1f}, from their last {history.session_count} sessions)"
+            if not typical else "Login within the user's learned typical band — n/a",
+            not typical,
         )
 
     # ---- history-dependent device / IP factors ----

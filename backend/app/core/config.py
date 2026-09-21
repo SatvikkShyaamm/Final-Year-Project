@@ -102,7 +102,14 @@ class Settings(BaseSettings):
     trust_weight_approved_vpn: int = 10        # + : source IP in an org-approved VPN CIDR
     trust_weight_unknown_vpn: int = 15         # - : source IP in a known public VPN/proxy CIDR
     trust_weight_failed_logins: int = 15       # - : >= threshold failed logins in the window
-    trust_weight_off_hours: int = 5            # - : login 00:00-05:00, fallback when no hour history
+    trust_weight_off_hours: int = 5            # - : login 00:00-05:00 -- ALWAYS checked (org policy
+                                                #     floor), independent of any learned history; see
+                                                #     trust_weight_atypical_hour below for the per-user
+                                                #     dynamic layer on top of this static baseline
+    trust_weight_atypical_hour: int = 8        # - : login outside the user's own learned typical-hour
+                                                #     band (2026-09-21 hardening -- the dynamic
+                                                #     counterpart of trust_weight_typical_hour; only
+                                                #     applies once trust_typical_hour_min_sessions is met)
     # ---- Continuous Trust Evaluation (Module 7) -- mid-session event weights ----
     # Applied by app/services/trust_score/continuous.py against the session's
     # CURRENT score (not the baseline) when a security-relevant event is
@@ -124,6 +131,14 @@ class Settings(BaseSettings):
     trust_failed_login_threshold: int = 3
     trust_failed_login_window_minutes: int = 15
     trust_typical_hour_min_sessions: int = 5   # need this many prior sessions to learn a range
+    # 2026-09-21 hardening: the learned typical-hour band is mean +/- k*stddev
+    # over the user's recent login hours (history.py's rolling last-20-session
+    # window), not a raw running min/max. A single outlier hour therefore only
+    # nudges the mean/stddev a little instead of permanently redefining the
+    # boundary, and its influence fades out entirely once it ages out of the
+    # rolling window -- see evaluator._typical_hour_band's docstring.
+    trust_typical_hour_band_stddev_multiplier: float = 1.5
+    trust_typical_hour_min_band_hours: float = 2.0  # floor on the band's half-width
     trust_off_hours_start_hour: int = 0        # inclusive, local time (see offset below)
     trust_off_hours_end_hour: int = 5          # exclusive
     trust_local_utc_offset_hours: int = 0      # shift session timestamps for the hour-of-day checks

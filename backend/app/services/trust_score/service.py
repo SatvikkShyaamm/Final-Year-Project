@@ -212,7 +212,12 @@ def factor_catalogue() -> list[dict]:
          "weight": s.trust_weight_known_ip, "applies_when": "user has prior session history"},
         {"factor_name": Factor.TYPICAL_HOUR, "factor_kind": FactorKind.POSITIVE,
          "weight": s.trust_weight_typical_hour,
-         "applies_when": f"user has >= {s.trust_typical_hour_min_sessions} prior sessions"},
+         "applies_when": f"user has >= {s.trust_typical_hour_min_sessions} prior sessions, "
+                         "login within their learned typical-hour band"},
+        {"factor_name": Factor.ATYPICAL_HOUR, "factor_kind": FactorKind.NEGATIVE,
+         "weight": s.trust_weight_atypical_hour,
+         "applies_when": f"user has >= {s.trust_typical_hour_min_sessions} prior sessions, "
+                         "login outside their learned typical-hour band"},
         {"factor_name": Factor.APPROVED_VPN, "factor_kind": FactorKind.POSITIVE,
          "weight": s.trust_weight_approved_vpn, "applies_when": "always checked"},
         {"factor_name": Factor.UNKNOWN_DEVICE, "factor_kind": FactorKind.NEGATIVE,
@@ -228,7 +233,8 @@ def factor_catalogue() -> list[dict]:
         {"factor_name": Factor.OFF_HOURS, "factor_kind": FactorKind.NEGATIVE,
          "weight": s.trust_weight_off_hours,
          "applies_when": f"login {s.trust_off_hours_start_hour:02d}:00-"
-                         f"{s.trust_off_hours_end_hour:02d}:00, fallback when no hour history"},
+                         f"{s.trust_off_hours_end_hour:02d}:00 -- always checked "
+                         "(org policy floor, independent of history)"},
     ]
 
 
