@@ -93,12 +93,7 @@ export function UserPortal() {
         )}
       </div>
 
-      <p className="mt-6 text-sm text-[color:var(--color-text-muted)]">
-        The trust score above starts as the static score computed at session
-        creation (Module 5) and updates live during the session as Module 7
-        re-evaluates it. Whether a MEDIUM/HIGH score means "verify with MFA"
-        or "block" is decided by Module 6.
-      </p>
+      
     </div>
   )
 }
