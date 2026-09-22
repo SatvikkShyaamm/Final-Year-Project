@@ -108,9 +108,7 @@ export function TrustScorePage() {
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h1 className="text-2xl font-semibold">Trust Score Monitoring</h1>
-          <p className="mt-1 text-sm text-[color:var(--color-text-muted)]">
-            Static score at session creation · Section-6 factor table · auto-refreshing
-          </p>
+          
         </div>
         <label className="text-xs text-[color:var(--color-text-muted)]">
           Session&nbsp;
@@ -286,14 +284,7 @@ export function TrustScorePage() {
                 ))}
               </tbody>
             </table>
-            <p className="border-t border-[color:var(--color-border)] px-4 py-2 text-xs text-[color:var(--color-text-muted)]">
-              Risk bands — LOW {config.risk_bands.LOW} · MEDIUM {config.risk_bands.MEDIUM} ·
-              HIGH {config.risk_bands.HIGH}. Failed-login penalty at{' '}
-              {config.failed_login_threshold}+ attempts in{' '}
-              {config.failed_login_window_minutes} min.
-              {config.known_vpn_list_is_static_sample &&
-                ' Known-VPN list is a static demo sample, not a live feed.'}
-            </p>
+            
           </div>
         )}
       </div>

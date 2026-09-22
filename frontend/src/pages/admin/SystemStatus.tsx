@@ -38,9 +38,6 @@ export function SystemStatus() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold">System Status</h1>
-          <p className="mt-1 text-sm text-[color:var(--color-text-muted)]">
-            Live check against the backend's /api/v1/health endpoint.
-          </p>
         </div>
         <button
           onClick={load}

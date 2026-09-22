@@ -49,11 +49,6 @@ export function SecurityAlerts() {
   return (
     <div>
       <h1 className="text-2xl font-semibold">Security Alerts</h1>
-      <p className="mt-1 text-sm text-[color:var(--color-text-muted)]">
-        Adaptive MFA events (Module 6) and continuous trust-evaluation events
-        (Module 7). Module 9 adds dedicated attack-simulation buttons that feed
-        the same two backends.
-      </p>
 
       {error && (
         <p className="mt-4 text-sm text-[color:var(--color-risk-high)]">{error}</p>

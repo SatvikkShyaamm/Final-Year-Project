@@ -84,13 +84,7 @@ export function AttackSimulation() {
   return (
     <div>
       <h1 className="text-2xl font-semibold">Attack Simulation</h1>
-      <p className="mt-1 text-sm text-[color:var(--color-text-muted)]">
-        Buttons below call <code className="rounded bg-[color:var(--color-surface-alt)] px-1">
-          POST /api/v1/simulate/&#123;scenario&#125;
-        </code>{' '}
-        and trigger the real backend security logic against the selected session
-        — never just on-screen text.
-      </p>
+      
 
       {error && <p className="mt-4 text-sm text-[color:var(--color-risk-high)]">{error}</p>}
 

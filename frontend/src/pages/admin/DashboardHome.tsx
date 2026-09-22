@@ -75,8 +75,6 @@ export function DashboardHome() {
     <div>
       <h1 className="text-2xl font-semibold">Dashboard Home</h1>
       <p className="mt-1 text-sm text-[color:var(--color-text-muted)]">
-        Real-time overview — live aggregates over Modules 2-7&apos;s own state,
-        refreshed on a timer and on every live event.
       </p>
 
       {error && <p className="mt-4 text-sm text-[color:var(--color-risk-high)]">{error}</p>}
@@ -94,12 +92,7 @@ export function DashboardHome() {
             {overview?.locked_out_accounts ?? 0} currently locked
           </span>
         </div>
-        <p className="mt-1 text-sm text-[color:var(--color-text-muted)]">
-          Module 6&apos;s MFA lockout (wrong-code streak) and Module 7&apos;s risk
-          lockout (a direct HIGH-risk crossing) — the manual{' '}
-          <code className="rounded bg-[color:var(--color-surface-alt)] px-1">redis-cli DEL</code>{' '}
-          fallback those hardening passes documented, now a real button.
-        </p>
+        
 
         <div className="mt-4 overflow-x-auto rounded-xl border border-[color:var(--color-border)]">
           <table className="w-full min-w-[640px] text-left text-sm">

@@ -53,11 +53,7 @@ export function Analytics() {
   return (
     <div>
       <h1 className="text-2xl font-semibold">Analytics</h1>
-      <p className="mt-1 text-sm text-[color:var(--color-text-muted)]">
-        Login activity, trust score distribution, MFA events, revoked
-        sessions, security alerts, risk levels, and ACL latency — real counts
-        over Modules 2-7&apos;s own state, charted with Recharts.
-      </p>
+      
 
       {error && <p className="mt-4 text-sm text-[color:var(--color-risk-high)]">{error}</p>}
 
